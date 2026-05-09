@@ -244,3 +244,97 @@ pub(crate) fn render_scroll_indicator(
         indicator_area,
     );
 }
+
+pub(crate) fn render_stable_vertical_scrollbar(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    content_length: usize,
+    viewport_length: usize,
+    position: usize,
+    arrows: bool,
+) {
+    if content_length <= viewport_length || area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let x = area.x + area.width.saturating_sub(1);
+    let arrow_cells = if arrows && area.height >= 2 {
+        2
+    } else {
+        0
+    };
+    let track_y = area.y + u16::from(arrow_cells > 0);
+    let track_height = area.height.saturating_sub(arrow_cells);
+    if track_height == 0 {
+        return;
+    }
+
+    let track_len = track_height as usize;
+    let thumb_len = stable_thumb_len(content_length, viewport_length, track_len);
+    let thumb_start = stable_thumb_start(content_length, track_len, thumb_len, position);
+
+    let buffer = frame.buffer_mut();
+    if arrow_cells > 0 {
+        if let Some(cell) = buffer.cell_mut((x, area.y)) {
+            cell.set_symbol("▲");
+        }
+        if let Some(cell) = buffer.cell_mut((x, area.y + area.height - 1)) {
+            cell.set_symbol("▼");
+        }
+    }
+
+    for index in 0..track_len {
+        let symbol = if (thumb_start..thumb_start + thumb_len).contains(&index) {
+            "█"
+        } else {
+            "║"
+        };
+        if let Some(cell) = buffer.cell_mut((x, track_y + index as u16)) {
+            cell.set_symbol(symbol);
+        }
+    }
+}
+
+fn stable_thumb_len(content_length: usize, viewport_length: usize, track_len: usize) -> usize {
+    let proportional = viewport_length
+        .saturating_mul(track_len)
+        .div_ceil(content_length);
+    proportional.clamp(1, track_len)
+}
+
+fn stable_thumb_start(
+    content_length: usize,
+    track_len: usize,
+    thumb_len: usize,
+    position: usize,
+) -> usize {
+    let max_thumb_start = track_len.saturating_sub(thumb_len);
+    let max_position = content_length.saturating_sub(1);
+    if max_position == 0 {
+        return 0;
+    }
+    let position = position.min(max_position);
+    (position * max_thumb_start + max_position / 2) / max_position
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    #[test]
+    fn stable_thumb_length_does_not_depend_on_position() {
+        let content_length = 37;
+        let viewport_length = 12;
+        let track_len = 17;
+
+        let thumb_len = stable_thumb_len(content_length, viewport_length, track_len);
+        for position in 0..content_length {
+            let thumb_start = stable_thumb_start(content_length, track_len, thumb_len, position);
+            assert!(thumb_start + thumb_len <= track_len);
+            assert_eq!(
+                thumb_len,
+                stable_thumb_len(content_length, viewport_length, track_len)
+            );
+        }
+    }
+}

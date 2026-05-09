@@ -3,9 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block, BorderType, Paragraph, Wrap},
 };
 
 use crate::{app::AppState, theme::Theme};
@@ -146,14 +144,13 @@ pub(crate) fn draw_repo_detail(
 
     let viewport_height = content[1].height.saturating_sub(2) as usize;
     if body_text_height > viewport_height {
-        let mut scrollbar_state =
-            ScrollbarState::new(body_text_height.saturating_sub(viewport_height))
-                .position(scroll_pos as usize)
-                .viewport_content_length(viewport_height);
-        frame.render_stateful_widget(
-            Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+        super::detail_common::render_stable_vertical_scrollbar(
+            frame,
             content[1],
-            &mut scrollbar_state,
+            body_text_height,
+            viewport_height,
+            scroll_pos as usize,
+            true,
         );
     }
 }

@@ -6,7 +6,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, HighlightSpacing, Padding, Paragraph, RenderDirection,
-        Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline, Table,
+        Row, Sparkline, Table, TableState,
     },
 };
 use serde_json::Value;
@@ -68,17 +68,21 @@ fn draw_logs_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppStat
         app.cached_log_entry_count = current_len;
     }
 
-    let filtered: Vec<&LogEntry> = if app.logs_search_query.is_empty() {
-        app.cached_log_entries.iter().collect()
+    let filtered = if app.logs_search_query.is_empty() {
+        None
     } else {
         let q = app.logs_search_query.to_lowercase();
-        app.cached_log_entries
-            .iter()
-            .filter(|e| e.matches(&q))
-            .collect()
+        Some(
+            app.cached_log_entries
+                .iter()
+                .filter(|e| e.matches(&q))
+                .collect::<Vec<_>>(),
+        )
     };
 
-    let count = filtered.len();
+    let count = filtered
+        .as_ref()
+        .map_or(app.cached_log_entries.len(), Vec::len);
 
     // Auto-scroll: keep selection at bottom when enabled
     if app.logs_auto_scroll && count > 0 {
@@ -124,36 +128,33 @@ fn draw_logs_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppStat
     let window_start = selected.saturating_sub(visible_height);
     let window_end = (selected + visible_height + 1).min(count);
 
-    let rows: Vec<Row> = filtered
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            if i >= window_start && i < window_end {
-                let (level_color, msg_style) = level_styles(&entry.level, theme);
-                let (msg_cell, row_height) =
-                    wrap_message_cell(&entry.message, &entry.extras, msg_width, theme, msg_style);
-                Row::new(vec![
-                    Cell::from(Span::styled(
-                        entry.time.clone(),
-                        Style::default().fg(theme.muted),
-                    )),
-                    Cell::from(Span::styled(
-                        format_level_tag(&entry.level),
-                        Style::default()
-                            .fg(level_color)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Cell::from(Span::styled(
-                        truncate_target(&entry.target, max_target_len as usize),
-                        Style::default().fg(theme.highlight),
-                    )),
-                    msg_cell,
-                ])
-                .height(row_height)
-            } else {
-                // Cheap placeholder for off-screen rows.
-                Row::new(vec![Cell::from(""); 4]).height(1)
-            }
+    let visible_entries = (window_start..window_end).map(|index| match &filtered {
+        Some(entries) => entries[index],
+        None => &app.cached_log_entries[index],
+    });
+    let rows: Vec<Row> = visible_entries
+        .map(|entry| {
+            let (level_color, msg_style) = level_styles(&entry.level, theme);
+            let (msg_cell, row_height) =
+                wrap_message_cell(&entry.message, &entry.extras, msg_width, theme, msg_style);
+            Row::new(vec![
+                Cell::from(Span::styled(
+                    entry.time.clone(),
+                    Style::default().fg(theme.muted),
+                )),
+                Cell::from(Span::styled(
+                    format_level_tag(&entry.level),
+                    Style::default()
+                        .fg(level_color)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Cell::from(Span::styled(
+                    truncate_target(&entry.target, max_target_len as usize),
+                    Style::default().fg(theme.highlight),
+                )),
+                msg_cell,
+            ])
+            .height(row_height)
         })
         .collect();
 
@@ -198,7 +199,11 @@ fn draw_logs_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppStat
             .style(Style::default().bg(theme.panel)),
     );
 
-    frame.render_stateful_widget(table, area, &mut app.logs_state);
+    let mut visible_state = TableState::default();
+    if count > 0 {
+        visible_state.select(Some(selected.saturating_sub(window_start)));
+    }
+    frame.render_stateful_widget(table, area, &mut visible_state);
     draw_scrollbar(frame, area, count, selected);
 }
 
@@ -401,19 +406,19 @@ fn build_logs_title<'a>(query: &str, typing: bool, theme: Theme) -> Line<'a> {
 fn draw_scrollbar(frame: &mut ratatui::Frame<'_>, area: Rect, count: usize, position: usize) {
     let content_height = area.height.saturating_sub(3) as usize;
     if count > content_height {
-        let mut scrollbar_state = ScrollbarState::new(count)
-            .position(position)
-            .viewport_content_length(content_height);
         let scrollbar_area = Rect {
             x: area.x,
             y: area.y + 1,
             width: area.width,
             height: area.height.saturating_sub(2),
         };
-        frame.render_stateful_widget(
-            Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+        super::detail_common::render_stable_vertical_scrollbar(
+            frame,
             scrollbar_area,
-            &mut scrollbar_state,
+            count,
+            content_height,
+            position,
+            true,
         );
     }
 }

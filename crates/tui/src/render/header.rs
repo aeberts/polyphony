@@ -67,8 +67,9 @@ pub fn draw_header(
     .style(Style::default().bg(theme.panel))
     .highlight_style(
         Style::default()
-            .add_modifier(Modifier::BOLD)
-            .add_modifier(Modifier::UNDERLINED),
+            .fg(theme.foreground)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD),
     );
     app.tab_inner_area = tab_sections[0];
     frame.render_widget(tabs, tab_sections[0]);

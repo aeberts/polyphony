@@ -3,12 +3,13 @@ use ratatui::{
     layout::{Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-    },
+    widgets::{Block, BorderType, Paragraph, Wrap},
 };
 
-use super::{detail_common::render_scroll_indicator, orchestrator::wrapped_line_count};
+use super::{
+    detail_common::{render_scroll_indicator, render_stable_vertical_scrollbar},
+    orchestrator::wrapped_line_count,
+};
 use crate::app::AppState;
 
 pub(crate) fn draw_live_log_detail(
@@ -156,11 +157,13 @@ pub(crate) fn draw_live_log_detail(
     );
 
     if total_lines > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_pos as usize);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        render_stable_vertical_scrollbar(
+            frame,
             inner,
-            &mut scrollbar_state,
+            total_lines,
+            visible_height,
+            scroll_pos as usize,
+            true,
         );
     }
 

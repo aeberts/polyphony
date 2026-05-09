@@ -3,13 +3,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, LineGauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Wrap,
-    },
+    widgets::{Block, BorderType, LineGauge, Paragraph, Wrap},
 };
 
-use super::detail_common::{kv_line, render_scroll_indicator, render_separator};
+use super::detail_common::{
+    kv_line, render_scroll_indicator, render_separator, render_stable_vertical_scrollbar,
+};
 use crate::app::AppState;
 
 pub(crate) fn draw_run_detail(
@@ -520,11 +519,13 @@ pub(crate) fn draw_run_detail(
     );
 
     if total_lines > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_pos as usize);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        render_stable_vertical_scrollbar(
+            frame,
             body_area,
-            &mut scrollbar_state,
+            total_lines,
+            visible_height,
+            scroll_pos as usize,
+            true,
         );
     }
 

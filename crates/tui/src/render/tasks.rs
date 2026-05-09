@@ -4,10 +4,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Cell, HighlightSpacing, Row, Scrollbar, ScrollbarOrientation,
-        ScrollbarState, Table,
-    },
+    widgets::{Block, BorderType, Cell, HighlightSpacing, Row, Table},
 };
 
 use crate::app::AppState;
@@ -123,19 +120,19 @@ pub fn draw_tasks_tab(
     if count > 0 {
         let content_height = area.height.saturating_sub(3) as usize;
         if count > content_height {
-            let mut scrollbar_state = ScrollbarState::new(count)
-                .position(app.tasks_state.selected().unwrap_or(0))
-                .viewport_content_length(content_height);
             let scrollbar_area = Rect {
                 x: area.x,
                 y: area.y + 1,
                 width: area.width,
                 height: area.height.saturating_sub(2),
             };
-            frame.render_stateful_widget(
-                Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+            super::detail_common::render_stable_vertical_scrollbar(
+                frame,
                 scrollbar_area,
-                &mut scrollbar_state,
+                count,
+                content_height,
+                app.tasks_state.selected().unwrap_or(0),
+                true,
             );
         }
     }
