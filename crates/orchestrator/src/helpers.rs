@@ -729,6 +729,7 @@ pub(crate) fn build_persisted_agent_run_record(
 ) -> PersistedAgentRunRecord {
     PersistedAgentRunRecord {
         repo_id,
+        run_id: running.run_id.clone(),
         issue_id: running.issue.id.clone(),
         issue_identifier: running.issue.identifier.clone(),
         agent_name: running.agent_name.clone(),
@@ -1166,6 +1167,7 @@ mod tests {
         };
         let run = PersistedAgentRunRecord {
             repo_id: String::new(),
+            run_id: Some("run-7".into()),
             issue_id: "issue-7".into(),
             issue_identifier: "DOG-7".into(),
             agent_name: "implementer".into(),

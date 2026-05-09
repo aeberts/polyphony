@@ -137,9 +137,12 @@ impl RuntimeService {
             .filter(|text| !text.is_empty())
             .map(ToOwned::to_owned);
         let tracker = self.tracker_for_issue(&issue.id);
-        // Acknowledge the issue on first dispatch so the reporter knows
-        // Polyphony is looking at it (e.g. adds an eyes reaction on GitHub).
-        if attempt.unwrap_or(0) == 0
+        let synthetic_issue = is_synthetic_issue_id(&issue.id);
+        // Acknowledge tracker issues on first dispatch so the reporter knows
+        // Polyphony is looking at them. Synthetic webhook/PR issues have no
+        // tracker-side record, so skip tracker writes for those.
+        if !synthetic_issue
+            && attempt.unwrap_or(0) == 0
             && let Err(error) = tracker.acknowledge_issue(&issue).await
         {
             warn!(
@@ -302,14 +305,16 @@ impl RuntimeService {
                 ),
             );
         }
-        if let Err(error) = tracker.ensure_issue_workflow_tracking(&issue).await {
-            warn!(%error, issue_identifier = %issue.identifier, "issue workflow tracking setup failed");
-        }
-        if let Err(error) = tracker
-            .update_issue_workflow_status(&issue, "In Progress")
-            .await
-        {
-            warn!(%error, issue_identifier = %issue.identifier, "issue workflow status sync failed");
+        if !synthetic_issue {
+            if let Err(error) = tracker.ensure_issue_workflow_tracking(&issue).await {
+                warn!(%error, issue_identifier = %issue.identifier, "issue workflow tracking setup failed");
+            }
+            if let Err(error) = tracker
+                .update_issue_workflow_status(&issue, "In Progress")
+                .await
+            {
+                warn!(%error, issue_identifier = %issue.identifier, "issue workflow status sync failed");
+            }
         }
         info!(
             issue_identifier = %issue.identifier,

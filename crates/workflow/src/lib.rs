@@ -262,11 +262,31 @@ pub struct DaemonUserConfig {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
 pub struct WebhookProviderConfig {
     pub auth: String,
     pub secret: String,
     pub header: Option<String>,
+    pub query: Option<String>,
+    pub source_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct WebhookTriggerConfig {
+    pub enabled: bool,
+    pub description: Option<String>,
+    pub repo_id: Option<String>,
+    pub agent: String,
+    pub model: Option<String>,
+    pub auth: String,
+    pub secret: String,
+    pub header: Option<String>,
+    pub query: Option<String>,
+    pub source_allowlist: Vec<String>,
+    pub title: Option<String>,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -274,6 +294,7 @@ pub struct WebhookProviderConfig {
 pub struct WebhooksConfig {
     pub enabled: bool,
     pub providers: HashMap<String, WebhookProviderConfig>,
+    pub triggers: HashMap<String, WebhookTriggerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

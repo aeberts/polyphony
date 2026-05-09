@@ -463,6 +463,7 @@ mod tests {
         };
         let persisted_run = PersistedAgentRunRecord {
             repo_id: String::new(),
+            run_id: Some("run-1".into()),
             issue_id: "issue-1".into(),
             issue_identifier: "GH-1".into(),
             agent_name: "codex".into(),

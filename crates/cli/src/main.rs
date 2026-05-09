@@ -45,6 +45,36 @@ struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 enum Commands {
+    /// Bootstrap config and workflow files for the current repository
+    Init {
+        /// Starter workflow pack to write when WORKFLOW.md is missing
+        #[arg(long, value_enum)]
+        pack: Option<init_command::InitTemplate>,
+        /// Backward-compatible alias for `--pack`
+        #[arg(long, value_enum)]
+        template: Option<init_command::InitTemplate>,
+        /// Overwrite an existing WORKFLOW.md with the selected template
+        #[arg(long)]
+        force: bool,
+        /// Seed a specific tracker instead of relying on repo auto-detection
+        #[arg(long, value_enum, default_value_t = init_command::InitTracker::Auto)]
+        tracker: init_command::InitTracker,
+        /// Tracker repository slug, for example `owner/repo` or `group/project`
+        #[arg(long)]
+        repository: Option<String>,
+        /// Tracker project slug, mainly for Linear
+        #[arg(long)]
+        project_slug: Option<String>,
+        /// Workspace default branch to seed into `polyphony.toml`
+        #[arg(long)]
+        default_branch: Option<String>,
+        /// Print all starter packs with guidance, then exit
+        #[arg(long)]
+        list_packs: bool,
+        /// Backward-compatible alias for `--list-packs`
+        #[arg(long)]
+        list_templates: bool,
+    },
     /// Run and control a headless Polyphony daemon
     Daemon {
         #[command(subcommand)]
@@ -314,6 +344,7 @@ mod bootstrap_support;
 mod commands;
 mod daemon;
 mod errors;
+mod init_command;
 mod prelude;
 mod repo_manager;
 mod store_support;
@@ -333,6 +364,7 @@ use crate::{
     commands::{handle_config_command, handle_doctor_command, handle_issue_command},
     daemon::{DaemonRequest, send_control_request, start_daemon_process},
     errors::format_fatal_error,
+    init_command::{InitOptions, print_init_report, print_pack_catalog, run_init_command},
     store_support::{build_store, reset_repository_state},
     tracing_support::{
         TelemetryGuard, TracingOutput, init_run_log_sink, init_tracing, load_historical_log_lines,
@@ -380,6 +412,45 @@ async fn try_main() -> Result<(), Error> {
     if matches!(cli.command, Some(Commands::Reset)) {
         let report = reset_repository_state(&workflow_path, cli.sqlite_url.as_deref()).await?;
         return print_json(&report);
+    }
+
+    if let Some(Commands::Init {
+        pack,
+        template,
+        force,
+        tracker,
+        repository,
+        project_slug,
+        default_branch,
+        list_packs,
+        list_templates,
+    }) = &cli.command
+    {
+        if *list_packs || *list_templates {
+            print_pack_catalog();
+            return Ok(());
+        }
+        let selected_pack = match (pack, template) {
+            (Some(pack), Some(template)) if pack != template => {
+                return Err(Error::Config(
+                    "`--pack` and `--template` must match when both are provided".into(),
+                ));
+            },
+            (Some(pack), _) => *pack,
+            (_, Some(template)) => *template,
+            (None, None) => init_command::InitTemplate::Default,
+        };
+        let options = InitOptions {
+            pack: selected_pack,
+            force: *force,
+            tracker: *tracker,
+            repository: repository.clone(),
+            project_slug: project_slug.clone(),
+            default_branch: default_branch.clone(),
+        };
+        let report = run_init_command(&workflow_path, &options)?;
+        print_init_report(&report);
+        return Ok(());
     }
 
     // For issue/config subcommands, skip TUI/tracing setup — just load the workflow and dispatch.

@@ -13,13 +13,51 @@ just test
 just docs-build
 ```
 
+## Bootstrap a repo
+
+The fastest way to bootstrap a repository is now:
+
+```bash
+polyphony init
+```
+
+This command:
+
+- creates `WORKFLOW.md` when missing
+- creates `~/.config/polyphony/config.toml` when missing
+- seeds `.polyphony/agents/` with starter prompt files
+- seeds `polyphony.toml` in git repositories when local tracker/workspace wiring can be inferred
+- accepts explicit pack parameters for tracker, repository, project slug, and default branch
+- auto-detects GitHub and GitLab remotes for repo-local tracker wiring
+- prints setup hints when a starter still needs tracker or auth edits
+- auto-detects supported local agent CLIs and inserts their profiles into the user config on first
+  run
+
+Starter packs are built in:
+
+```bash
+polyphony init --list-packs
+polyphony init --pack codex
+polyphony init --pack multi-agent
+polyphony init --pack pipeline-static
+polyphony init --pack pipeline-planner
+polyphony init --pack automation-feedback
+polyphony init --pack pipeline-static --tracker github --repository owner/repo
+polyphony init --pack codex --tracker linear --project-slug ENG
+```
+
+Use `--force` to overwrite an existing `WORKFLOW.md` with the selected pack. `--template` and
+`--list-templates` still work as backward-compatible aliases.
+
+Pack-by-pack guidance lives in [Starter Templates](./starter-templates.md).
+
 ## Running polyphony
 
-On first start, the CLI creates `~/.config/polyphony/config.toml` if it does not exist. The
-generated file is an annotated reference template, with every supported top-level config area shown
-and local CLI terminal settings such as `use_tmux` documented inline. The default values keep
-`tracker.kind = "none"` and no dispatch agents, so the real CLI can start without external services
-or mock data:
+If you skip `polyphony init`, the normal runtime still bootstraps missing files on first start. The
+generated `~/.config/polyphony/config.toml` is an annotated reference template, with every
+supported top-level config area shown and local CLI terminal settings such as `use_tmux`
+documented inline. The default values keep `tracker.kind = "none"` and no dispatch agents, so the
+real CLI can start without external services or mock data:
 
 ```bash
 cargo run -p polyphony-cli

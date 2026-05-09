@@ -71,14 +71,16 @@
     {% for t in inbox_items %}
     <div class="grid-row cols-inbox-multi inbox-row{% if t.parent_id %} child{% endif %}{% if t.status == 'open' or t.status == 'in_progress' or t.status == 'started' or t.status == 'ready' %} active{% endif %}" data-item-id="{{ t.item_id }}" data-title="{{ t.title }}" data-status="{{ t.status }}" data-approval="{{ t.approval_state }}" data-priority="{{ t.priority }}" data-updated="{{ t.updated_at }}" data-author="{{ t.author }}" data-labels="{{ t.labels | join(',') }}" data-repo="{{ t.repo_id }}" data-source="{{ t.source }}" style="cursor: pointer;">
       <span>
-        {% if t.has_workspace %}<span class="col-accent" title="Has workspace">&#x25CF;</span>
+        {% if t.parent_id %}<span class="col-muted">&nbsp;</span>
+        {% elif t.has_workspace %}<span class="col-accent" title="Has workspace">&#x25CF;</span>
         {% else %}<span class="col-muted"> </span>{% endif %}
       </span>
-      <span class="col-muted">{% if t.updated_at %}<time datetime="{{ t.updated_at }}">{{ t.updated_at }}</time>{% else %}&mdash;{% endif %}</span>
-      <span class="col-muted" title="{{ t.source }}">{% if t.repo_id %}{{ t.repo_id }}{% else %}{% set ns_matched = namespace(name=t.source) %}{% for r in repo_registrations %}{% if r.repo_id in t.source or r.repo_id in t.item_id %}{% set ns_matched.name = r.repo_id %}{% endif %}{% endfor %}{{ ns_matched.name }}{% endif %}</span>
-      <span class="col-title">
-        {% if t.parent_id %}<span class="tree-prefix">├── </span>{% endif %}
-        {% if t.url %}<a href="{{ t.url }}" target="_blank" onclick="event.stopPropagation()">{{ t.title }}</a>
+      <span class="col-muted">{% if t.parent_id %}&nbsp;{% elif t.updated_at %}<time datetime="{{ t.updated_at }}">{{ t.updated_at }}</time>{% else %}&mdash;{% endif %}</span>
+      <span class="col-muted" title="{% if not t.parent_id %}{{ t.source }}{% endif %}">{% if t.parent_id %}&nbsp;{% elif t.repo_id %}{{ t.repo_id }}{% else %}{% set ns_matched = namespace(name=t.source) %}{% for r in repo_registrations %}{% if r.repo_id in t.source or r.repo_id in t.item_id %}{% set ns_matched.name = r.repo_id %}{% endif %}{% endfor %}{{ ns_matched.name }}{% endif %}</span>
+      <span class="col-title{% if t.parent_id %} child-title{% endif %}">
+        {% if t.parent_id %}<span class="child-branch" aria-hidden="true"></span>{% endif %}
+        {% if t.url %}<a{% if t.parent_id %} class="child-title-text"{% endif %} href="{{ t.url }}" target="_blank" onclick="event.stopPropagation()">{{ t.title }}</a>
+        {% elif t.parent_id %}<span class="child-title-text">{{ t.title }}</span>
         {% else %}{{ t.title }}{% endif %}
       </span>
       <span>
@@ -96,7 +98,7 @@
         {% elif t.approval_state == "Waiting" %}<span class="col-warning" title="Waiting for approval">&#x25F7;</span>
         {% endif %}
       </span>
-      <span class="col-muted">{% if t.priority is not none %}P{{ t.priority }}{% else %}&mdash;{% endif %}</span>
+      <span class="col-muted">{% if t.parent_id %}&nbsp;{% elif t.priority is not none %}P{{ t.priority }}{% else %}&mdash;{% endif %}</span>
     </div>
     {% endfor %}
     <div class="grid-footer" id="inbox-footer">

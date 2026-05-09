@@ -123,6 +123,7 @@ pub enum RuntimeCommand {
         agent_name: Option<String>,
         directives: Option<String>,
     },
+    DispatchWebhook(Box<WebhookDispatchRequest>),
     DispatchPullRequestInboxItem {
         item_id: String,
         directives: Option<String>,
@@ -207,6 +208,7 @@ pub struct RuntimeService {
     pending_deliverable_resolutions:
         Vec<(polyphony_core::RunId, polyphony_core::DeliverableDecision)>,
     pending_manual_dispatches: Vec<ManualDispatchRequest>,
+    pending_webhook_dispatches: Vec<WebhookDispatchRequest>,
     pending_manual_pull_request_inbox_dispatches: Vec<ManualPullRequestInboxDispatchRequest>,
     pending_merge_deliverables: Vec<polyphony_core::RunId>,
     pending_run_retries: Vec<polyphony_core::RunId>,
@@ -240,6 +242,16 @@ struct ManualDispatchRequest {
     issue_id: polyphony_core::IssueId,
     agent_name: Option<String>,
     directives: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebhookDispatchRequest {
+    pub trigger_id: String,
+    pub repo_id: Option<String>,
+    pub issue: Issue,
+    pub agent_name: String,
+    pub model: Option<String>,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone)]

@@ -255,6 +255,7 @@ impl RuntimeService {
                 pending_issue_closures: Vec::new(),
                 pending_deliverable_resolutions: Vec::new(),
                 pending_manual_dispatches: Vec::new(),
+                pending_webhook_dispatches: Vec::new(),
                 pending_manual_pull_request_inbox_dispatches: Vec::new(),
                 pending_merge_deliverables: Vec::new(),
                 pending_run_retries: Vec::new(),
@@ -405,6 +406,16 @@ impl RuntimeService {
                                 agent_name,
                                 directives,
                             });
+                            next_tick = Instant::now();
+                        }
+                        RuntimeCommand::DispatchWebhook(request) => {
+                            info!(
+                                trigger_id = %request.trigger_id,
+                                issue_identifier = %request.issue.identifier,
+                                agent = %request.agent_name,
+                                "webhook dispatch queued (event loop)"
+                            );
+                            self.pending_webhook_dispatches.push(*request);
                             next_tick = Instant::now();
                         }
                         RuntimeCommand::DispatchPullRequestInboxItem {
@@ -756,6 +767,15 @@ impl RuntimeService {
                         directives,
                     });
                 },
+                Ok(RuntimeCommand::DispatchWebhook(request)) => {
+                    info!(
+                        trigger_id = %request.trigger_id,
+                        issue_identifier = %request.issue.identifier,
+                        agent = %request.agent_name,
+                        "webhook dispatch queued"
+                    );
+                    self.pending_webhook_dispatches.push(*request);
+                },
                 Ok(RuntimeCommand::DispatchPullRequestInboxItem {
                     item_id,
                     directives,
@@ -996,6 +1016,77 @@ impl RuntimeService {
             );
         }
         self.save_cache().await;
+    }
+
+    pub(crate) async fn process_pending_webhook_dispatches(&mut self) {
+        let dispatches = std::mem::take(&mut self.pending_webhook_dispatches);
+        if dispatches.is_empty() {
+            return;
+        }
+
+        for request in dispatches {
+            let repo_label = request.repo_id.as_deref().unwrap_or("default");
+            let workflow = if let Some(repo_id) = request.repo_id.as_deref() {
+                let Some(context) = self.repos.get(repo_id) else {
+                    self.push_event(
+                        EventScope::Dispatch,
+                        format!(
+                            "webhook {} failed: repo {repo_id} is not registered",
+                            request.trigger_id
+                        ),
+                    );
+                    continue;
+                };
+                context.workflow.clone()
+            } else {
+                self.workflow()
+            };
+
+            let mut workflow = workflow.clone();
+            workflow.config.pipeline.enabled = false;
+            workflow.config.orchestration.router_agent = None;
+            workflow.config.pipeline.planner_agent = None;
+            workflow.definition.prompt_template = "{{ issue.description }}".into();
+
+            let Some(profile) = workflow.config.agents.profiles.get_mut(&request.agent_name) else {
+                self.push_event(
+                    EventScope::Dispatch,
+                    format!(
+                        "webhook {} failed: agent {} is not configured",
+                        request.trigger_id, request.agent_name
+                    ),
+                );
+                continue;
+            };
+            if let Some(model) = request.model.clone() {
+                profile.model = Some(model);
+            }
+
+            if let Some(repo_id) = request.repo_id.clone() {
+                self.state
+                    .issue_repo_map
+                    .insert(request.issue.id.clone(), repo_id);
+            }
+
+            let mut issue = request.issue.clone();
+            issue.description = Some(request.prompt.clone());
+
+            self.push_event(
+                EventScope::Dispatch,
+                format!(
+                    "webhook {} queued {} via {} ({repo_label})",
+                    request.trigger_id, issue.identifier, request.agent_name
+                ),
+            );
+            self.dispatch_requested_issue(
+                workflow,
+                issue,
+                Some(&request.agent_name),
+                None,
+                "webhook dispatch",
+            )
+            .await;
+        }
     }
 
     pub(crate) async fn process_manual_dispatches(&mut self) {
@@ -2236,6 +2327,7 @@ impl RuntimeService {
         self.process_pending_task_resolutions().await;
         self.process_pending_task_retries().await;
         self.process_pending_agent_stops().await;
+        self.process_pending_webhook_dispatches().await;
         self.process_manual_dispatches().await;
         self.process_manual_pull_request_inbox_dispatches().await;
         // Emit snapshot immediately after dispatches so runs appear in the TUI

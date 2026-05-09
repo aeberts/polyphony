@@ -80,6 +80,7 @@
 {# Detail modals #}
 {% for m in runs %}
 {% if m.deliverable %}
+{% set insight = run_insights[m.id] %}
 <div class="modal-overlay" id="modal-outcome-{{ m.id }}">
   <div class="modal">
     <div class="modal-header">
@@ -135,6 +136,38 @@
         <a href="{{ m.deliverable.url }}" target="_blank" style="font-size: 0.85rem; font-weight: 500;">{{ m.deliverable.url }} &rarr;</a>
       </div>
       {% endif %}
+
+      <div class="detail-grid">
+        <div class="detail-card">
+          <h4>Summary</h4>
+          <div class="modal-description">{{ insight.summary }}</div>
+          {% if insight.next_action %}
+          <div class="detail-list" style="margin-top: 0.6rem;">
+            <div class="detail-list-row"><span class="key">next</span><span>{{ insight.next_action }}</span></div>
+          </div>
+          {% endif %}
+        </div>
+        {% if insight.history_facts %}
+        <div class="detail-card">
+          <h4>History</h4>
+          <div class="detail-list">
+            {% for fact in insight.history_facts %}
+            <div class="detail-list-row"><span class="key">{{ fact.label }}</span><span>{{ fact.value }}</span></div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+        {% if insight.artifact_facts %}
+        <div class="detail-card">
+          <h4>Artifacts</h4>
+          <div class="detail-list">
+            {% for fact in insight.artifact_facts %}
+            <div class="detail-list-row"><span class="key">{{ fact.label }}</span><span>{{ fact.value }}</span></div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+      </div>
 
       {# Deliverable title & description #}
       {% if m.deliverable.title %}

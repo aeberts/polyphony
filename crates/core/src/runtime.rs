@@ -12,6 +12,8 @@ pub struct CodexTotals {
 pub struct RunningAgentRow {
     #[serde(default)]
     pub repo_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
     pub issue_id: String,
     pub issue_identifier: String,
     pub agent_name: String,
@@ -374,6 +376,8 @@ pub struct IssueStateUpdate {
 pub struct AgentRunHistoryRow {
     #[serde(default)]
     pub repo_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
     pub issue_id: String,
     pub issue_identifier: String,
     pub agent_name: String,
@@ -404,6 +408,8 @@ pub struct AgentRunHistoryRow {
 pub struct PersistedAgentRunRecord {
     #[serde(default)]
     pub repo_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
     pub issue_id: String,
     pub issue_identifier: String,
     pub agent_name: String,
@@ -435,6 +441,7 @@ impl PersistedAgentRunRecord {
     pub fn to_agent_run_history_row(&self) -> AgentRunHistoryRow {
         AgentRunHistoryRow {
             repo_id: self.repo_id.clone(),
+            run_id: self.run_id.clone(),
             issue_id: self.issue_id.clone(),
             issue_identifier: self.issue_identifier.clone(),
             agent_name: self.agent_name.clone(),

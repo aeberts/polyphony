@@ -3612,6 +3612,7 @@ dependencies = [
  "dirs",
  "hex",
  "hmac",
+ "ipnet",
  "minijinja",
  "polyphony-core",
  "polyphony-orchestrator",
@@ -3631,6 +3632,7 @@ dependencies = [
  "tower-sessions",
  "tower-sessions-sqlx-store",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

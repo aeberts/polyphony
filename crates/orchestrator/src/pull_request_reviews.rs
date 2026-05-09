@@ -1084,10 +1084,11 @@ impl RuntimeService {
                     .clone()
                     .unwrap_or_else(|| "Human Review".into());
                 if !workflow.config.is_active_state(&workflow_status) {
-                    if let Err(error) = self
-                        .tracker
-                        .update_issue_workflow_status(&issue, &workflow_status)
-                        .await
+                    if !is_synthetic_issue_id(&issue.id)
+                        && let Err(error) = self
+                            .tracker
+                            .update_issue_workflow_status(&issue, &workflow_status)
+                            .await
                     {
                         warn!(%error, issue_identifier = %issue.identifier, "issue workflow status sync failed");
                     }
@@ -1208,10 +1209,11 @@ impl RuntimeService {
                     .clone()
                     .unwrap_or_else(|| "Human Review".into());
                 if !workflow.config.is_active_state(&workflow_status) {
-                    if let Err(error) = self
-                        .tracker_for_issue(&running.issue.id)
-                        .update_issue_workflow_status(&running.issue, &workflow_status)
-                        .await
+                    if !is_synthetic_issue_id(&running.issue.id)
+                        && let Err(error) = self
+                            .tracker_for_issue(&running.issue.id)
+                            .update_issue_workflow_status(&running.issue, &workflow_status)
+                            .await
                     {
                         warn!(%error, issue_identifier = %running.issue.identifier, "issue workflow status sync failed");
                     }

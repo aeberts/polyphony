@@ -43,6 +43,29 @@ impl RuntimeService {
         }
     }
 
+    async fn complete_step_with_output(
+        &mut self,
+        run_id: &Option<String>,
+        kind: StepKind,
+        output: std::collections::HashMap<String, serde_json::Value>,
+    ) {
+        let Some(id) = run_id.as_deref() else {
+            return;
+        };
+        if let Some(run) = self.state.runs.get_mut(id)
+            && let Some(step) = run
+                .steps
+                .iter_mut()
+                .find(|s| s.kind == kind && s.status == polyphony_core::StepStatus::Running)
+        {
+            step.mark_succeeded_with_output(output);
+            run.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                let _ = store.save_run(run).await;
+            }
+        }
+    }
+
     async fn fail_step(&mut self, run_id: &Option<String>, kind: StepKind, error: &str) {
         let Some(id) = run_id.as_deref() else {
             return;
@@ -312,13 +335,51 @@ impl RuntimeService {
             );
             return Ok(());
         };
-        self.complete_step(&run_id, polyphony_core::StepKind::Commit)
-            .await;
+        self.complete_step_with_output(
+            &run_id,
+            polyphony_core::StepKind::Commit,
+            std::collections::HashMap::from([
+                (
+                    "branch".into(),
+                    serde_json::Value::String(commit_result.branch_name.clone()),
+                ),
+                (
+                    "head_sha".into(),
+                    serde_json::Value::String(commit_result.head_sha.clone()),
+                ),
+                (
+                    "changed_files".into(),
+                    serde_json::Value::Number(commit_result.changed_files.into()),
+                ),
+                (
+                    "lines_added".into(),
+                    serde_json::Value::Number(commit_result.lines_added.unwrap_or(0).into()),
+                ),
+                (
+                    "lines_removed".into(),
+                    serde_json::Value::Number(commit_result.lines_removed.unwrap_or(0).into()),
+                ),
+            ]),
+        )
+        .await;
         // Push is bundled with commit_and_push — auto-complete the Push step.
         self.mark_step_running(&run_id, polyphony_core::StepKind::Push)
             .await;
-        self.complete_step(&run_id, polyphony_core::StepKind::Push)
-            .await;
+        self.complete_step_with_output(
+            &run_id,
+            polyphony_core::StepKind::Push,
+            std::collections::HashMap::from([
+                (
+                    "branch".into(),
+                    serde_json::Value::String(commit_result.branch_name.clone()),
+                ),
+                (
+                    "head_sha".into(),
+                    serde_json::Value::String(commit_result.head_sha.clone()),
+                ),
+            ]),
+        )
+        .await;
         info!(
             issue_identifier = %running.issue.identifier,
             branch_name = %commit_result.branch_name,
@@ -391,8 +452,29 @@ impl RuntimeService {
                 return Err(Error::Core(error));
             },
         };
-        self.complete_step(&run_id, polyphony_core::StepKind::CreatePullRequest)
-            .await;
+        self.complete_step_with_output(
+            &run_id,
+            polyphony_core::StepKind::CreatePullRequest,
+            std::collections::HashMap::from([
+                (
+                    "url".into(),
+                    serde_json::Value::String(pull_request.url.clone().unwrap_or_default()),
+                ),
+                (
+                    "number".into(),
+                    serde_json::Value::Number(pull_request.number.into()),
+                ),
+                (
+                    "branch".into(),
+                    serde_json::Value::String(branch_name.clone()),
+                ),
+                (
+                    "head_sha".into(),
+                    serde_json::Value::String(commit_result.head_sha.clone()),
+                ),
+            ]),
+        )
+        .await;
         info!(
             issue_identifier = %running.issue.identifier,
             pull_request_number = pull_request.number,
@@ -446,8 +528,15 @@ impl RuntimeService {
             .run_review_pass(workflow, running, &pull_request)
             .await?;
         if let Some(review_body) = review_body {
-            self.complete_step(&run_id, polyphony_core::StepKind::ReviewPass)
-                .await;
+            self.complete_step_with_output(
+                &run_id,
+                polyphony_core::StepKind::ReviewPass,
+                std::collections::HashMap::from([(
+                    "review_generated".into(),
+                    serde_json::Value::Bool(true),
+                )]),
+            )
+            .await;
             self.mark_step_running(&run_id, polyphony_core::StepKind::PostReviewComment)
                 .await;
             if let Some(commenter) = self.pull_request_commenter_for_issue(&running.issue.id) {
@@ -455,8 +544,15 @@ impl RuntimeService {
                     .comment_on_pull_request(&pull_request, &review_body)
                     .await;
             }
-            self.complete_step(&run_id, polyphony_core::StepKind::PostReviewComment)
-                .await;
+            self.complete_step_with_output(
+                &run_id,
+                polyphony_core::StepKind::PostReviewComment,
+                std::collections::HashMap::from([(
+                    "url".into(),
+                    serde_json::Value::String(pull_request.url.clone().unwrap_or_default()),
+                )]),
+            )
+            .await;
         } else {
             self.skip_step(&run_id, polyphony_core::StepKind::ReviewPass)
                 .await;
@@ -469,8 +565,15 @@ impl RuntimeService {
             .await;
         self.send_handoff_feedback(workflow, running, &pull_request, &commit_result)
             .await;
-        self.complete_step(&run_id, polyphony_core::StepKind::SendFeedback)
-            .await;
+        self.complete_step_with_output(
+            &run_id,
+            polyphony_core::StepKind::SendFeedback,
+            std::collections::HashMap::from([(
+                "url".into(),
+                serde_json::Value::String(pull_request.url.clone().unwrap_or_default()),
+            )]),
+        )
+        .await;
 
         self.push_event(
             EventScope::Handoff,

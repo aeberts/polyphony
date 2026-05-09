@@ -1070,6 +1070,73 @@ async fn handle_next_worker_message(service: &mut RuntimeService) {
 }
 
 #[tokio::test]
+async fn webhook_dispatch_uses_synthetic_issue_without_tracker_side_effects() {
+    let workspace_root = unique_workspace_root("webhook-dispatch");
+    let workflow = test_workflow(&workspace_root);
+    let (_tx, workflow_rx) = watch::channel(workflow.clone());
+    let tracker = TestTracker::new(Vec::new());
+    let provisioner = RecordingProvisioner::default();
+    let agent = ScriptedPipelineAgent::default();
+    let (mut service, _handle) = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent.clone()),
+        Arc::new(provisioner),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        workflow_rx,
+    );
+    service
+        .pending_webhook_dispatches
+        .push(WebhookDispatchRequest {
+            trigger_id: "deploy".into(),
+            repo_id: None,
+            issue: Issue {
+                id: format!("webhook:deploy:1:{}", uuid::Uuid::new_v4()),
+                identifier: "WEBHOOK-DEPLOY-1".into(),
+                title: "Deploy 1".into(),
+                description: Some("{\"event\":\"push\"}".into()),
+                priority: None,
+                state: "webhook".into(),
+                branch_name: None,
+                url: None,
+                author: None,
+                labels: vec!["webhook:deploy".into()],
+                comments: Vec::new(),
+                blocked_by: Vec::new(),
+                approval_state: DispatchApprovalState::Approved,
+                parent_id: None,
+                created_at: None,
+                updated_at: None,
+            },
+            agent_name: "mock".into(),
+            model: Some("gpt-test".into()),
+            prompt: "Inspect the webhook payload".into(),
+        });
+
+    service.process_pending_webhook_dispatches().await;
+    handle_next_worker_message(&mut service).await;
+
+    let calls = agent.recorded_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "mock");
+    assert_eq!(calls[0].1, "Inspect the webhook payload");
+    assert!(tracker.acknowledged_issues().is_empty());
+    assert!(tracker.recorded_workflow_updates().is_empty());
+    assert!(
+        service
+            .state
+            .runs
+            .values()
+            .any(|run| run.issue_identifier.as_deref() == Some("WEBHOOK-DEPLOY-1"))
+    );
+}
+
+#[tokio::test]
 async fn reconcile_running_releases_missing_issue() {
     let workspace_root = unique_workspace_root("missing");
     let provisioner = RecordingProvisioner::default();
@@ -3223,6 +3290,7 @@ fn restore_bootstrap_rehydrates_saved_context_from_workspace_artifact() {
         reviewed_pull_request_heads: std::collections::HashMap::new(),
         agent_run_history: vec![PersistedAgentRunRecord {
             repo_id: String::new(),
+            run_id: Some("run-restore".into()),
             issue_id: "issue-restore".into(),
             issue_identifier: "DOG-104".into(),
             agent_name: "implementer".into(),

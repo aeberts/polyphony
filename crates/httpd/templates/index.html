@@ -2,10 +2,6 @@
 {% block title %}Polyphony &mdash; Dashboard{% endblock %}
 
 {% block content %}
-<div class="page-header">
-  <span class="meta">{{ dispatch_mode }} &middot; {{ tracker_kind }}</span>
-</div>
-
 <div class="stats">
   <div class="stat">
     <div class="value{% if counts.running > 0 %} accent{% endif %}">{{ counts.running }}</div>
@@ -95,9 +91,9 @@
         {% else %}<span class="col-muted"> </span>{% endif %}
       </span>
       <span class="col-muted">{% if t.updated_at %}<time datetime="{{ t.updated_at }}">{{ t.updated_at }}</time>{% else %}&mdash;{% endif %}</span>
-      <span class="col-title">
-        {% if t.parent_id %}<span class="tree-prefix">├── </span>{% endif %}
-        <a href="/inbox">{{ t.title }}</a>
+      <span class="col-title{% if t.parent_id %} child-title{% endif %}">
+        {% if t.parent_id %}<span class="child-branch" aria-hidden="true"></span>{% endif %}
+        <a{% if t.parent_id %} class="child-title-text"{% endif %} href="/inbox">{{ t.title }}</a>
       </span>
       <span>
         {% if t.status == "open" or t.status == "in_progress" or t.status == "started" or t.status == "in progress" or t.status == "ready" %}<span class="col-success" title="{{ t.status }}">&#x25CF;</span>

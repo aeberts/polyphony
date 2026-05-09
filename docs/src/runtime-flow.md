@@ -5,12 +5,20 @@ components.
 
 ## Startup
 
+When you want to create the initial files deliberately instead of relying on first-run side
+effects, use:
+
+```bash
+polyphony init
+```
+
 At startup the CLI:
 
 1. initializes tracing, routing local logs into the TUI when active and falling back to local stderr logs if OTLP exporter setup fails
 2. creates `~/.config/polyphony/config.toml` if it is missing
 3. creates `WORKFLOW.md` when it is missing, via a startup modal in TUI mode or automatically in `--no-tui` mode
-4. seeds `.polyphony/config.toml` in git repos when the checked-in workflow is still generic and local repo wiring is unset
+4. seeds `.polyphony/config.toml` in git repos when the checked-in workflow is still generic and local repo wiring is unset, including GitHub and GitLab remote detection where possible
+   - `polyphony init` can also seed tracker/repository/project slug/default branch values directly with `--pack`, `--tracker`, `--repository`, `--project-slug`, and `--default-branch`
 5. loads the merged runtime config from built-in defaults, `~/.config/polyphony/config.toml`, `WORKFLOW.md`, and `.polyphony/config.toml`
 6. builds the selected tracker and agent registry runtime
 7. creates the git-backed workspace provisioner

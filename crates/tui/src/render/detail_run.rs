@@ -1,4 +1,4 @@
-use polyphony_core::RuntimeSnapshot;
+use polyphony_core::{RuntimeSnapshot, build_run_insight};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -173,13 +173,102 @@ pub(crate) fn draw_run_detail(
 
     // Body: KV info + related tasks + events
     let format_time = super::format_detail_time;
+    let run_tasks = snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.run_id == run.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let run_history = snapshot
+        .agent_run_history
+        .iter()
+        .filter(|entry| polyphony_core::agent_history_matches_run(run, entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    let running_agents = snapshot
+        .running
+        .iter()
+        .filter(|entry| polyphony_core::running_agent_matches_run(run, entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    let insight = build_run_insight(run, &run_tasks, &run_history, &running_agents);
 
-    let mut lines = vec![
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Summary",
+        Style::default()
+            .fg(theme.highlight)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        insight.summary.clone(),
+        Style::default().fg(theme.foreground),
+    )));
+    if let Some(next_action) = &insight.next_action {
+        lines.push(Line::from(vec![
+            Span::styled("Next: ", Style::default().fg(theme.muted)),
+            Span::styled(next_action.clone(), Style::default().fg(theme.info)),
+        ]));
+    }
+    if let Some(stop_reason) = &insight.stop_reason {
+        lines.push(Line::from(vec![
+            Span::styled("Why:  ", Style::default().fg(theme.muted)),
+            Span::styled(stop_reason.clone(), Style::default().fg(theme.warning)),
+        ]));
+    }
+    if let Some(last_activity) = &insight.last_activity {
+        lines.push(Line::from(vec![
+            Span::styled("Last: ", Style::default().fg(theme.muted)),
+            Span::styled(last_activity.clone(), Style::default().fg(theme.foreground)),
+        ]));
+    }
+
+    if !insight.history_facts.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "History",
+            Style::default()
+                .fg(theme.highlight)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for fact in &insight.history_facts {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", fact.label),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(fact.value.clone(), Style::default().fg(theme.foreground)),
+            ]));
+        }
+    }
+
+    if !insight.artifact_facts.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Artifacts",
+            Style::default()
+                .fg(theme.highlight)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for fact in &insight.artifact_facts {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", fact.label),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(fact.value.clone(), Style::default().fg(theme.foreground)),
+            ]));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.extend([
         kv_line("ID", &run.id, theme),
         kv_line("Kind", super::orchestrator::run_kind_label(run.kind), theme),
         kv_line("Target", &super::orchestrator::run_target_label(run), theme),
         kv_line("Created", &format_time(run.created_at), theme),
-    ];
+    ]);
 
     if let Some(deliverable) = &run.deliverable {
         lines.push(kv_line(
@@ -374,6 +463,32 @@ pub(crate) fn draw_run_detail(
                     Span::styled(indent.to_string(), Style::default().fg(theme.border)),
                     Span::styled(excerpt, Style::default().fg(theme.danger)),
                 ]));
+            }
+            if !step.output.is_empty() {
+                let indent = if is_last {
+                    "     "
+                } else {
+                    "  │  "
+                };
+                let mut outputs = step
+                    .output
+                    .iter()
+                    .filter_map(|(key, value)| match value {
+                        serde_json::Value::String(value) if !value.trim().is_empty() => {
+                            Some(format!("{key}={value}"))
+                        },
+                        serde_json::Value::Number(value) => Some(format!("{key}={value}")),
+                        serde_json::Value::Bool(value) => Some(format!("{key}={value}")),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                outputs.sort();
+                if !outputs.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(indent.to_string(), Style::default().fg(theme.border)),
+                        Span::styled(outputs.join("  "), Style::default().fg(theme.muted)),
+                    ]));
+                }
             }
         }
     }

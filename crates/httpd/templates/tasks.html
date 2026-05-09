@@ -14,7 +14,7 @@
 {% if tasks %}
 <div class="card">
   <div class="search-bar">
-    <input type="text" class="search-input" id="task-search" placeholder="Filter by repo, title, run, status, category, or agent..." autocomplete="off">
+    <input type="text" class="search-input" id="task-search" placeholder="Filter by repo, title, status, category, or agent..." autocomplete="off">
     <span class="search-count" id="task-filter-count"></span>
   </div>
   {% if repo_registrations | length > 1 %}
@@ -26,21 +26,19 @@
   </div>
   {% endif %}
   <div class="grid-table" id="tasks-table">
-    <div class="grid-header" style="grid-template-columns: 2rem 8rem 7rem 1fr 7rem 7rem 4rem 5rem 8rem;">
-      <span></span>
+    <div class="grid-header" style="grid-template-columns: 10rem 8rem 1fr 4rem 7rem 6rem 5rem;">
+      <span>Updated</span>
       <span>Repo</span>
-      <span>Run</span>
       <span>Title</span>
       <span>Status</span>
       <span>Category</span>
       <span>Agent</span>
       <span>Turns</span>
-      <span>Updated</span>
     </div>
     {% for t in tasks %}
     <div
       class="grid-row{% if t.status == 'in_progress' %} active{% endif %}"
-      style="grid-template-columns: 2rem 8rem 7rem 1fr 7rem 7rem 4rem 5rem 8rem; cursor: pointer;"
+      style="grid-template-columns: 10rem 8rem 1fr 4rem 7rem 6rem 5rem; cursor: pointer;"
       data-task-id="{{ t.id }}"
       data-repo="{{ t.repo_id }}"
       data-run="{{ t.run_id }}"
@@ -50,26 +48,32 @@
       data-agent="{{ t.agent_name or '' }}"
       data-updated="{{ t.updated_at }}"
     >
-      <span>
-        {% if t.status == "completed" %}<span class="col-success">&#x2713;</span>
-        {% elif t.status == "failed" %}<span class="col-danger">&#x2715;</span>
-        {% elif t.status == "cancelled" %}<span class="col-muted">&#x2298;</span>
-        {% elif t.status == "in_progress" %}<span class="col-accent">&#x25D0;</span>
-        {% else %}<span class="col-muted">&#x2026;</span>{% endif %}
-      </span>
+      <span class="col-muted"><time datetime="{{ t.updated_at }}">{{ t.updated_at }}</time></span>
       <span class="col-muted">{% if t.repo_id %}{{ t.repo_id }}{% else %}&mdash;{% endif %}</span>
-      <span class="col-muted">{{ t.run_id }}</span>
       <span class="col-title">{{ t.title }}</span>
-      <span class="col-muted">{{ t.status }}</span>
+      <span>
+        {% if t.status == "completed" %}<span class="col-success" title="completed">&#x2713;</span>
+        {% elif t.status == "failed" %}<span class="col-danger" title="failed">&#x2715;</span>
+        {% elif t.status == "cancelled" %}<span class="col-muted" title="cancelled">&#x2298;</span>
+        {% elif t.status == "in_progress" %}<span class="col-accent" title="in progress">&#x25CF;</span>
+        {% elif t.status == "pending" %}<span class="col-warning" title="pending">&#x25F7;</span>
+        {% else %}<span class="col-muted" title="{{ t.status }}">&#xB7;</span>{% endif %}
+      </span>
       <span class="col-muted">{{ t.category }}</span>
       <span class="col-agent">{% if t.agent_name %}{{ t.agent_name }}{% else %}&mdash;{% endif %}</span>
       <span class="col-muted">{{ t.turns_completed }}</span>
-      <span class="col-muted"><time datetime="{{ t.updated_at }}">{{ t.updated_at }}</time></span>
     </div>
     {% endfor %}
     <div class="grid-footer">
       <span>{{ tasks | length }} tasks</span>
       <span>open any row for task detail and controls</span>
+    </div>
+    <div class="legend">
+      <span><span class="col-warning">&#x25F7;</span> pending</span>
+      <span><span class="col-accent legend-live">&#x25CF;</span> in progress</span>
+      <span><span class="col-success">&#x2713;</span> completed</span>
+      <span><span class="col-danger">&#x2715;</span> failed</span>
+      <span><span class="col-muted">&#x2298;</span> cancelled</span>
     </div>
   </div>
 </div>
@@ -201,7 +205,6 @@ var taskAction = (function() {
       var repoMatch = activeTaskRepo === 'all' || row.dataset.repo === activeTaskRepo;
       var text = [
         row.dataset.repo,
-        row.dataset.run,
         row.dataset.title,
         row.dataset.status,
         row.dataset.category,

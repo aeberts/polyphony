@@ -339,6 +339,7 @@ mod tests {
             running: Vec::new(),
             agent_run_history: vec![AgentRunHistoryRow {
                 repo_id: String::new(),
+                run_id: Some("run-1".into()),
                 issue_id: "1".into(),
                 issue_identifier: "ISSUE-1".into(),
                 agent_name: "codex".into(),
@@ -413,6 +414,7 @@ mod tests {
         };
         let run = crate::PersistedAgentRunRecord {
             repo_id: String::new(),
+            run_id: Some("run-1".into()),
             issue_id: "1".into(),
             issue_identifier: "ISSUE-1".into(),
             agent_name: "codex".into(),
@@ -522,6 +524,7 @@ mod tests {
             agent_run_history: (0..300)
                 .map(|index| crate::PersistedAgentRunRecord {
                     repo_id: String::new(),
+                    run_id: Some(format!("run-{index}")),
                     issue_id: index.to_string(),
                     issue_identifier: format!("ISSUE-{index}"),
                     agent_name: "codex".into(),

@@ -153,6 +153,8 @@ async fn provision_github(
             auth: "hmac_sha256".into(),
             secret,
             header: None,
+            query: None,
+            source_allowlist: Vec::new(),
         },
     })
 }
@@ -234,6 +236,8 @@ async fn provision_gitlab(
             auth: "token_header".into(),
             secret,
             header: Some("X-Gitlab-Token".into()),
+            query: None,
+            source_allowlist: Vec::new(),
         },
     })
 }
@@ -344,6 +348,8 @@ async fn provision_linear(
             auth: "hmac_sha256_header".into(),
             secret,
             header: Some("Linear-Signature".into()),
+            query: None,
+            source_allowlist: Vec::new(),
         },
     })
 }

@@ -79,12 +79,6 @@
 </div>
 {% endif %}
 
-{% set heartbeat_events = [] %}
-{% for e in recent_events %}
-  {% if e.scope == "heartbeat" %}
-    {% set_global heartbeat_events = heartbeat_events | concat(with=e) %}
-  {% endif %}
-{% endfor %}
 {% if heartbeat_events | length > 0 %}
 <div class="card">
   <div class="card-header">

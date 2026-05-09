@@ -243,6 +243,42 @@ mod command_parse_tests {
     }
 
     #[test]
+    fn parses_init_pack_and_tracker_flags() {
+        let cli = Cli::try_parse_from([
+            "polyphony",
+            "init",
+            "--pack",
+            "pipeline-static",
+            "--tracker",
+            "github",
+            "--repository",
+            "owner/repo",
+            "--default-branch",
+            "main",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Init {
+                pack,
+                tracker,
+                repository,
+                default_branch,
+                ..
+            }) => {
+                assert_eq!(
+                    pack,
+                    Some(crate::init_command::InitTemplate::PipelineStatic)
+                );
+                assert_eq!(tracker, crate::init_command::InitTracker::Github);
+                assert_eq!(repository.as_deref(), Some("owner/repo"));
+                assert_eq!(default_branch.as_deref(), Some("main"));
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_issue_comment_command() {
         let cli = Cli::try_parse_from([
             "polyphony",
@@ -455,6 +491,312 @@ workspace:
         let _ = fs::remove_dir_all(&repo_root);
 
         assert!(repo_config.is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod init_command_tests {
+    use std::{fs, process::Command};
+
+    use crate::init_command::{
+        InitOptions, InitTemplate, InitTracker, WorkflowWriteAction, render_pack_catalog,
+        run_init_command_with_user_config_path,
+    };
+
+    fn write_valid_workflow(path: &std::path::Path, prompt: &str) {
+        fs::write(
+            path,
+            format!(
+                "---\ntracker:\n  kind: none\nworkspace:\n  checkout_kind: directory\n---\n# Existing Workflow\n\n{prompt}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn init_git_repo(repo_root: &std::path::Path) {
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repo_root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn init_creates_selected_template_and_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::PipelineStatic,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let workflow_contents = fs::read_to_string(&workflow_path).unwrap();
+        let repo_config_contents = fs::read_to_string(repo_root.join("polyphony.toml")).unwrap();
+
+        assert_eq!(report.workflow_action, WorkflowWriteAction::Created);
+        assert!(report.user_config_created);
+        assert!(report.repo_config_created);
+        assert_eq!(
+            report.repo_config_auto_detected_kind.as_deref(),
+            Some("none")
+        );
+        assert!(report.tracker_needs_manual_setup);
+        assert!(report.validation_error.is_some());
+        assert!(
+            report
+                .setup_hints
+                .iter()
+                .any(|hint| hint.contains("kind = \"github\""))
+        );
+        assert_eq!(report.created_agent_prompt_files.len(), 5);
+        assert!(workflow_contents.contains("# Static Pipeline Workflow"));
+        assert!(!workflow_contents.contains("# Destination:"));
+        assert!(repo_config_contents.contains("kind = \"none\""));
+    }
+
+    #[test]
+    fn init_keeps_existing_workflow_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+        write_valid_workflow(&workflow_path, "Keep me.");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::Codex,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let workflow_contents = fs::read_to_string(&workflow_path).unwrap();
+
+        assert_eq!(report.workflow_action, WorkflowWriteAction::SkippedExisting);
+        assert!(workflow_contents.contains("Keep me."));
+        assert!(!workflow_contents.contains("# Codex Workflow"));
+    }
+
+    #[test]
+    fn init_force_overwrites_existing_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+        write_valid_workflow(&workflow_path, "Old prompt.");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::Codex,
+                force: true,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let workflow_contents = fs::read_to_string(&workflow_path).unwrap();
+
+        assert_eq!(report.workflow_action, WorkflowWriteAction::Overwritten);
+        assert!(report.validation_error.is_none());
+        assert!(workflow_contents.contains("# Codex Workflow"));
+        assert!(!workflow_contents.contains("Old prompt."));
+    }
+
+    #[test]
+    fn pack_catalog_lists_all_packs() {
+        let catalog = render_pack_catalog();
+
+        assert!(catalog.contains("default:"));
+        assert!(catalog.contains("codex:"));
+        assert!(catalog.contains("multi-agent:"));
+        assert!(catalog.contains("pipeline-static:"));
+        assert!(catalog.contains("pipeline-planner:"));
+        assert!(catalog.contains("automation-feedback:"));
+        assert!(catalog.contains("Use it when:"));
+        assert!(catalog.contains("--tracker"));
+    }
+
+    #[test]
+    fn init_detects_gitlab_remote_for_repo_config_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+        let remote_status = Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.example.com/polyphony/platform.git",
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(remote_status.success());
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::MultiAgent,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let repo_config_contents = fs::read_to_string(repo_root.join("polyphony.toml")).unwrap();
+
+        assert_eq!(
+            report.repo_config_auto_detected_kind.as_deref(),
+            Some("gitlab")
+        );
+        assert!(repo_config_contents.contains("kind = \"gitlab\""));
+        assert!(repo_config_contents.contains("endpoint = \"https://gitlab.example.com\""));
+        assert!(repo_config_contents.contains("repository = \"polyphony/platform\""));
+    }
+
+    #[test]
+    fn init_reports_gitlab_automation_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+        let remote_status = Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.example.com/polyphony/platform.git",
+            ])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(remote_status.success());
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::PipelineStatic,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            report
+                .setup_hints
+                .iter()
+                .any(|hint| hint.contains("currently requires GitHub"))
+        );
+    }
+
+    #[test]
+    fn init_seeds_explicit_linear_pack_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::Codex,
+                tracker: InitTracker::Linear,
+                project_slug: Some("ENG".into()),
+                default_branch: Some("develop".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let repo_config_contents = fs::read_to_string(repo_root.join("polyphony.toml")).unwrap();
+
+        assert_eq!(
+            report.repo_config_auto_detected_kind.as_deref(),
+            Some("linear")
+        );
+        assert!(!report.tracker_needs_manual_setup);
+        assert!(repo_config_contents.contains("kind = \"linear\""));
+        assert!(repo_config_contents.contains("project_slug = \"ENG\""));
+        assert!(repo_config_contents.contains("api_key = \"$LINEAR_API_KEY\""));
+        assert!(repo_config_contents.contains("default_branch = \"develop\""));
+    }
+
+    #[test]
+    fn init_seeds_explicit_github_pack_parameters_without_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::PipelineStatic,
+                tracker: InitTracker::Github,
+                repository: Some("owner/repo".into()),
+                default_branch: Some("main".into()),
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let repo_config_contents = fs::read_to_string(repo_root.join("polyphony.toml")).unwrap();
+
+        assert_eq!(
+            report.repo_config_auto_detected_kind.as_deref(),
+            Some("github")
+        );
+        assert!(!report.tracker_needs_manual_setup);
+        assert!(repo_config_contents.contains("kind = \"github\""));
+        assert!(repo_config_contents.contains("repository = \"owner/repo\""));
+        assert!(repo_config_contents.contains("api_key = \"$GITHUB_TOKEN\""));
+        assert!(repo_config_contents.contains("default_branch = \"main\""));
     }
 }
 

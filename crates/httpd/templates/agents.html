@@ -34,28 +34,27 @@
     <span class="count">{{ running | length }} active</span>
   </div>
   <div class="grid-table">
-    <div class="grid-header" style="grid-template-columns: 2rem 8rem 1fr 8rem 6rem 5rem 6rem 7rem;">
-      <span></span>
+    <div class="grid-header" style="grid-template-columns: 10rem 8rem 1fr 6rem 5rem 6rem;">
+      <span>Started</span>
       <span>Repo</span>
       <span>Agent</span>
-      <span>Issue</span>
       <span>Model</span>
       <span>Turns</span>
       <span>State</span>
-      <span>Started</span>
     </div>
     {% for a in running %}
-    <div class="grid-row active" data-agent-running="{{ loop.index0 }}" style="grid-template-columns: 2rem 8rem 1fr 8rem 6rem 5rem 6rem 7rem; cursor: pointer;" data-repo="{{ a.repo_id }}" data-agent="{{ a.agent_name }}" data-issue="{{ a.issue_identifier }}" data-model="{{ a.model or '' }}" data-state="{{ a.state }}">
-      <span class="col-accent">&#x2819;</span>
+    <div class="grid-row active" data-agent-running="{{ loop.index0 }}" style="grid-template-columns: 10rem 8rem 1fr 6rem 5rem 6rem; cursor: pointer;" data-repo="{{ a.repo_id }}" data-agent="{{ a.agent_name }}" data-issue="{{ a.issue_identifier }}" data-model="{{ a.model or '' }}" data-state="{{ a.state }}">
+      <span class="col-muted"><time datetime="{{ a.started_at }}">{{ a.started_at }}</time></span>
       <span class="col-muted">{% if a.repo_id %}{{ a.repo_id }}{% else %}&mdash;{% endif %}</span>
       <span class="col-agent">{{ a.agent_name }}</span>
-      <span class="col-title">{{ a.issue_identifier }}</span>
       <span class="col-muted">{{ a.model }}</span>
       <span class="col-muted">{{ a.turn_count }}/{{ a.max_turns }}</span>
-      <span class="col-accent">{{ a.state }}</span>
-      <span class="col-muted"><time datetime="{{ a.started_at }}">{{ a.started_at }}</time></span>
+      <span class="col-accent" title="{{ a.state }}">&#x25CF;</span>
     </div>
     {% endfor %}
+    <div class="legend">
+      <span><span class="col-accent">&#x25CF;</span> running</span>
+    </div>
   </div>
 </div>
 
@@ -64,7 +63,7 @@
 <div class="modal-overlay" id="modal-agent-running-{{ loop.index0 }}">
   <div class="modal">
     <div class="modal-header">
-      <h2>{{ a.agent_name }} &mdash; {{ a.issue_identifier }}</h2>
+      <h2>{{ a.agent_name }}</h2>
       <button class="modal-close" onclick="polyphony.closeModal(this.closest('.modal-overlay'))" title="Close (Esc)">&times;</button>
     </div>
     <div class="modal-body">
@@ -90,10 +89,6 @@
         <span class="meta-item">
           <span class="meta-label">turns:</span>
           <span class="meta-value">{{ a.turn_count }}/{{ a.max_turns }}</span>
-        </span>
-        <span class="meta-item">
-          <span class="meta-label">issue:</span>
-          <span class="meta-value">{{ a.issue_identifier }}</span>
         </span>
         <span class="meta-item">
           <span class="meta-label">started:</span>
@@ -171,34 +166,42 @@
     <span class="count">{{ agent_run_history | length }} runs</span>
   </div>
   <div class="grid-table">
-    <div class="grid-header" style="grid-template-columns: 2rem 8rem 1fr 8rem 6rem 5rem 7rem;">
-      <span></span>
+    <div class="grid-header" style="grid-template-columns: 10rem 8rem 1fr 6rem 5rem 4rem;">
+      <span>Finished</span>
       <span>Repo</span>
       <span>Agent</span>
-      <span>Issue</span>
       <span>Model</span>
       <span>Attempt</span>
-      <span>Finished</span>
+      <span>Status</span>
     </div>
     {% for a in agent_run_history %}
-    <div class="grid-row" data-agent-history="{{ loop.index0 }}" style="grid-template-columns: 2rem 8rem 1fr 8rem 6rem 5rem 7rem; cursor: pointer;" data-repo="{{ a.repo_id }}" data-agent="{{ a.agent_name }}" data-issue="{{ a.issue_identifier }}" data-model="{{ a.model or '' }}" data-state="{{ a.status }}">
-      <span>
-        {% if a.status == "Succeeded" %}<span class="col-success">&#x2713;</span>
-        {% elif a.status == "Failed" %}<span class="col-danger">&#x2715;</span>
-        {% elif a.status == "CancelledByReconciliation" %}<span class="col-warning">&#x2298;</span>
-        {% else %}<span class="col-warning">&#x25F7;</span>{% endif %}
-      </span>
+    <div class="grid-row" data-agent-history="{{ loop.index0 }}" style="grid-template-columns: 10rem 8rem 1fr 6rem 5rem 4rem; cursor: pointer;" data-repo="{{ a.repo_id }}" data-agent="{{ a.agent_name }}" data-issue="{{ a.issue_identifier }}" data-model="{{ a.model or '' }}" data-state="{{ a.status }}">
+      <span class="col-muted">{% if a.finished_at %}<time datetime="{{ a.finished_at }}">{{ a.finished_at }}</time>{% else %}&mdash;{% endif %}</span>
       <span class="col-muted">{% if a.repo_id %}{{ a.repo_id }}{% else %}&mdash;{% endif %}</span>
       <span class="col-agent">{{ a.agent_name }}</span>
-      <span class="col-title">{{ a.issue_identifier }}</span>
       <span class="col-muted">{{ a.model }}</span>
       <span class="col-muted">{{ a.attempt }}</span>
-      <span class="col-muted">{% if a.finished_at %}<time datetime="{{ a.finished_at }}">{{ a.finished_at }}</time>{% else %}&mdash;{% endif %}</span>
+      <span>
+        {% if a.status == "Succeeded" %}<span class="col-success" title="succeeded">&#x2713;</span>
+        {% elif a.status == "Failed" %}<span class="col-danger" title="failed">&#x2715;</span>
+        {% elif a.status == "CancelledByReconciliation" %}<span class="col-warning" title="cancelled by reconciliation">&#x2298;</span>
+        {% elif a.status == "CancelledByUser" %}<span class="col-muted" title="cancelled by user">&#x2298;</span>
+        {% elif a.status == "TimedOut" %}<span class="col-warning" title="timed out">&#x25F7;</span>
+        {% elif a.status == "Stalled" %}<span class="col-warning" title="stalled">&#x2026;</span>
+        {% else %}<span class="col-muted" title="{{ a.status }}">&#xB7;</span>{% endif %}
+      </span>
     </div>
     {% endfor %}
     <div class="grid-footer">
       <span>{{ agent_run_history | length }} runs</span>
       <span></span>
+    </div>
+    <div class="legend">
+      <span><span class="col-success">&#x2713;</span> succeeded</span>
+      <span><span class="col-danger">&#x2715;</span> failed</span>
+      <span><span class="col-warning">&#x25F7;</span> timed out</span>
+      <span><span class="col-warning">&#x2026;</span> stalled</span>
+      <span><span class="col-muted">&#x2298;</span> cancelled</span>
     </div>
   </div>
 </div>
@@ -208,7 +211,7 @@
 <div class="modal-overlay" id="modal-agent-history-{{ loop.index0 }}">
   <div class="modal">
     <div class="modal-header">
-      <h2>{{ a.agent_name }} &mdash; {{ a.issue_identifier }}</h2>
+      <h2>{{ a.agent_name }}</h2>
       <button class="modal-close" onclick="polyphony.closeModal(this.closest('.modal-overlay'))" title="Close (Esc)">&times;</button>
     </div>
     <div class="modal-body">
@@ -237,10 +240,6 @@
         <span class="meta-item">
           <span class="meta-label">turns:</span>
           <span class="meta-value">{{ a.turn_count }}/{{ a.max_turns }}</span>
-        </span>
-        <span class="meta-item">
-          <span class="meta-label">issue:</span>
-          <span class="meta-value">{{ a.issue_identifier }}</span>
         </span>
         {% if a.attempt %}
         <span class="meta-item">

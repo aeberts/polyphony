@@ -1,4 +1,4 @@
-use polyphony_core::{DeliverableDecision, RuntimeSnapshot};
+use polyphony_core::{DeliverableDecision, RuntimeSnapshot, build_run_insight};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
@@ -117,7 +117,89 @@ pub(crate) fn draw_deliverable_detail(
 
     // Body
     let format_time = super::format_detail_time;
+    let run_tasks = snapshot
+        .tasks
+        .iter()
+        .filter(|task| task.run_id == run.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let run_history = snapshot
+        .agent_run_history
+        .iter()
+        .filter(|entry| polyphony_core::agent_history_matches_run(run, entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    let running_agents = snapshot
+        .running
+        .iter()
+        .filter(|entry| polyphony_core::running_agent_matches_run(run, entry))
+        .cloned()
+        .collect::<Vec<_>>();
+    let insight = build_run_insight(run, &run_tasks, &run_history, &running_agents);
     let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Summary",
+        Style::default()
+            .fg(theme.highlight)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        insight.summary,
+        Style::default().fg(theme.foreground),
+    )));
+    if let Some(next_action) = insight.next_action {
+        lines.push(Line::from(vec![
+            Span::styled("Next: ", Style::default().fg(theme.muted)),
+            Span::styled(next_action, Style::default().fg(theme.info)),
+        ]));
+    }
+    if let Some(stop_reason) = insight.stop_reason {
+        lines.push(Line::from(vec![
+            Span::styled("Why:  ", Style::default().fg(theme.muted)),
+            Span::styled(stop_reason, Style::default().fg(theme.warning)),
+        ]));
+    }
+
+    if !insight.history_facts.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "History",
+            Style::default()
+                .fg(theme.highlight)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for fact in insight.history_facts {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", fact.label),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(fact.value, Style::default().fg(theme.foreground)),
+            ]));
+        }
+    }
+
+    if !insight.artifact_facts.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            "Artifacts",
+            Style::default()
+                .fg(theme.highlight)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for fact in insight.artifact_facts {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", fact.label),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(fact.value, Style::default().fg(theme.foreground)),
+            ]));
+        }
+    }
+
+    lines.push(Line::default());
 
     if let Some(url) = &deliverable.url {
         lines.push(kv_line("URL", url, theme));
@@ -147,42 +229,6 @@ pub(crate) fn draw_deliverable_detail(
             &workspace_path.display().to_string(),
             theme,
         ));
-    }
-
-    // Diff stats from metadata
-    if !deliverable.metadata.is_empty() {
-        let mut stat_parts = Vec::new();
-        if let Some(files) = deliverable
-            .metadata
-            .get("changed_files")
-            .and_then(|v| v.as_u64())
-        {
-            stat_parts.push(format!("{files} files"));
-        }
-        if let Some(added) = deliverable
-            .metadata
-            .get("lines_added")
-            .and_then(|v| v.as_u64())
-        {
-            stat_parts.push(format!("+{added}"));
-        }
-        if let Some(removed) = deliverable
-            .metadata
-            .get("lines_removed")
-            .and_then(|v| v.as_u64())
-        {
-            stat_parts.push(format!("-{removed}"));
-        }
-        if !stat_parts.is_empty() {
-            lines.push(kv_line("Changes", &stat_parts.join("  "), theme));
-        }
-        if let Some(sha) = deliverable
-            .metadata
-            .get("head_sha")
-            .and_then(|v| v.as_str())
-        {
-            lines.push(kv_line("SHA", &sha[..sha.len().min(12)], theme));
-        }
     }
 
     // Deliverable title & description (e.g. PR title and body)

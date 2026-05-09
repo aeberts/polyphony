@@ -1,9 +1,10 @@
 use chrono::{TimeZone, Utc};
 use polyphony_core::{
-    BudgetSnapshot, CodexTotals, Deliverable, DeliverableDecision, DeliverableKind,
-    DeliverableStatus, DispatchApprovalState, DispatchMode, InboxItemKind, InboxItemRow,
-    RuntimeCadence, RuntimeSnapshot, SnapshotCounts, TaskCategory, TaskRow, TaskStatus,
-    TrackerConnectionStatus, TrackerIssueRow, UserInteractionKind, UserInteractionRequest,
+    AgentRunHistoryRow, AttemptStatus, BudgetSnapshot, CodexTotals, Deliverable,
+    DeliverableDecision, DeliverableKind, DeliverableStatus, DispatchApprovalState, DispatchMode,
+    InboxItemKind, InboxItemRow, RunKind, RunRow, RunStatus, RuntimeCadence, RuntimeSnapshot,
+    SnapshotCounts, TaskCategory, TaskRow, TaskStatus, TokenUsage, TrackerConnectionStatus,
+    TrackerIssueRow, UserInteractionKind, UserInteractionRequest,
 };
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
@@ -1124,6 +1125,7 @@ fn agent_detail_scroll_resets_when_agent_selection_changes() {
     snapshot.running = vec![
         polyphony_core::RunningAgentRow {
             repo_id: String::new(),
+            run_id: None,
             issue_id: "issue-1".into(),
             issue_identifier: "GH-1".into(),
             agent_name: "opus".into(),
@@ -1146,6 +1148,7 @@ fn agent_detail_scroll_resets_when_agent_selection_changes() {
         },
         polyphony_core::RunningAgentRow {
             repo_id: String::new(),
+            run_id: None,
             issue_id: "issue-2".into(),
             issue_identifier: "GH-2".into(),
             agent_name: "codex".into(),
@@ -1419,6 +1422,100 @@ fn task_detail_renders_activity_log() {
     assert!(screen.contains("Activity"), "{screen}");
     assert!(screen.contains("Fetching origin"), "{screen}");
     assert!(screen.contains("Waiting for SSH key touch"), "{screen}");
+}
+
+#[test]
+fn run_detail_renders_history_facts() {
+    let backend = TestBackend::new(140, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut snapshot = test_snapshot(1);
+    let now = Utc::now();
+    snapshot.runs = vec![RunRow {
+        repo_id: String::new(),
+        id: "run-1".into(),
+        kind: RunKind::IssueDelivery,
+        issue_identifier: Some("GH-1".into()),
+        title: "Ship history facts".into(),
+        status: RunStatus::Delivered,
+        task_count: 1,
+        tasks_completed: 1,
+        deliverable: None,
+        has_deliverable: false,
+        review_target: None,
+        workspace_key: Some("gh-1".into()),
+        workspace_path: Some(std::path::PathBuf::from("/tmp/workspace")),
+        created_at: now,
+        activity_log: Vec::new(),
+        cancel_reason: None,
+        steps: Vec::new(),
+    }];
+    snapshot.tasks = vec![TaskRow {
+        repo_id: String::new(),
+        id: "task-1".into(),
+        run_id: "run-1".into(),
+        title: "Implement".into(),
+        description: None,
+        activity_log: Vec::new(),
+        category: TaskCategory::Coding,
+        status: TaskStatus::Completed,
+        ordinal: 1,
+        agent_name: Some("codex".into()),
+        turns_completed: 2,
+        total_tokens: 0,
+        started_at: Some(now - chrono::TimeDelta::seconds(90)),
+        finished_at: Some(now - chrono::TimeDelta::seconds(30)),
+        error: None,
+        created_at: now,
+        updated_at: now,
+    }];
+    snapshot.agent_run_history = vec![AgentRunHistoryRow {
+        repo_id: String::new(),
+        run_id: Some("run-1".into()),
+        issue_id: "issue-1".into(),
+        issue_identifier: "GH-1".into(),
+        agent_name: "codex".into(),
+        model: Some("gpt-5".into()),
+        status: AttemptStatus::Succeeded,
+        attempt: Some(1),
+        max_turns: 4,
+        turn_count: 2,
+        session_id: Some("sess-1".into()),
+        thread_id: None,
+        turn_id: None,
+        codex_app_server_pid: None,
+        last_event: Some("completed".into()),
+        last_message: Some("done".into()),
+        started_at: now - chrono::TimeDelta::seconds(95),
+        finished_at: Some(now - chrono::TimeDelta::seconds(5)),
+        last_event_at: Some(now - chrono::TimeDelta::seconds(5)),
+        tokens: TokenUsage {
+            input_tokens: 300,
+            output_tokens: 150,
+            total_tokens: 450,
+        },
+        workspace_path: Some(std::path::PathBuf::from("/tmp/workspace")),
+        error: None,
+        saved_context: None,
+    }];
+    let mut app = AppState::new(default_theme(), LogBuffer::default());
+    app.active_tab = app::ActiveTab::Orchestrator;
+    app.on_snapshot(&snapshot);
+    app.push_detail(app::DetailView::Run {
+        run_id: "run-1".into(),
+        scroll: 0,
+    });
+
+    terminal
+        .draw(|frame| {
+            render::render(frame, &snapshot, &mut app);
+        })
+        .unwrap();
+
+    let screen = buffer_text(terminal.backend().buffer());
+    assert!(screen.contains("History"), "{screen}");
+    assert!(screen.contains("Attempts"), "{screen}");
+    assert!(screen.contains("450"), "{screen}");
+    assert!(screen.contains("codex"), "{screen}");
 }
 
 #[test]

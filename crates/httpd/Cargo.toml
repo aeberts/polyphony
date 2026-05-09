@@ -14,6 +14,7 @@ axum-login.workspace = true
 chrono.workspace = true
 hex.workspace = true
 hmac.workspace = true
+ipnet.workspace = true
 minijinja = { workspace = true, features = ["loader"] }
 polyphony-core = { path = "../core" }
 polyphony-orchestrator = { path = "../orchestrator" }
@@ -30,6 +31,7 @@ tower-http.workspace = true
 tower-sessions.workspace = true
 tower-sessions-sqlx-store.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

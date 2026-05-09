@@ -350,6 +350,24 @@ impl ServiceConfig {
             config.url = resolve_env_token(config.url.take());
             config.bearer_token = resolve_env_token(config.bearer_token.take());
         }
+        for provider in self.daemon.webhooks.providers.values_mut() {
+            provider.auth = resolve_env_token(Some(provider.auth.clone())).unwrap_or_default();
+            provider.secret = resolve_env_token(Some(provider.secret.clone())).unwrap_or_default();
+            provider.header = resolve_env_token(provider.header.take());
+            provider.query = resolve_env_token(provider.query.take());
+        }
+        for trigger in self.daemon.webhooks.triggers.values_mut() {
+            trigger.description = resolve_env_token(trigger.description.take());
+            trigger.repo_id = resolve_env_token(trigger.repo_id.take());
+            trigger.agent = resolve_env_token(Some(trigger.agent.clone())).unwrap_or_default();
+            trigger.model = resolve_env_token(trigger.model.take());
+            trigger.auth = resolve_env_token(Some(trigger.auth.clone())).unwrap_or_default();
+            trigger.secret = resolve_env_token(Some(trigger.secret.clone())).unwrap_or_default();
+            trigger.header = resolve_env_token(trigger.header.take());
+            trigger.query = resolve_env_token(trigger.query.take());
+            trigger.title = resolve_env_token(trigger.title.take());
+            trigger.prompt = resolve_env_token(Some(trigger.prompt.clone())).unwrap_or_default();
+        }
         for profile in self.agents.profiles.values_mut() {
             profile.api_key = resolve_agent_api_key(&profile.kind, profile.api_key.clone());
             profile.base_url = resolve_env_token(profile.base_url.take());
@@ -492,6 +510,68 @@ impl ServiceConfig {
             .collect();
         if self.hooks.timeout_ms == 0 {
             self.hooks.timeout_ms = 60_000;
+        }
+        for provider in self.daemon.webhooks.providers.values_mut() {
+            provider.auth = provider.auth.trim().to_ascii_lowercase();
+            provider.secret = provider.secret.trim().to_string();
+            provider.header = provider
+                .header
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            provider.query = provider
+                .query
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            provider.source_allowlist = provider
+                .source_allowlist
+                .drain(..)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect();
+        }
+        for trigger in self.daemon.webhooks.triggers.values_mut() {
+            trigger.description = trigger
+                .description
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            trigger.repo_id = trigger
+                .repo_id
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            trigger.agent = trigger.agent.trim().to_string();
+            trigger.model = trigger
+                .model
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            trigger.auth = trigger.auth.trim().to_ascii_lowercase();
+            trigger.secret = trigger.secret.trim().to_string();
+            trigger.header = trigger
+                .header
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            trigger.query = trigger
+                .query
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            trigger.source_allowlist = trigger
+                .source_allowlist
+                .drain(..)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect();
+            trigger.title = trigger
+                .title
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            trigger.prompt = trigger.prompt.trim().to_string();
         }
     }
 
@@ -792,6 +872,52 @@ impl ServiceConfig {
                 "heartbeat.agent `{agent_name}` is not defined"
             )));
         }
+        for (name, provider) in &self.daemon.webhooks.providers {
+            validate_webhook_auth_config(
+                &format!("daemon.webhooks.providers.{name}"),
+                &provider.auth,
+                &provider.secret,
+                provider.header.as_deref(),
+                provider.query.as_deref(),
+                &provider.source_allowlist,
+            )?;
+        }
+        for (name, trigger) in &self.daemon.webhooks.triggers {
+            if !trigger.enabled {
+                continue;
+            }
+            if trigger.agent.trim().is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "daemon.webhooks.triggers.{name}.agent must be non-empty"
+                )));
+            }
+            if !self.agents.profiles.contains_key(&trigger.agent) {
+                return Err(Error::InvalidConfig(format!(
+                    "daemon.webhooks.triggers.{name}.agent `{}` is not defined",
+                    trigger.agent
+                )));
+            }
+            if trigger.prompt.trim().is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "daemon.webhooks.triggers.{name}.prompt must be non-empty"
+                )));
+            }
+            if let Some(repo_id) = &trigger.repo_id
+                && repo_id.trim().is_empty()
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "daemon.webhooks.triggers.{name}.repo_id must be non-empty when set"
+                )));
+            }
+            validate_webhook_auth_config(
+                &format!("daemon.webhooks.triggers.{name}"),
+                &trigger.auth,
+                &trigger.secret,
+                trigger.header.as_deref(),
+                trigger.query.as_deref(),
+                &trigger.source_allowlist,
+            )?;
+        }
         Ok(())
     }
 
@@ -955,6 +1081,56 @@ impl ServiceConfig {
         }
         Ok(candidates)
     }
+}
+
+fn validate_webhook_auth_config(
+    path: &str,
+    auth: &str,
+    secret: &str,
+    header: Option<&str>,
+    query: Option<&str>,
+    source_allowlist: &[String],
+) -> Result<(), Error> {
+    match auth {
+        "hmac_sha256" | "hmac_sha256_header" | "token_header" | "bearer" | "query_token" => {
+            if secret.trim().is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "{path}.secret must be non-empty"
+                )));
+            }
+        },
+        "none" => {
+            if source_allowlist.is_empty() {
+                return Err(Error::InvalidConfig(format!(
+                    "{path}.auth = `none` requires source_allowlist"
+                )));
+            }
+        },
+        "" => {
+            return Err(Error::InvalidConfig(format!(
+                "{path}.auth must be configured"
+            )));
+        },
+        other => {
+            return Err(Error::InvalidConfig(format!(
+                "{path}.auth `{other}` is not supported"
+            )));
+        },
+    }
+
+    if matches!(auth, "token_header" | "hmac_sha256_header")
+        && header.unwrap_or_default().trim().is_empty()
+    {
+        return Err(Error::InvalidConfig(format!(
+            "{path}.header must be set for auth `{auth}`"
+        )));
+    }
+    if auth == "query_token" && query.unwrap_or_default().trim().is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "{path}.query must be set for auth `query_token`"
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_tool_names(entries: &mut Vec<String>) {

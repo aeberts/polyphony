@@ -1484,3 +1484,75 @@ agents:
 
     assert_eq!(config.startup_dispatch_mode(), DispatchMode::Automatic);
 }
+
+#[test]
+fn webhook_trigger_config_requires_known_agent_and_query_name() {
+    let config = serde_yaml::from_str::<YamlValue>(
+        r#"
+agents:
+  default: implementer
+  profiles:
+    implementer:
+      kind: mock
+      transport: mock
+      command: mock
+daemon:
+  webhooks:
+    enabled: true
+    triggers:
+      deploy:
+        enabled: true
+        agent: implementer
+        auth: query_token
+        secret: top-secret
+        prompt: Inspect
+"#,
+    )
+    .unwrap();
+    let workflow = WorkflowDefinition {
+        config,
+        prompt_template: String::new(),
+    };
+
+    let error = ServiceConfig::from_workflow(&workflow).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("daemon.webhooks.triggers.deploy.query must be set"),
+        "{error}"
+    );
+}
+
+#[test]
+fn webhook_trigger_config_allows_none_auth_with_allowlist() {
+    let config = serde_yaml::from_str::<YamlValue>(
+        r#"
+agents:
+  default: implementer
+  profiles:
+    implementer:
+      kind: mock
+      transport: mock
+      command: mock
+daemon:
+  webhooks:
+    enabled: true
+    triggers:
+      deploy:
+        enabled: true
+        agent: implementer
+        auth: none
+        source_allowlist: [192.168.0.0/16]
+        prompt: Inspect
+"#,
+    )
+    .unwrap();
+    let workflow = WorkflowDefinition {
+        config,
+        prompt_template: String::new(),
+    };
+
+    let config = ServiceConfig::from_workflow(&workflow).unwrap();
+    assert!(config.daemon.webhooks.triggers["deploy"].enabled);
+    assert_eq!(config.daemon.webhooks.triggers["deploy"].auth, "none");
+}

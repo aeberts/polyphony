@@ -333,6 +333,7 @@ impl RuntimeService {
                 .values()
                 .map(|running| RunningAgentRow {
                     repo_id: self.repo_id_for_issue(&running.issue.id),
+                    run_id: running.run_id.clone(),
                     issue_id: running.issue.id.clone(),
                     issue_identifier: running.issue.identifier.clone(),
                     agent_name: running.agent_name.clone(),

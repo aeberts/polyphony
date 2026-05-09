@@ -49,14 +49,16 @@ impl RuntimeService {
             .insert(workspace.workspace_key.clone());
 
         let tracker = self.tracker_for_issue(&issue.id);
-        if let Err(error) = tracker.ensure_issue_workflow_tracking(&issue).await {
-            warn!(%error, issue_identifier = %issue.identifier, "issue workflow tracking setup failed");
-        }
-        if let Err(error) = tracker
-            .update_issue_workflow_status(&issue, "In Progress")
-            .await
-        {
-            warn!(%error, issue_identifier = %issue.identifier, "issue workflow status sync failed");
+        if !is_synthetic_issue_id(&issue.id) {
+            if let Err(error) = tracker.ensure_issue_workflow_tracking(&issue).await {
+                warn!(%error, issue_identifier = %issue.identifier, "issue workflow tracking setup failed");
+            }
+            if let Err(error) = tracker
+                .update_issue_workflow_status(&issue, "In Progress")
+                .await
+            {
+                warn!(%error, issue_identifier = %issue.identifier, "issue workflow status sync failed");
+            }
         }
 
         let has_planner = workflow.config.router_agent_name().is_some();

@@ -38,10 +38,24 @@ cargo install --path crates/cli
 Then run it inside any git repository:
 
 ```bash
+polyphony init
 polyphony
 ```
 
-On first start, Polyphony creates a default config at `~/.config/polyphony/config.toml` and seeds repo-local agent prompts in `.polyphony/agents/`.
+`polyphony init` bootstraps `WORKFLOW.md`, `~/.config/polyphony/config.toml`, repo-local agent
+prompts, and a starter `polyphony.toml` when local tracker wiring can be inferred or requested. It
+auto-detects GitHub and GitLab remotes, supports explicit pack parameters for tracker/repository
+defaults, and prints setup hints for missing tracker or auth wiring.
+
+Starter packs are built in:
+
+```bash
+polyphony init --list-packs
+polyphony init --pack codex
+polyphony init --pack multi-agent
+polyphony init --pack pipeline-static --tracker github --repository owner/repo
+polyphony init --pack codex --tracker linear --project-slug ENG
+```
 
 ## Events
 

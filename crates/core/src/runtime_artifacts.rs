@@ -116,6 +116,7 @@ mod tests {
         let now = chrono::Utc::now();
         let record = PersistedAgentRunRecord {
             repo_id: String::new(),
+            run_id: Some("run-1".into()),
             issue_id: "issue-1".into(),
             issue_identifier: "DOG-1".into(),
             agent_name: "implementer".into(),

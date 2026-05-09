@@ -1,0 +1,303 @@
+{% extends "layout.html" %}
+{% block title %}Webhooks · Polyphony{% endblock %}
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Webhook Triggers</h1>
+    <div class="meta">Generic inbound webhooks that dispatch directly into an agent session.</div>
+  </div>
+</div>
+<div id="webhooks-flash" data-success="{{ success_message }}" data-error="{{ error_message }}" hidden></div>
+
+<div class="stats">
+  <div class="stat">
+    <div class="value accent">{{ triggers | length }}</div>
+    <div class="label">Triggers</div>
+  </div>
+  <div class="stat">
+    <div class="value {% if webhooks_enabled %}success{% else %}warning{% endif %}">
+      {% if webhooks_enabled %}Enabled{% else %}Disabled{% endif %}
+    </div>
+    <div class="label">Webhook Router</div>
+  </div>
+  <div class="stat">
+    <div class="value muted">{{ providers_count }}</div>
+    <div class="label">Refresh Providers</div>
+  </div>
+</div>
+
+{% if success_message %}
+<div class="card">
+  <div class="detail-card user-banner user-banner-success">{{ success_message }}</div>
+</div>
+{% endif %}
+{% if error_message %}
+<div class="card">
+  <div class="detail-card user-banner user-banner-error">{{ error_message }}</div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-header">
+    <h2>Create Trigger</h2>
+    <span class="count">Writes through to daemon config, routes update live</span>
+  </div>
+  <div class="user-form-shell">
+    <form method="post" action="/webhooks/create" class="user-form-grid">
+      <label class="user-field">
+        <span>ID</span>
+        <input class="search-input" name="id" type="text" placeholder="github-pr-opened" required>
+      </label>
+      <label class="user-field">
+        <span>Agent</span>
+        <input class="search-input" name="agent" list="agent-options" placeholder="implementer" required>
+      </label>
+      <label class="user-field">
+        <span>Repo ID</span>
+        <input class="search-input" name="repo_id" list="repo-options" placeholder="optional in single-repo mode">
+      </label>
+      <label class="user-field">
+        <span>Model Override</span>
+        <input class="search-input" name="model" type="text" placeholder="optional">
+      </label>
+      <label class="user-field">
+        <span>Auth</span>
+        <select class="search-input" name="auth">
+          <option value="hmac_sha256">hmac_sha256</option>
+          <option value="hmac_sha256_header">hmac_sha256_header</option>
+          <option value="token_header">token_header</option>
+          <option value="bearer">bearer</option>
+          <option value="query_token">query_token</option>
+          <option value="none">none</option>
+        </select>
+      </label>
+      <label class="user-field">
+        <span>Secret / Token</span>
+        <div class="token-input-shell">
+          <input class="search-input token-input" name="secret" type="password" placeholder="shared secret or bearer token">
+          <button class="btn btn-ghost token-toggle" type="button">Show</button>
+        </div>
+      </label>
+      <label class="user-field">
+        <span>Header Name</span>
+        <input class="search-input" name="header" type="text" placeholder="X-Gitlab-Token or Linear-Signature">
+      </label>
+      <label class="user-field">
+        <span>Query Param</span>
+        <input class="search-input" name="query" type="text" placeholder="token">
+      </label>
+      <label class="user-field">
+        <span>Source Allowlist</span>
+        <input class="search-input" name="source_allowlist" type="text" placeholder="192.30.252.0/22, 185.199.108.0/22">
+      </label>
+      <label class="user-field">
+        <span>Title Template</span>
+        <input class="search-input" name="title" type="text" placeholder="Deploy {% raw %}{{ delivery_index }}{% endraw %}">
+      </label>
+      <label class="user-field" style="grid-column: 1 / -1;">
+        <span>Description</span>
+        <input class="search-input" name="description" type="text" placeholder="Run an agent when a GitHub PR webhook lands">
+      </label>
+      <label class="user-field" style="grid-column: 1 / -1;">
+        <span>Prompt Template</span>
+        <textarea class="search-input" name="prompt" rows="10" placeholder="Inspect this webhook and decide what to do.&#10;&#10;Trigger: {% raw %}{{ trigger_id }}{% endraw %}&#10;Delivery: {% raw %}{{ delivery_index }}{% endraw %}&#10;Remote IP: {% raw %}{{ remote_addr }}{% endraw %}&#10;&#10;Body:&#10;{% raw %}{{ body_json }}{% endraw %}" required></textarea>
+      </label>
+      <label class="user-field" style="display: flex; align-items: center; gap: 0.5rem;">
+        <input type="checkbox" name="enabled" checked>
+        <span>Enabled</span>
+      </label>
+      <div class="user-form-actions">
+        <button class="btn btn-primary" type="submit">Create Trigger</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<datalist id="agent-options">
+  {% for agent in agent_options %}
+  <option value="{{ agent }}"></option>
+  {% endfor %}
+</datalist>
+<datalist id="repo-options">
+  {% for repo in repo_options %}
+  <option value="{{ repo }}"></option>
+  {% endfor %}
+</datalist>
+
+<div class="card">
+  <div class="card-header">
+    <h2>Examples</h2>
+    <span class="count">Common trigger shapes</span>
+  </div>
+  <div class="detail-card">
+    <p><strong>GitHub PR opened</strong>: <code>auth = token_header</code> or <code>hmac_sha256</code>, title like <code>PR {% raw %}{{ delivery_index }}{% endraw %}</code>, prompt reads <code>{% raw %}{{ body_json }}{% endraw %}</code>.</p>
+    <p><strong>GitLab push or MR</strong>: <code>auth = token_header</code> with <code>header = X-Gitlab-Token</code>, optional CIDR allowlist if the sender IPs are stable in your setup.</p>
+    <p><strong>Internal service</strong>: <code>auth = bearer</code> or <code>query_token</code>, then treat the body as structured input for a repo-specific agent.</p>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h2>Configured Triggers</h2>
+    <span class="count">{{ triggers | length }} total</span>
+  </div>
+  {% if triggers %}
+  <div class="grid-table">
+    <div class="grid-header" style="grid-template-columns: 2rem 1fr 10rem 10rem 1fr;">
+      <span></span>
+      <span>ID</span>
+      <span>Agent</span>
+      <span>Auth</span>
+      <span>Endpoint</span>
+    </div>
+    {% for trigger in triggers %}
+    <div class="grid-row user-row{% if trigger.enabled %} active{% endif %}" style="grid-template-columns: 2rem 1fr 10rem 10rem 1fr; cursor: pointer;" data-user-modal="modal-webhook-{{ loop.index0 }}">
+      <span class="{% if trigger.enabled %}col-success{% else %}col-muted{% endif %}">{% if trigger.enabled %}●{% else %}○{% endif %}</span>
+      <span class="col-title">{{ trigger.id }}</span>
+      <span class="col-muted">{{ trigger.agent }}{% if trigger.model %} / {{ trigger.model }}{% endif %}</span>
+      <span class="col-muted">{{ trigger.auth }}</span>
+      <span><code>POST {{ trigger.endpoint }}</code></span>
+    </div>
+    {% endfor %}
+    <div class="grid-footer">
+      <span>{{ triggers | length }} configured trigger{% if triggers | length != 1 %}s{% endif %}</span>
+      <span>Templates can use <code>{% raw %}{{ trigger_id }}{% endraw %}</code>, <code>{% raw %}{{ delivery_index }}{% endraw %}</code>, <code>{% raw %}{{ body }}{% endraw %}</code>, <code>{% raw %}{{ body_json }}{% endraw %}</code>, <code>{% raw %}{{ headers_json }}{% endraw %}</code>, <code>{% raw %}{{ query_json }}{% endraw %}</code>, and <code>{% raw %}{{ remote_addr }}{% endraw %}</code>.</span>
+    </div>
+  </div>
+  {% else %}
+  <div class="empty">No webhook triggers configured yet.</div>
+  {% endif %}
+</div>
+
+{% for trigger in triggers %}
+<div class="modal-overlay" id="modal-webhook-{{ loop.index0 }}">
+  <div class="modal" style="max-width: 760px;">
+    <div class="modal-header">
+      <h2>{{ trigger.id }}</h2>
+      <button class="modal-close" onclick="polyphony.closeModal(this.closest('.modal-overlay'))" title="Close (Esc)">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-meta">
+        <div class="meta-item"><span class="meta-label">Endpoint</span><span class="meta-value accent"><code>{{ trigger.endpoint }}</code></span></div>
+        <div class="meta-item"><span class="meta-label">Agent</span><span class="meta-value muted">{{ trigger.agent }}{% if trigger.model %} / {{ trigger.model }}{% endif %}</span></div>
+        <div class="meta-item"><span class="meta-label">Allowlist</span><span class="meta-value muted">{{ trigger.source_allowlist_display }}</span></div>
+      </div>
+
+      <form method="post" action="/webhooks/update" class="user-form-grid">
+        <input type="hidden" name="original_id" value="{{ trigger.id }}">
+        <label class="user-field">
+          <span>ID</span>
+          <input class="search-input" name="id" type="text" value="{{ trigger.id }}" required>
+        </label>
+        <label class="user-field">
+          <span>Agent</span>
+          <input class="search-input" name="agent" type="text" value="{{ trigger.agent }}" list="agent-options" required>
+        </label>
+        <label class="user-field">
+          <span>Repo ID</span>
+          <input class="search-input" name="repo_id" type="text" value="{% if trigger.repo_id %}{{ trigger.repo_id }}{% endif %}" list="repo-options">
+        </label>
+        <label class="user-field">
+          <span>Model Override</span>
+          <input class="search-input" name="model" type="text" value="{% if trigger.model %}{{ trigger.model }}{% endif %}">
+        </label>
+        <label class="user-field">
+          <span>Auth</span>
+          <select class="search-input" name="auth">
+            <option value="hmac_sha256"{% if trigger.auth == "hmac_sha256" %} selected{% endif %}>hmac_sha256</option>
+            <option value="hmac_sha256_header"{% if trigger.auth == "hmac_sha256_header" %} selected{% endif %}>hmac_sha256_header</option>
+            <option value="token_header"{% if trigger.auth == "token_header" %} selected{% endif %}>token_header</option>
+            <option value="bearer"{% if trigger.auth == "bearer" %} selected{% endif %}>bearer</option>
+            <option value="query_token"{% if trigger.auth == "query_token" %} selected{% endif %}>query_token</option>
+            <option value="none"{% if trigger.auth == "none" %} selected{% endif %}>none</option>
+          </select>
+        </label>
+        <label class="user-field">
+          <span>Secret / Token</span>
+          <div class="token-input-shell">
+            <input class="search-input token-input" name="secret" type="password" placeholder="Replace with a new secret if needed">
+            <button class="btn btn-ghost token-toggle" type="button">Show</button>
+          </div>
+          <div class="meta" style="margin-top: 0.25rem;">Current: <code>{{ trigger.masked_secret }}</code></div>
+        </label>
+        <label class="user-field">
+          <span>Header Name</span>
+          <input class="search-input" name="header" type="text" value="{% if trigger.header %}{{ trigger.header }}{% endif %}">
+        </label>
+        <label class="user-field">
+          <span>Query Param</span>
+          <input class="search-input" name="query" type="text" value="{% if trigger.query %}{{ trigger.query }}{% endif %}">
+        </label>
+        <label class="user-field">
+          <span>Source Allowlist</span>
+          <input class="search-input" name="source_allowlist" type="text" value="{{ trigger.source_allowlist_display if trigger.source_allowlist_display != 'none' else '' }}">
+        </label>
+        <label class="user-field">
+          <span>Title Template</span>
+          <input class="search-input" name="title" type="text" value="{% if trigger.title %}{{ trigger.title }}{% endif %}">
+        </label>
+        <label class="user-field" style="grid-column: 1 / -1;">
+          <span>Description</span>
+          <input class="search-input" name="description" type="text" value="{% if trigger.description %}{{ trigger.description }}{% endif %}">
+        </label>
+        <label class="user-field" style="grid-column: 1 / -1;">
+          <span>Prompt Template</span>
+          <textarea class="search-input" name="prompt" rows="10">{{ trigger.prompt }}</textarea>
+        </label>
+        <label class="user-field" style="display: flex; align-items: center; gap: 0.5rem;">
+          <input type="checkbox" name="enabled"{% if trigger.enabled %} checked{% endif %}>
+          <span>Enabled</span>
+        </label>
+        <div class="modal-actions" style="margin-top: 0.25rem;">
+          <button class="btn btn-primary" type="submit">Save Trigger</button>
+        </div>
+      </form>
+
+      <div class="modal-section">
+        <h3>Danger Zone</h3>
+        <form method="post" action="/webhooks/delete" onsubmit="return confirm('Remove webhook trigger {{ trigger.id }}?');">
+          <input type="hidden" name="id" value="{{ trigger.id }}">
+          <button class="btn btn-danger" type="submit">Remove Trigger</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}
+
+{% block head %}
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    var flash = document.getElementById('webhooks-flash');
+    var success = flash ? flash.dataset.success : '';
+    var error = flash ? flash.dataset.error : '';
+    if (success) polyphony.toast(success, 'success');
+    if (error) polyphony.toast(error, 'error');
+
+    document.querySelectorAll('.token-toggle').forEach(function(button) {
+      button.addEventListener('click', function() {
+        var input = button.parentElement.querySelector('.token-input');
+        if (!input) return;
+        var reveal = input.type === 'password';
+        input.type = reveal ? 'text' : 'password';
+        button.textContent = reveal ? 'Hide' : 'Show';
+      });
+    });
+
+    document.querySelectorAll('.user-row[data-user-modal]').forEach(function(row) {
+      row.addEventListener('click', function() {
+        polyphony.openModal(row.dataset.userModal);
+      });
+    });
+
+    document.querySelectorAll('.modal-overlay').forEach(function(overlay) {
+      overlay.addEventListener('click', function(event) {
+        if (event.target === overlay) {
+          polyphony.closeModal(overlay);
+        }
+      });
+    });
+  });
+</script>
+{% endblock %}

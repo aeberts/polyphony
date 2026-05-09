@@ -3626,6 +3626,7 @@ mod tests {
         };
         let record = PersistedAgentRunRecord {
             repo_id: String::new(),
+            run_id: Some("run-2".into()),
             issue_id: "issue-2".into(),
             issue_identifier: "DOG-2".into(),
             agent_name: "implementer".into(),
@@ -4215,6 +4216,7 @@ mod tests {
             .agent_run_history
             .push(polyphony_core::AgentRunHistoryRow {
                 repo_id: String::new(),
+                run_id: Some("run-review".into()),
                 issue_id: "issue-89".into(),
                 issue_identifier: "penso/arbor#89".into(),
                 agent_name: "reviewer".into(),

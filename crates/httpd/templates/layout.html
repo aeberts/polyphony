@@ -12,7 +12,7 @@
       }
     })();
   </script>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=20260403b">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -36,6 +36,7 @@
       <a href="/outcomes">Outcomes</a>
       <a href="/tasks">Tasks</a>
       <a href="/repos">Repos</a>
+      <a href="/webhooks">Webhooks</a>
       <a href="/users">Users</a>
       <a href="/logs">Logs</a>
       <a href="/heartbeat">Heartbeat</a>
@@ -375,6 +376,31 @@
         }, 60000);
       };
       document.head.appendChild(s);
+    })();
+
+    // Lightweight glyph spinners for live run/activity indicators
+    (function() {
+      var frames = ['\u280b', '\u2819', '\u2839', '\u2838', '\u283c', '\u2834', '\u2826', '\u2827', '\u2807', '\u280f'];
+
+      function hydrateSpinners() {
+        document.querySelectorAll('[data-spinner="braille"]:not([data-spinner-h])').forEach(function(el) {
+          el.setAttribute('data-spinner-h', '1');
+          if (!el.getAttribute('aria-label')) {
+            el.setAttribute('aria-label', 'active');
+          }
+        });
+      }
+
+      hydrateSpinners();
+      new MutationObserver(hydrateSpinners).observe(document.body, { childList: true, subtree: true });
+
+      var tick = 0;
+      setInterval(function() {
+        tick = (tick + 1) % frames.length;
+        document.querySelectorAll('[data-spinner="braille"]').forEach(function(el) {
+          el.textContent = frames[tick];
+        });
+      }, 110);
     })();
 
     // Auto-refresh via WebSocket

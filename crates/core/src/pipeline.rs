@@ -525,7 +525,8 @@ impl PullRequestEvent {
 /// (reviews, comments, conflicts) and have no corresponding tracker-side
 /// state.  They must be excluded from tracker refresh calls during
 /// reconciliation because no tracker will recognise them.
-const SYNTHETIC_ISSUE_ID_PREFIXES: &[&str] = &["pr_review:", "pr_comment:", "pr_conflict:"];
+const SYNTHETIC_ISSUE_ID_PREFIXES: &[&str] =
+    &["pr_review:", "pr_comment:", "pr_conflict:", "webhook:"];
 
 pub fn is_synthetic_issue_id(issue_id: &str) -> bool {
     SYNTHETIC_ISSUE_ID_PREFIXES
