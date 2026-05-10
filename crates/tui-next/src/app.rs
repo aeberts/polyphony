@@ -16,6 +16,7 @@ pub(crate) struct AppState {
     pub visible_rows: usize,
     pub list_rect: Rect,
     pub search_query: String,
+    pub input: String,
     pub tick: u32,
     pub command_palette_open: bool,
     pub command_selected: usize,

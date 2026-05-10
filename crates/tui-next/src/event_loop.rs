@@ -111,7 +111,6 @@ fn handle_key(
             app.children_expanded = false;
         },
         KeyCode::Esc => return true,
-        KeyCode::Char('q') if app.route != Route::Inbox => return true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.command_palette_open = true;
@@ -122,10 +121,10 @@ fn handle_key(
             app.detail_scroll = 0;
             app.children_expanded = false;
         },
-        KeyCode::Up | KeyCode::Char('k') if app.route == Route::Detail => {
+        KeyCode::Up if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
         },
-        KeyCode::Down | KeyCode::Char('j') if app.route == Route::Detail => {
+        KeyCode::Down if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_add(1);
         },
         KeyCode::PageUp if app.route == Route::Detail => {
@@ -133,6 +132,12 @@ fn handle_key(
         },
         KeyCode::PageDown if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_add(8);
+        },
+        KeyCode::Backspace if app.route == Route::Detail => {
+            app.input.pop();
+        },
+        KeyCode::Char(c) if app.route == Route::Detail && is_search_char(c, modifiers) => {
+            app.input.push(c);
         },
         KeyCode::Backspace if app.route == Route::Inbox => {
             app.search_query.pop();

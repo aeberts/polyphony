@@ -3,7 +3,9 @@ use ratatui::{
     layout::{Constraint, Layout, Margin, Rect},
     style::Style,
     text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget, Wrap},
+    widgets::{
+        Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget, Wrap,
+    },
 };
 
 use crate::{
@@ -12,7 +14,7 @@ use crate::{
     rows::display_rows_matching,
     status::{state_color, state_icon},
     theme, tracker,
-    widgets::LeftRailPanel,
+    widgets::{InputBottomPanel, LeftRailPanel},
 };
 
 const CHILDREN_COLLAPSED_LIMIT: usize = 8;
@@ -29,21 +31,46 @@ pub(crate) fn draw_detail(
         return;
     };
 
-    let content_area = area.inner(Margin::new(2, 0));
+    let content_area = Rect::new(
+        area.x + 2,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    );
     let show_sidebar = content_area.width >= 96;
     let (main_area, sidebar_area) = if show_sidebar {
-        let [main, sidebar] = Layout::horizontal([Constraint::Min(48), Constraint::Length(38)])
-            .spacing(3)
+        let [main, sidebar] = Layout::horizontal([Constraint::Min(48), Constraint::Length(42)])
+            .spacing(2)
             .areas(content_area);
         (main, Some(sidebar))
     } else {
         (content_area, None)
     };
 
-    draw_main(frame, main_area, snapshot, item, app);
+    let [main_content, input_area] = Layout::vertical([Constraint::Min(1), Constraint::Length(5)])
+        .spacing(1)
+        .areas(main_area);
+
+    draw_main(frame, main_content, snapshot, item, app);
+    draw_input(frame, input_area, app);
     if let Some(sidebar) = sidebar_area {
         draw_sidebar(frame, sidebar, snapshot, item, app.tick);
     }
+}
+
+fn draw_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    InputBottomPanel::new(&app.input)
+        .focused(true)
+        .blink_on((app.tick / 6).is_multiple_of(2))
+        .border_color(theme::primary())
+        .content_bg(theme::element())
+        .text_color(theme::text())
+        .muted_color(theme::muted())
+        .label_accent(theme::primary())
+        .bottom_half_bg(theme::bg())
+        .padding(Padding::new(1, 1, 1, 0))
+        .labels("build", "GPT-5.5", "OpenAI")
+        .render(area, frame.buffer_mut());
 }
 
 fn draw_main(
@@ -255,7 +282,7 @@ fn render_panels(
 ) -> Vec<Option<Rect>> {
     let mut rendered_areas = vec![None; panels.len()];
     let mut y_cursor = -(i32::from(scroll));
-    let panel_width = area.width.saturating_sub(3);
+    let panel_width = area.width.saturating_sub(2);
     let max_panel_height = panel_max_height(area.height);
     for (idx, panel) in panels.iter().enumerate() {
         let height = panel.visible_height(panel_width, max_panel_height);
@@ -266,7 +293,7 @@ fn render_panels(
             let panel_area = Rect::new(
                 area.x,
                 area.y + top as u16,
-                area.width.saturating_sub(3),
+                area.width.saturating_sub(2),
                 visible_height,
             );
             let hovered = hover_panel == Some(idx)
@@ -429,7 +456,7 @@ fn draw_sidebar(
     lines.push(Line::from(vec![
         Span::styled("Esc", Style::new().fg(theme::text())),
         Span::styled(":back  ", Style::new().fg(theme::muted())),
-        Span::styled("j/k", Style::new().fg(theme::text())),
+        Span::styled("↑/↓", Style::new().fg(theme::text())),
         Span::styled(":scroll", Style::new().fg(theme::muted())),
     ]));
 
