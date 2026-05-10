@@ -110,6 +110,8 @@ fn draw_detail_footer(
         Span::styled(":commands  ", Style::new().fg(theme::muted())),
         Span::styled("Esc", Style::new().fg(theme::text()).bold()),
         Span::styled(":back  ", Style::new().fg(theme::muted())),
+        Span::styled("m", Style::new().fg(theme::text()).bold()),
+        Span::styled(":mode  ", Style::new().fg(theme::muted())),
         Span::styled("orchestrator ", Style::new().fg(theme::muted())),
         Span::styled("•", Style::new().fg(orchestrator_status_color(snapshot))),
         Span::styled(
@@ -540,15 +542,6 @@ fn draw_sidebar(
             }
         }
     }
-
-    lines.push(Line::raw(""));
-    lines.push(Line::styled("Keys", Style::new().fg(theme::text()).bold()));
-    lines.push(Line::from(vec![
-        Span::styled("Esc", Style::new().fg(theme::text())),
-        Span::styled(":back  ", Style::new().fg(theme::muted())),
-        Span::styled("↑/↓", Style::new().fg(theme::text())),
-        Span::styled(":scroll", Style::new().fg(theme::muted())),
-    ]));
 
     Paragraph::new(Text::from(lines))
         .wrap(Wrap { trim: false })

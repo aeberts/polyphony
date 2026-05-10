@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use polyphony_core::{InboxItemRow, RuntimeSnapshot};
+use polyphony_core::{DispatchMode, InboxItemRow, RuntimeSnapshot};
 use ratatui::{
     layout::{Margin, Rect},
     style::{Color, Style},
@@ -12,6 +12,7 @@ use crate::{
     app::{AppState, Route, clamp_selection},
     command_palette,
     detail::draw_detail,
+    dispatch_mode_picker,
     format::{item_time_label, truncate},
     rows::{display_rows_matching, hierarchy_prefix},
     status::{state_color, state_icon},
@@ -46,6 +47,9 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &RuntimeSnapshot, a
 
     if app.command_palette_open {
         command_palette::render(frame, area, app);
+    }
+    if app.dispatch_mode_picker_open {
+        dispatch_mode_picker::render(frame, area, snapshot, app);
     }
 }
 
@@ -320,6 +324,15 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &RuntimeSna
     Line::from(vec![
         Span::styled("tracker:", Style::new().fg(theme::muted())),
         Span::styled(tracker::label(snapshot), Style::new().fg(theme::primary())),
+        Span::styled("  orchestrator ", Style::new().fg(theme::muted())),
+        Span::styled(
+            "•",
+            Style::new().fg(dispatch_mode_color(snapshot.dispatch_mode)),
+        ),
+        Span::styled(
+            snapshot.dispatch_mode.to_string(),
+            Style::new().fg(theme::muted()),
+        ),
     ])
     .render(footer, frame.buffer_mut());
 
@@ -334,6 +347,14 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &RuntimeSna
         ),
         frame.buffer_mut(),
     );
+}
+
+fn dispatch_mode_color(mode: DispatchMode) -> Color {
+    match mode {
+        DispatchMode::Stop => theme::error(),
+        DispatchMode::Idle | DispatchMode::Manual => theme::secondary(),
+        DispatchMode::Automatic | DispatchMode::Nightshift => theme::done(),
+    }
 }
 
 fn render_scrollbar(

@@ -1,6 +1,7 @@
 mod app;
 mod command_palette;
 mod detail;
+mod dispatch_mode_picker;
 mod event_loop;
 mod format;
 mod render;

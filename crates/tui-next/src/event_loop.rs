@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, watch};
 use crate::{
     Error,
     app::{AppState, Route, clamp_selection},
-    command_palette,
+    command_palette, dispatch_mode_picker,
     render::draw,
     rows::display_rows_matching,
 };
@@ -98,7 +98,11 @@ fn handle_key(
     command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
 ) -> bool {
     if app.command_palette_open {
-        return handle_command_palette_key(app, code, modifiers, command_tx);
+        return handle_command_palette_key(app, code, modifiers, snapshot, command_tx);
+    }
+
+    if app.dispatch_mode_picker_open {
+        return handle_dispatch_mode_picker_key(app, code, modifiers, command_tx);
     }
 
     let rows = display_rows_matching(snapshot, &app.search_query);
@@ -128,6 +132,14 @@ fn handle_key(
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.command_palette_open = true;
             command_palette::reset(app);
+        },
+        KeyCode::Char('m')
+            if app.detail_input_mode == crate::app::DetailInputMode::None
+                && !modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+        {
+            dispatch_mode_picker::open(app, snapshot.dispatch_mode);
         },
         KeyCode::Enter if app.route == Route::Inbox && !rows.is_empty() => {
             app.route = Route::Detail;
@@ -220,6 +232,27 @@ fn handle_key(
         },
         KeyCode::Home => app.selected = 0,
         KeyCode::End => app.selected = rows.len().saturating_sub(1),
+        _ => {},
+    }
+    false
+}
+
+fn handle_dispatch_mode_picker_key(
+    app: &mut AppState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) -> bool {
+    match code {
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Esc | KeyCode::Char('m') => app.dispatch_mode_picker_open = false,
+        KeyCode::Enter => {
+            let mode = dispatch_mode_picker::selected_mode(app);
+            let _ = command_tx.send(RuntimeCommand::SetMode(mode));
+            app.dispatch_mode_picker_open = false;
+        },
+        KeyCode::Up | KeyCode::Char('k') => dispatch_mode_picker::selected_up(app),
+        KeyCode::Down | KeyCode::Char('j') => dispatch_mode_picker::selected_down(app),
         _ => {},
     }
     false
@@ -496,16 +529,26 @@ fn handle_command_palette_key(
     app: &mut AppState,
     code: KeyCode,
     modifiers: KeyModifiers,
+    snapshot: &RuntimeSnapshot,
     command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
 ) -> bool {
     match code {
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Esc if !app.command_query.is_empty() => {
+            app.command_query.clear();
+            app.command_selected = 0;
+            app.command_scroll = 0;
+        },
         KeyCode::Esc => app.command_palette_open = false,
-        KeyCode::Enter => run_command_palette_selection(app, command_tx),
-        KeyCode::Up | KeyCode::Char('k') => command_palette::selected_up(app),
-        KeyCode::Down | KeyCode::Char('j') => command_palette::selected_down(app),
+        KeyCode::Enter => run_command_palette_selection(app, snapshot, command_tx),
+        KeyCode::Up => command_palette::selected_up(app),
+        KeyCode::Down => command_palette::selected_down(app),
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.command_palette_open = false;
+        },
+        KeyCode::Backspace => command_palette::pop_query_char(app),
+        KeyCode::Char(c) if is_search_char(c, modifiers) => {
+            command_palette::push_query_char(app, c);
         },
         _ => {},
     }
@@ -514,31 +557,39 @@ fn handle_command_palette_key(
 
 fn run_command_palette_selection(
     app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
     command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
 ) {
-    match command_palette::COMMANDS
-        .get(app.command_selected)
-        .map(|command| command.name)
-    {
+    match command_palette::selected_command(app).map(|command| command.name) {
+        Some("Switch dispatch mode") => {
+            app.command_palette_open = false;
+            dispatch_mode_picker::open(app, snapshot.dispatch_mode);
+        },
+        Some("Toggle dispatch start/stop") => {
+            let mode = match snapshot.dispatch_mode {
+                DispatchMode::Stop => DispatchMode::Manual,
+                _ => DispatchMode::Stop,
+            };
+            let _ = command_tx.send(RuntimeCommand::SetMode(mode));
+        },
         Some("Refresh trackers") => {
             let _ = command_tx.send(RuntimeCommand::Refresh);
             app.status_message = Some("refresh requested".to_string());
         },
         Some("Stop dispatching") => {
             let _ = command_tx.send(RuntimeCommand::SetMode(DispatchMode::Stop));
-            app.status_message = Some("global dispatch stopped".to_string());
         },
         Some("Manual dispatch mode") => {
             let _ = command_tx.send(RuntimeCommand::SetMode(DispatchMode::Manual));
-            app.status_message = Some("global dispatch set to manual".to_string());
         },
         Some("Switch to nightshift mode") => {
             let _ = command_tx.send(RuntimeCommand::SetMode(DispatchMode::Nightshift));
-            app.status_message = Some("global dispatch set to nightshift".to_string());
         },
         _ => {},
     }
-    app.command_palette_open = false;
+    if app.command_palette_open {
+        app.command_palette_open = false;
+    }
 }
 
 fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::MouseEvent) {
