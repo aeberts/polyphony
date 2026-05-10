@@ -1,5 +1,6 @@
-use polyphony_core::{InboxItemRow, RuntimeSnapshot, TaskRow};
+use polyphony_core::{InboxItemRow, RunStatus, RuntimeSnapshot, TaskRow};
 use ratatui::{
+    buffer::Buffer,
     layout::{Constraint, Layout, Margin, Rect},
     style::Style,
     text::{Line, Span, Text},
@@ -12,12 +13,9 @@ use crate::{
     app::AppState,
     format::item_time_label,
     rows::display_rows_matching,
-    status::{state_color, state_icon},
-    theme, tracker,
+    session, theme, tracker,
     widgets::{InputBottomPanel, LeftRailPanel},
 };
-
-const CHILDREN_COLLAPSED_LIMIT: usize = 8;
 
 pub(crate) fn draw_detail(
     frame: &mut ratatui::Frame<'_>,
@@ -82,172 +80,65 @@ fn draw_main(
 ) {
     app.children_expand_rect = Rect::default();
 
-    let mut panels = Vec::new();
-    panels.push(LeftRailPanel::new(vec![
-        Line::from(vec![
-            Span::styled(
-                format!("{} ", state_icon(&item.status)),
-                Style::new().fg(state_color(&item.status)),
-            ),
-            Span::styled(item.title.clone(), Style::new().fg(theme::text()).bold()),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("{}  ", item.identifier),
-                Style::new().fg(theme::muted()),
-            ),
-            Span::styled(
-                format!("{}  ", item.source),
-                Style::new().fg(theme::primary()),
-            ),
-            Span::styled(item.status.clone(), Style::new().fg(theme::muted())),
-        ]),
-    ]));
-
-    let description = item
-        .description
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("No description.");
-    let mut description_lines = vec![Line::styled(
-        "Description",
-        Style::new().fg(theme::text()).bold(),
-    )];
-    description_lines.extend(
-        description
-            .lines()
-            .map(|line| Line::styled(line.to_string(), Style::new().fg(theme::muted()))),
-    );
-    panels.push(LeftRailPanel::new(description_lines));
-
-    let children = children_for_item(snapshot, item);
-    let children_expandable = children.len() > CHILDREN_COLLAPSED_LIMIT;
-    let children_panel_index = match children.is_empty() {
-        true => None,
-        false => {
-            let mut block = vec![Line::styled(
-                "Children",
-                Style::new().fg(theme::text()).bold(),
-            )];
-            let last_idx = children.len().saturating_sub(1);
-            let visible_children = match (children_expandable, app.children_expanded) {
-                (true, false) => CHILDREN_COLLAPSED_LIMIT,
-                _ => children.len(),
-            };
-            for (idx, child) in children.iter().take(visible_children).enumerate() {
-                let connector = match (
-                    children_expandable && !app.children_expanded,
-                    idx == last_idx,
-                ) {
-                    (false, true) => "└── ",
-                    _ => "├── ",
-                };
-                block.push(Line::from(vec![
-                    Span::styled(connector, Style::new().fg(theme::muted())),
-                    Span::styled(
-                        format!("{} ", state_icon(&child.status)),
-                        Style::new().fg(state_color(&child.status)),
-                    ),
-                    Span::styled(child.title.clone(), Style::new().fg(theme::muted())),
-                ]));
-            }
-            match (children_expandable, app.children_expanded) {
-                (true, false) => {
-                    block.push(Line::styled("…", Style::new().fg(theme::muted())));
-                    block.push(Line::styled(
-                        "Click to expand",
-                        Style::new().fg(theme::secondary()),
-                    ));
-                },
-                (true, true) => {
-                    block.push(Line::styled(
-                        "Click to collapse",
-                        Style::new().fg(theme::secondary()),
-                    ));
-                },
-                (false, _) => {},
-            }
-            let children_height = block.len().saturating_add(2) as u16;
-            let panel_index = panels.len();
-            panels.push(
-                LeftRailPanel::new(block)
-                    .max_height(children_height)
-                    .bg(theme::element()),
-            );
-            Some(panel_index)
-        },
-    };
-
-    let runs = snapshot
-        .runs
+    let session = session::build_issue_session(snapshot, item, app.children_expanded);
+    let panel_styles = session
+        .blocks
         .iter()
-        .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
+        .map(|block| block.style)
         .collect::<Vec<_>>();
-    if !runs.is_empty() {
-        let mut block = vec![Line::styled("Runs", Style::new().fg(theme::text()).bold())];
-        for run in &runs {
-            block.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", run.status),
-                    Style::new().fg(theme::primary()),
-                ),
-                Span::styled(run.title.clone(), Style::new().fg(theme::muted())),
-            ]));
-            block.push(Line::styled(
-                format!(
-                    "  tasks {}/{} · {}",
-                    run.tasks_completed, run.task_count, run.kind
-                ),
-                Style::new().fg(theme::muted()),
-            ));
-        }
-        panels.push(LeftRailPanel::new(block));
-    }
-
-    let tasks = tasks_for_item(snapshot, item);
-    if !tasks.is_empty() {
-        let mut block = vec![Line::styled("Tasks", Style::new().fg(theme::text()).bold())];
-        for task in tasks {
-            let icon = match task.status.to_string().as_str() {
-                "completed" => "✓",
-                "in_progress" => "●",
-                "failed" => "⊘",
-                _ => "·",
-            };
-            block.push(Line::from(vec![
-                Span::styled(format!("{icon} "), Style::new().fg(theme::primary())),
-                Span::styled(task.title.clone(), Style::new().fg(theme::muted())),
-            ]));
-            let agent = task.agent_name.as_deref().unwrap_or("unassigned");
-            block.push(Line::styled(
-                format!(
-                    "  {} · {} turns · {} tokens",
-                    agent, task.turns_completed, task.total_tokens
-                ),
-                Style::new().fg(theme::muted()),
-            ));
-        }
-        panels.push(LeftRailPanel::new(block));
-    }
-
-    let panel_width = area.width.saturating_sub(1);
-    let rendered_height = panels
+    let panels = session
+        .blocks
         .iter()
-        .map(|panel| panel.visible_height(panel_width, panel_max_height(area.height)))
-        .sum::<u16>()
-        .saturating_add(panels.len().saturating_sub(1) as u16) as usize;
+        .map(|block| {
+            let mut panel = LeftRailPanel::new(block.lines.clone()).border_color(block.accent);
+            if let Some(max_height) = block.max_height {
+                panel = panel.max_height(max_height);
+            }
+            panel
+        })
+        .collect::<Vec<_>>();
+
+    let panel_width = area.width.saturating_sub(2);
+    let max_panel_height = panel_max_height(area.height);
+    let panel_heights = panels
+        .iter()
+        .zip(panel_styles.iter())
+        .map(|(panel, style)| match style {
+            session::SessionBlockStyle::Plain => panel.plain_height(panel_width) as usize,
+            session::SessionBlockStyle::Subtle | session::SessionBlockStyle::Full => {
+                panel.visible_height(panel_width, max_panel_height) as usize
+            },
+        })
+        .collect::<Vec<_>>();
+    let panel_offsets = panel_offsets(&panel_heights);
+    let rendered_height = total_panel_height(&panel_heights);
     let max_scroll = rendered_height.saturating_sub(area.height as usize) as u16;
-    app.detail_scroll = app.detail_scroll.min(max_scroll);
+    app.detail_scroll_max = max_scroll;
+    app.detail_scrollbar_rect = Rect::default();
+    if app.detail_follow_bottom {
+        app.detail_scroll = bottom_aligned_scroll(&panel_offsets, &panel_heights, area.height)
+            .min(max_scroll as usize) as u16;
+    } else {
+        app.detail_scroll = app.detail_scroll.min(max_scroll);
+    }
 
     let rendered_areas = render_panels(
         frame,
         area,
         &panels,
+        &panel_styles,
+        &panel_heights,
+        &panel_offsets,
         app.detail_scroll,
-        children_panel_index.filter(|_| children_expandable),
+        session
+            .children_block_index
+            .filter(|_| session.children_expandable),
         app.mouse_pos,
     );
-    if let Some(children_panel_index) = children_panel_index.filter(|_| children_expandable) {
+    if let Some(children_panel_index) = session
+        .children_block_index
+        .filter(|_| session.children_expandable)
+    {
         app.children_expand_rect = rendered_areas
             .get(children_panel_index)
             .copied()
@@ -256,6 +147,12 @@ fn draw_main(
     }
 
     if max_scroll > 0 {
+        app.detail_scrollbar_rect = Rect::new(
+            area.x + area.width.saturating_sub(2),
+            area.y,
+            2,
+            area.height,
+        );
         render_scrollbar(
             frame,
             area,
@@ -270,39 +167,127 @@ fn render_panels(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     panels: &[LeftRailPanel],
+    panel_styles: &[session::SessionBlockStyle],
+    panel_heights: &[usize],
+    panel_offsets: &[usize],
     scroll: u16,
     hover_panel: Option<usize>,
     mouse_pos: Option<(u16, u16)>,
 ) -> Vec<Option<Rect>> {
     let mut rendered_areas = vec![None; panels.len()];
-    let mut y_cursor = -(i32::from(scroll));
     let panel_width = area.width.saturating_sub(2);
-    let max_panel_height = panel_max_height(area.height);
-    for (idx, panel) in panels.iter().enumerate() {
-        let height = panel.visible_height(panel_width, max_panel_height);
-        let top = y_cursor;
+    let content_height = total_panel_height(panel_heights).min(u16::MAX as usize) as u16;
+    let mut scratch = Buffer::empty(Rect::new(0, 0, panel_width, content_height));
+    Block::default()
+        .style(Style::new().bg(theme::bg()))
+        .render(scratch.area, &mut scratch);
 
-        if top >= 0 && top < i32::from(area.height) {
-            let visible_height = height.min(area.height.saturating_sub(top as u16));
-            let panel_area = Rect::new(
-                area.x,
-                area.y + top as u16,
-                area.width.saturating_sub(2),
-                visible_height,
-            );
-            let hovered = hover_panel == Some(idx)
-                && mouse_pos.is_some_and(|pos| panel_area.contains(pos.into()));
-            let bg = match hovered {
-                true => theme::element_hover(),
-                false => theme::element(),
+    for (idx, panel) in panels.iter().enumerate() {
+        let height = panel_heights
+            .get(idx)
+            .copied()
+            .unwrap_or_default()
+            .min(u16::MAX as usize) as u16;
+        let content_y = panel_offsets
+            .get(idx)
+            .copied()
+            .unwrap_or_default()
+            .min(u16::MAX as usize) as u16;
+        let bg = match hover_panel == Some(idx) {
+            true => theme::element_hover(),
+            false => theme::element(),
+        };
+        match panel_styles
+            .get(idx)
+            .copied()
+            .unwrap_or(session::SessionBlockStyle::Full)
+        {
+            session::SessionBlockStyle::Plain => {
+                panel.render_plain(
+                    Rect::new(0, content_y, panel_width, height),
+                    theme::bg(),
+                    &mut scratch,
+                );
+            },
+            session::SessionBlockStyle::Subtle => {
+                panel.render_plain_with_rail(
+                    Rect::new(0, content_y, panel_width, height),
+                    theme::bg(),
+                    &mut scratch,
+                );
+            },
+            session::SessionBlockStyle::Full => {
+                panel.render_clipped_with_bg(
+                    Rect::new(0, content_y, panel_width, height),
+                    0,
+                    bg,
+                    &mut scratch,
+                );
+            },
+        }
+    }
+
+    let scroll = usize::from(scroll);
+    for y in 0..area.height {
+        let source_y = scroll.saturating_add(usize::from(y));
+        if source_y >= usize::from(content_height) {
+            break;
+        }
+        for x in 0..panel_width {
+            let Some(source) = scratch.cell((x, source_y as u16)) else {
+                continue;
             };
-            panel.render_clipped_with_bg(panel_area, 0, bg, frame.buffer_mut());
+            if let Some(dest) = frame.buffer_mut().cell_mut((area.x + x, area.y + y)) {
+                *dest = source.clone();
+            }
+        }
+    }
+
+    for (idx, height) in panel_heights.iter().copied().enumerate() {
+        let content_y = panel_offsets.get(idx).copied().unwrap_or_default();
+        let top = content_y as i32 - scroll as i32;
+
+        let bottom = top + height as i32;
+        if bottom > 0 && top < i32::from(area.height) {
+            let visible_y = area.y + top.max(0) as u16;
+            let visible_height = height.min((area.y + area.height - visible_y) as usize) as u16;
+            let panel_area = Rect::new(area.x, visible_y, panel_width, visible_height);
             rendered_areas[idx] = Some(panel_area);
         }
-
-        y_cursor += i32::from(height) + 1;
     }
+
+    let _ = mouse_pos;
     rendered_areas
+}
+
+fn panel_offsets(panel_heights: &[usize]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(panel_heights.len());
+    let mut y = 0usize;
+    for height in panel_heights {
+        offsets.push(y);
+        y = y.saturating_add(*height).saturating_add(1);
+    }
+    offsets
+}
+
+fn bottom_aligned_scroll(
+    panel_offsets: &[usize],
+    panel_heights: &[usize],
+    viewport_height: u16,
+) -> usize {
+    let Some((&last_offset, &last_height)) = panel_offsets.last().zip(panel_heights.last()) else {
+        return 0;
+    };
+    let viewport_height = viewport_height as usize;
+    last_offset.saturating_sub(viewport_height.saturating_sub(last_height))
+}
+
+fn total_panel_height(panel_heights: &[usize]) -> usize {
+    panel_heights
+        .iter()
+        .copied()
+        .sum::<usize>()
+        .saturating_add(panel_heights.len().saturating_sub(1))
 }
 
 fn panel_max_height(viewport_height: u16) -> u16 {
@@ -336,22 +321,6 @@ fn render_scrollbar(
         .position(scroll.saturating_mul(scroll_scale as usize))
         .viewport_content_length(viewport_length as usize);
     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
-}
-
-fn children_for_item<'a>(
-    snapshot: &'a RuntimeSnapshot,
-    item: &InboxItemRow,
-) -> Vec<&'a InboxItemRow> {
-    let mut children = snapshot
-        .inbox_items
-        .iter()
-        .filter(|candidate| {
-            candidate.parent_id.as_deref() == Some(item.item_id.as_str())
-                || candidate.parent_id.as_deref() == Some(item.identifier.as_str())
-        })
-        .collect::<Vec<_>>();
-    children.sort_by(|a, b| a.identifier.cmp(&b.identifier));
-    children
 }
 
 fn draw_sidebar(
@@ -398,6 +367,49 @@ fn draw_sidebar(
             .map(|(label, value)| sidebar_kv(label, value, label_width, value_width)),
     );
 
+    let mut runs = snapshot
+        .runs
+        .iter()
+        .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
+        .collect::<Vec<_>>();
+    runs.sort_by_key(|run| run.created_at);
+    if let Some(run) = runs.last() {
+        let agent_count = snapshot
+            .agent_run_history
+            .iter()
+            .filter(|history| polyphony_core::agent_history_matches_run(run, history))
+            .count()
+            + snapshot
+                .running
+                .iter()
+                .filter(|agent| polyphony_core::running_agent_matches_run(run, agent))
+                .count();
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("Flow", Style::new().fg(theme::text()).bold()));
+        lines.push(sidebar_kv_styled(
+            "status",
+            &run.status.to_string(),
+            label_width,
+            value_width,
+            run_status_color(&run.status),
+        ));
+        lines.push(sidebar_kv(
+            "tasks",
+            &format!("{}/{}", run.tasks_completed, run.task_count),
+            label_width,
+            value_width,
+        ));
+        lines.push(sidebar_kv(
+            "agents",
+            &agent_count.to_string(),
+            label_width,
+            value_width,
+        ));
+        if let Some(workspace) = &run.workspace_key {
+            lines.push(sidebar_kv("branch", workspace, label_width, value_width));
+        }
+    }
+
     let tasks = tasks_for_item(snapshot, item);
     if !tasks.is_empty() {
         lines.push(Line::raw(""));
@@ -409,17 +421,30 @@ fn draw_sidebar(
                 "failed" => "⊘",
                 _ => "·",
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{icon} "), Style::new().fg(theme::primary())),
-                Span::styled(&task.title, Style::new().fg(theme::muted())),
-            ]));
+            let mut spans = vec![Span::styled(
+                format!("{icon} "),
+                Style::new().fg(theme::primary()),
+            )];
             if let Some(agent) = task.agent_name.as_deref() {
-                lines.push(Line::styled(
-                    format!("  {agent}"),
-                    Style::new().fg(theme::muted()),
+                spans.push(Span::styled(
+                    format!("[{agent}] "),
+                    Style::new().fg(theme::secondary()),
                 ));
             }
+            spans.push(Span::styled(&task.title, Style::new().fg(theme::muted())));
+            lines.push(Line::from(spans));
         }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("·", Style::new().fg(theme::muted())),
+            Span::styled(" todo  ", Style::new().fg(theme::muted())),
+            Span::styled("●", Style::new().fg(theme::primary())),
+            Span::styled(" running  ", Style::new().fg(theme::muted())),
+            Span::styled("⊘", Style::new().fg(theme::primary())),
+            Span::styled(" blocked  ", Style::new().fg(theme::muted())),
+            Span::styled("✓", Style::new().fg(theme::done())),
+            Span::styled(" done", Style::new().fg(theme::muted())),
+        ]));
     }
 
     let running = snapshot
@@ -479,6 +504,16 @@ fn workspace_label(snapshot: &RuntimeSnapshot, item: &InboxItemRow, tick: u32) -
 }
 
 fn sidebar_kv(label: &str, value: &str, label_width: usize, value_width: usize) -> Line<'static> {
+    sidebar_kv_styled(label, value, label_width, value_width, theme::text())
+}
+
+fn sidebar_kv_styled(
+    label: &str,
+    value: &str,
+    label_width: usize,
+    value_width: usize,
+    value_color: ratatui::style::Color,
+) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{label:<label_width$}"),
@@ -490,9 +525,18 @@ fn sidebar_kv(label: &str, value: &str, label_width: usize, value_width: usize) 
                 "{:>value_width$}",
                 crate::format::truncate(value, value_width)
             ),
-            Style::new().fg(theme::text()),
+            Style::new().fg(value_color),
         ),
     ])
+}
+
+fn run_status_color(status: &RunStatus) -> ratatui::style::Color {
+    match status {
+        RunStatus::Delivered => theme::done(),
+        RunStatus::Failed | RunStatus::Cancelled => theme::error(),
+        RunStatus::InProgress | RunStatus::Planning | RunStatus::Review => theme::primary(),
+        RunStatus::Pending => theme::muted(),
+    }
 }
 
 fn selected_item<'a>(snapshot: &'a RuntimeSnapshot, app: &AppState) -> Option<&'a InboxItemRow> {

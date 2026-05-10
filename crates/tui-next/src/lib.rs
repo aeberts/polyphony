@@ -5,6 +5,7 @@ mod event_loop;
 mod format;
 mod render;
 mod rows;
+mod session;
 mod status;
 mod theme;
 mod tracker;

@@ -67,6 +67,7 @@ pub(crate) struct LeftRailPanel {
     lines: Vec<Line<'static>>,
     max_height: Option<u16>,
     bg: Color,
+    border_color: Color,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,11 +236,15 @@ impl<'a> InputBottomPanel<'a> {
 }
 
 impl LeftRailPanel {
+    const CONTENT_LEFT: u16 = 3;
+    const CONTENT_RIGHT: u16 = 1;
+
     pub(crate) fn new(lines: Vec<Line<'static>>) -> Self {
         Self {
             lines,
             max_height: None,
             bg: theme::element(),
+            border_color: theme::border(),
         }
     }
 
@@ -248,8 +253,8 @@ impl LeftRailPanel {
         self
     }
 
-    pub(crate) fn bg(mut self, bg: Color) -> Self {
-        self.bg = bg;
+    pub(crate) fn border_color(mut self, border_color: Color) -> Self {
+        self.border_color = border_color;
         self
     }
 
@@ -262,6 +267,69 @@ impl LeftRailPanel {
             .sum::<u16>()
             .max(1);
         content_height + 2
+    }
+
+    pub(crate) fn plain_height(&self, width: u16) -> u16 {
+        let content_width = width
+            .saturating_sub(Self::CONTENT_LEFT + Self::CONTENT_RIGHT)
+            .max(1) as usize;
+        self.lines
+            .iter()
+            .map(|line| line.width().div_ceil(content_width).max(1) as u16)
+            .sum::<u16>()
+            .max(1)
+    }
+
+    pub(crate) fn render_plain(&self, area: Rect, bg: Color, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(Style::new().bg(bg));
+                }
+            }
+        }
+
+        Paragraph::new(Text::from(self.lines.clone()))
+            .wrap(Wrap { trim: false })
+            .style(Style::new().bg(bg))
+            .render(self.plain_content_area(area), buf);
+    }
+
+    pub(crate) fn render_plain_with_rail(&self, area: Rect, bg: Color, buf: &mut Buffer) {
+        if area.is_empty() {
+            return;
+        }
+
+        for y in area.y..area.y + area.height {
+            for x in area.x..area.x + area.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(Style::new().bg(bg));
+                }
+            }
+            if let Some(cell) = buf.cell_mut((area.x, y)) {
+                cell.set_symbol("▕")
+                    .set_style(Style::new().fg(self.border_color).bg(bg));
+            }
+        }
+
+        Paragraph::new(Text::from(self.lines.clone()))
+            .wrap(Wrap { trim: false })
+            .style(Style::new().bg(bg))
+            .render(self.plain_content_area(area), buf);
+    }
+
+    fn plain_content_area(&self, area: Rect) -> Rect {
+        Rect::new(
+            area.x.saturating_add(Self::CONTENT_LEFT),
+            area.y,
+            area.width
+                .saturating_sub(Self::CONTENT_LEFT + Self::CONTENT_RIGHT),
+            area.height,
+        )
     }
 
     pub(crate) fn visible_height(&self, width: u16, max_height: u16) -> u16 {
@@ -286,7 +354,7 @@ impl LeftRailPanel {
         }
 
         let inner = LeftBorderPanel::new()
-            .border_color(theme::border())
+            .border_color(self.border_color)
             .content_bg(bg)
             .padding(Padding::new(2, 1, 1, 1))
             .render(area, buf);

@@ -21,6 +21,8 @@ use crate::{
     rows::display_rows_matching,
 };
 
+const DETAIL_MOUSE_SCROLL_ROWS: u16 = 5;
+
 pub async fn run(
     mut snapshot_rx: watch::Receiver<RuntimeSnapshot>,
     command_tx: mpsc::UnboundedSender<RuntimeCommand>,
@@ -108,6 +110,7 @@ fn handle_key(
         KeyCode::Esc if app.route == Route::Detail => {
             app.route = Route::Inbox;
             app.detail_scroll = 0;
+            app.detail_follow_bottom = false;
             app.children_expanded = false;
         },
         KeyCode::Esc => return true,
@@ -118,20 +121,24 @@ fn handle_key(
         },
         KeyCode::Enter if app.route == Route::Inbox && !rows.is_empty() => {
             app.route = Route::Detail;
-            app.detail_scroll = 0;
+            app.detail_follow_bottom = true;
             app.children_expanded = false;
         },
         KeyCode::Up if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
+            app.detail_follow_bottom = false;
         },
         KeyCode::Down if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_add(1);
+            app.detail_follow_bottom = false;
         },
         KeyCode::PageUp if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_sub(8);
+            app.detail_follow_bottom = false;
         },
         KeyCode::PageDown if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_add(8);
+            app.detail_follow_bottom = false;
         },
         KeyCode::Backspace if app.route == Route::Detail => {
             app.input.pop();
@@ -206,19 +213,39 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
     match mouse.kind {
         MouseEventKind::ScrollDown => {
             if app.route == Route::Detail {
-                app.detail_scroll = app.detail_scroll.saturating_add(1);
+                app.detail_scroll = app.detail_scroll.saturating_add(DETAIL_MOUSE_SCROLL_ROWS);
+                app.detail_follow_bottom = false;
             } else {
                 app.selected = (app.selected + 1).min(rows.len().saturating_sub(1));
             }
         },
         MouseEventKind::ScrollUp => {
             if app.route == Route::Detail {
-                app.detail_scroll = app.detail_scroll.saturating_sub(1);
+                app.detail_scroll = app.detail_scroll.saturating_sub(DETAIL_MOUSE_SCROLL_ROWS);
+                app.detail_follow_bottom = false;
             } else {
                 app.selected = app.selected.saturating_sub(1);
             }
         },
+        MouseEventKind::Down(event::MouseButton::Left)
+        | MouseEventKind::Drag(event::MouseButton::Left)
+            if app.route == Route::Detail
+                && (app.detail_scrollbar_active
+                    || app
+                        .detail_scrollbar_rect
+                        .contains((mouse.column, mouse.row).into())) =>
+        {
+            app.detail_scrollbar_active = true;
+            app.detail_scroll = scroll_from_scrollbar(app, mouse.row);
+            app.detail_follow_bottom = false;
+        },
         MouseEventKind::Up(event::MouseButton::Left) => {
+            if app.route == Route::Detail && app.detail_scrollbar_active {
+                app.detail_scroll = scroll_from_scrollbar(app, mouse.row);
+                app.detail_scrollbar_active = false;
+                app.detail_follow_bottom = false;
+                return;
+            }
             if app.route == Route::Detail
                 && app
                     .children_expand_rect
@@ -232,12 +259,23 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
             {
                 app.selected = row.min(rows.len().saturating_sub(1));
                 app.route = Route::Detail;
-                app.detail_scroll = 0;
+                app.detail_follow_bottom = true;
                 app.children_expanded = false;
             }
         },
         _ => {},
     }
+}
+
+fn scroll_from_scrollbar(app: &AppState, row: u16) -> u16 {
+    if app.detail_scrollbar_rect.is_empty() || app.detail_scroll_max == 0 {
+        return app.detail_scroll;
+    }
+
+    let top = app.detail_scrollbar_rect.y;
+    let track_rows = app.detail_scrollbar_rect.height.saturating_sub(1).max(1);
+    let row_offset = row.saturating_sub(top).min(track_rows);
+    ((u32::from(row_offset) * u32::from(app.detail_scroll_max)) / u32::from(track_rows)) as u16
 }
 
 fn list_row_at_mouse(app: &AppState, column: u16, row: u16) -> Option<usize> {
