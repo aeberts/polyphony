@@ -8,6 +8,7 @@ mod rows;
 mod status;
 mod theme;
 mod tracker;
+mod widgets;
 
 use std::io;
 

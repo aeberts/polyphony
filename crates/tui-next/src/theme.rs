@@ -19,6 +19,10 @@ pub(crate) const fn element() -> Color {
     Color::Rgb(30, 30, 30)
 }
 
+pub(crate) const fn element_hover() -> Color {
+    Color::Rgb(42, 42, 42)
+}
+
 pub(crate) const fn text() -> Color {
     Color::Rgb(238, 238, 238)
 }

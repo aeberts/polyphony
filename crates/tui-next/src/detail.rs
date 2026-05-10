@@ -12,7 +12,10 @@ use crate::{
     rows::display_rows_matching,
     status::{state_color, state_icon},
     theme, tracker,
+    widgets::LeftRailPanel,
 };
+
+const CHILDREN_COLLAPSED_LIMIT: usize = 8;
 
 pub(crate) fn draw_detail(
     frame: &mut ratatui::Frame<'_>,
@@ -50,13 +53,16 @@ fn draw_main(
     item: &InboxItemRow,
     app: &mut AppState,
 ) {
-    let mut lines = vec![
+    app.children_expand_rect = Rect::default();
+
+    let mut panels = Vec::new();
+    panels.push(LeftRailPanel::new(vec![
         Line::from(vec![
             Span::styled(
                 format!("{} ", state_icon(&item.status)),
                 Style::new().fg(state_color(&item.status)),
             ),
-            Span::styled(&item.title, Style::new().fg(theme::text()).bold()),
+            Span::styled(item.title.clone(), Style::new().fg(theme::text()).bold()),
         ]),
         Line::from(vec![
             Span::styled(
@@ -67,46 +73,81 @@ fn draw_main(
                 format!("{}  ", item.source),
                 Style::new().fg(theme::primary()),
             ),
-            Span::styled(&item.status, Style::new().fg(theme::muted())),
+            Span::styled(item.status.clone(), Style::new().fg(theme::muted())),
         ]),
-        Line::raw(""),
-    ];
+    ]));
 
-    if let Some(description) = item
+    let description = item
         .description
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-    {
-        lines.push(Line::styled(
-            "Description",
-            Style::new().fg(theme::text()).bold(),
-        ));
-        lines.push(Line::styled(description, Style::new().fg(theme::muted())));
-        lines.push(Line::raw(""));
-    }
+        .unwrap_or("No description.");
+    let mut description_lines = vec![Line::styled(
+        "Description",
+        Style::new().fg(theme::text()).bold(),
+    )];
+    description_lines.extend(
+        description
+            .lines()
+            .map(|line| Line::styled(line.to_string(), Style::new().fg(theme::muted()))),
+    );
+    panels.push(LeftRailPanel::new(description_lines));
 
-    let children = snapshot
-        .inbox_items
-        .iter()
-        .filter(|candidate| candidate.parent_id.as_deref() == Some(item.item_id.as_str()))
-        .collect::<Vec<_>>();
-    if !children.is_empty() {
-        lines.push(Line::styled(
-            "Children",
-            Style::new().fg(theme::text()).bold(),
+    let children = children_for_item(snapshot, item);
+    let children_expandable = children.len() > CHILDREN_COLLAPSED_LIMIT;
+    let mut block = vec![Line::styled(
+        "Children",
+        Style::new().fg(theme::text()).bold(),
+    )];
+    if children.is_empty() {
+        block.push(Line::styled(
+            "No children.",
+            Style::new().fg(theme::muted()),
         ));
-        for child in children {
-            lines.push(Line::from(vec![
-                Span::styled("├── ", Style::new().fg(theme::muted())),
+    } else {
+        let last_idx = children.len().saturating_sub(1);
+        let visible_children = match (children_expandable, app.children_expanded) {
+            (true, false) => CHILDREN_COLLAPSED_LIMIT,
+            _ => children.len(),
+        };
+        for (idx, child) in children.iter().take(visible_children).enumerate() {
+            let connector = match (app.children_expanded, idx == last_idx) {
+                (true, true) => "└── ",
+                _ => "├── ",
+            };
+            block.push(Line::from(vec![
+                Span::styled(connector, Style::new().fg(theme::muted())),
                 Span::styled(
                     format!("{} ", state_icon(&child.status)),
                     Style::new().fg(state_color(&child.status)),
                 ),
-                Span::styled(&child.title, Style::new().fg(theme::muted())),
+                Span::styled(child.title.clone(), Style::new().fg(theme::muted())),
             ]));
         }
-        lines.push(Line::raw(""));
+        match (children_expandable, app.children_expanded) {
+            (true, false) => {
+                block.push(Line::styled("...", Style::new().fg(theme::muted())));
+                block.push(Line::styled(
+                    "Click to expand",
+                    Style::new().fg(theme::muted()),
+                ));
+            },
+            (true, true) => {
+                block.push(Line::styled(
+                    "Click to collapse",
+                    Style::new().fg(theme::muted()),
+                ));
+            },
+            (false, _) => {},
+        }
     }
+    let children_height = block.len().saturating_add(2) as u16;
+    let children_panel_index = panels.len();
+    panels.push(
+        LeftRailPanel::new(block)
+            .max_height(children_height)
+            .bg(theme::element()),
+    );
 
     let runs = snapshot
         .runs
@@ -114,16 +155,16 @@ fn draw_main(
         .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
         .collect::<Vec<_>>();
     if !runs.is_empty() {
-        lines.push(Line::styled("Runs", Style::new().fg(theme::text()).bold()));
+        let mut block = vec![Line::styled("Runs", Style::new().fg(theme::text()).bold())];
         for run in &runs {
-            lines.push(Line::from(vec![
+            block.push(Line::from(vec![
                 Span::styled(
                     format!("{} ", run.status),
                     Style::new().fg(theme::primary()),
                 ),
-                Span::styled(&run.title, Style::new().fg(theme::muted())),
+                Span::styled(run.title.clone(), Style::new().fg(theme::muted())),
             ]));
-            lines.push(Line::styled(
+            block.push(Line::styled(
                 format!(
                     "  tasks {}/{} · {}",
                     run.tasks_completed, run.task_count, run.kind
@@ -131,12 +172,14 @@ fn draw_main(
                 Style::new().fg(theme::muted()),
             ));
         }
-        lines.push(Line::raw(""));
+        panels.push(LeftRailPanel::new(block));
     }
 
     let tasks = tasks_for_item(snapshot, item);
-    if !tasks.is_empty() {
-        lines.push(Line::styled("Tasks", Style::new().fg(theme::text()).bold()));
+    let mut block = vec![Line::styled("Tasks", Style::new().fg(theme::text()).bold())];
+    if tasks.is_empty() {
+        block.push(Line::styled("No tasks.", Style::new().fg(theme::muted())));
+    } else {
         for task in tasks {
             let icon = match task.status.to_string().as_str() {
                 "completed" => "✓",
@@ -144,12 +187,12 @@ fn draw_main(
                 "failed" => "⊘",
                 _ => "·",
             };
-            lines.push(Line::from(vec![
+            block.push(Line::from(vec![
                 Span::styled(format!("{icon} "), Style::new().fg(theme::primary())),
-                Span::styled(&task.title, Style::new().fg(theme::muted())),
+                Span::styled(task.title.clone(), Style::new().fg(theme::muted())),
             ]));
             let agent = task.agent_name.as_deref().unwrap_or("unassigned");
-            lines.push(Line::styled(
+            block.push(Line::styled(
                 format!(
                     "  {} · {} turns · {} tokens",
                     agent, task.turns_completed, task.total_tokens
@@ -158,19 +201,35 @@ fn draw_main(
             ));
         }
     }
+    panels.push(LeftRailPanel::new(block));
 
-    let rendered_height = lines
+    let panel_width = area.width.saturating_sub(1);
+    let rendered_height = panels
         .iter()
-        .map(|line| line.width().div_ceil(area.width.max(1) as usize).max(1))
-        .sum::<usize>();
+        .map(|panel| panel.visible_height(panel_width, panel_max_height(area.height)))
+        .sum::<u16>()
+        .saturating_add(panels.len().saturating_sub(1) as u16) as usize;
     let max_scroll = rendered_height.saturating_sub(area.height as usize) as u16;
     app.detail_scroll = app.detail_scroll.min(max_scroll);
 
-    Paragraph::new(Text::from(lines))
-        .wrap(Wrap { trim: false })
-        .scroll((app.detail_scroll, 0))
-        .style(Style::new().bg(theme::bg()))
-        .render(area, frame.buffer_mut());
+    let rendered_areas = render_panels(
+        frame,
+        area,
+        &panels,
+        app.detail_scroll,
+        match children_expandable {
+            true => Some(children_panel_index),
+            false => None,
+        },
+        app.mouse_pos,
+    );
+    if children_expandable {
+        app.children_expand_rect = rendered_areas
+            .get(children_panel_index)
+            .copied()
+            .flatten()
+            .unwrap_or_default();
+    }
 
     if max_scroll > 0 {
         render_scrollbar(
@@ -181,6 +240,49 @@ fn draw_main(
             app.detail_scroll as usize,
         );
     }
+}
+
+fn render_panels(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    panels: &[LeftRailPanel],
+    scroll: u16,
+    hover_panel: Option<usize>,
+    mouse_pos: Option<(u16, u16)>,
+) -> Vec<Option<Rect>> {
+    let mut rendered_areas = vec![None; panels.len()];
+    let mut y_cursor = -(i32::from(scroll));
+    let panel_width = area.width.saturating_sub(3);
+    let max_panel_height = panel_max_height(area.height);
+    for (idx, panel) in panels.iter().enumerate() {
+        let height = panel.visible_height(panel_width, max_panel_height);
+        let top = y_cursor;
+
+        if top >= 0 && top < i32::from(area.height) {
+            let visible_height = height.min(area.height.saturating_sub(top as u16));
+            let panel_area = Rect::new(
+                area.x,
+                area.y + top as u16,
+                area.width.saturating_sub(3),
+                visible_height,
+            );
+            let hovered = hover_panel == Some(idx)
+                && mouse_pos.is_some_and(|pos| panel_area.contains(pos.into()));
+            let bg = match hovered {
+                true => theme::element_hover(),
+                false => theme::element(),
+            };
+            panel.render_clipped_with_bg(panel_area, 0, bg, frame.buffer_mut());
+            rendered_areas[idx] = Some(panel_area);
+        }
+
+        y_cursor += i32::from(height) + 1;
+    }
+    rendered_areas
+}
+
+fn panel_max_height(viewport_height: u16) -> u16 {
+    viewport_height.saturating_sub(2).clamp(6, 12)
 }
 
 fn render_scrollbar(
@@ -210,6 +312,22 @@ fn render_scrollbar(
         .position(scroll.saturating_mul(scroll_scale as usize))
         .viewport_content_length(viewport_length as usize);
     frame.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+}
+
+fn children_for_item<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    item: &InboxItemRow,
+) -> Vec<&'a InboxItemRow> {
+    let mut children = snapshot
+        .inbox_items
+        .iter()
+        .filter(|candidate| {
+            candidate.parent_id.as_deref() == Some(item.item_id.as_str())
+                || candidate.parent_id.as_deref() == Some(item.identifier.as_str())
+        })
+        .collect::<Vec<_>>();
+    children.sort_by(|a, b| a.identifier.cmp(&b.identifier));
+    children
 }
 
 fn draw_sidebar(

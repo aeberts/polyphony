@@ -20,6 +20,9 @@ pub(crate) struct AppState {
     pub command_palette_open: bool,
     pub command_selected: usize,
     pub command_scroll: usize,
+    pub children_expanded: bool,
+    pub children_expand_rect: Rect,
+    pub mouse_pos: Option<(u16, u16)>,
 }
 
 pub(crate) fn clamp_selection(app: &mut AppState, len: usize) {

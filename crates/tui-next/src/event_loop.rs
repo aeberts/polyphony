@@ -108,6 +108,7 @@ fn handle_key(
         KeyCode::Esc if app.route == Route::Detail => {
             app.route = Route::Inbox;
             app.detail_scroll = 0;
+            app.children_expanded = false;
         },
         KeyCode::Esc => return true,
         KeyCode::Char('q') if app.route != Route::Inbox => return true,
@@ -119,6 +120,7 @@ fn handle_key(
         KeyCode::Enter if app.route == Route::Inbox && !rows.is_empty() => {
             app.route = Route::Detail;
             app.detail_scroll = 0;
+            app.children_expanded = false;
         },
         KeyCode::Up | KeyCode::Char('k') if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
@@ -184,6 +186,8 @@ fn handle_command_palette_key(app: &mut AppState, code: KeyCode, modifiers: KeyM
 }
 
 fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::MouseEvent) {
+    app.mouse_pos = Some((mouse.column, mouse.row));
+
     if app.command_palette_open {
         match mouse.kind {
             MouseEventKind::ScrollDown => command_palette::selected_down(app),
@@ -210,12 +214,21 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
             }
         },
         MouseEventKind::Up(event::MouseButton::Left) => {
+            if app.route == Route::Detail
+                && app
+                    .children_expand_rect
+                    .contains((mouse.column, mouse.row).into())
+            {
+                app.children_expanded = !app.children_expanded;
+                return;
+            }
             if app.route == Route::Inbox
                 && let Some(row) = list_row_at_mouse(app, mouse.column, mouse.row)
             {
                 app.selected = row.min(rows.len().saturating_sub(1));
                 app.route = Route::Detail;
                 app.detail_scroll = 0;
+                app.children_expanded = false;
             }
         },
         _ => {},
