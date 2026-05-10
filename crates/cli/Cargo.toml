@@ -13,6 +13,7 @@ default = [
   "sqlite",
   "tracing",
   "tui",
+  "tui-next",
   "httpd",
   "linear",
   "github",
@@ -34,6 +35,7 @@ gitlab = ["dep:polyphony-gitlab"]
 beads = ["dep:polyphony-beads"]
 sqlite = ["dep:polyphony-sqlite"]
 tui = ["dep:polyphony-tui"]
+tui-next = ["dep:polyphony-tui-next", "tui"]
 httpd = ["dep:polyphony-httpd"]
 tracing = [
   "dep:opentelemetry",
@@ -91,6 +93,7 @@ polyphony-linear = { path = "../linear", optional = true }
 polyphony-orchestrator = { path = "../orchestrator" }
 polyphony-sqlite = { path = "../sqlite", optional = true }
 polyphony-tui = { path = "../tui", optional = true }
+polyphony-tui-next = { path = "../tui-next", optional = true }
 polyphony-httpd = { path = "../httpd", optional = true }
 polyphony-tools = { path = "../tools" }
 polyphony-workspace = { path = "../workspace" }

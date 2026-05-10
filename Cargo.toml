@@ -25,6 +25,7 @@ members = [
   "crates/sqlite",
   "crates/metrics",
   "crates/tui",
+  "crates/tui-next",
   "crates/httpd",
   "crates/cli",
 ]

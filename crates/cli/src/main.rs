@@ -37,6 +37,9 @@ struct Cli {
     workflow_path: Option<PathBuf>,
     #[arg(long, global = true)]
     no_tui: bool,
+    /// TUI implementation to launch.
+    #[arg(long = "tui", value_enum, default_value_t = TuiVariant::Current, global = true)]
+    tui: TuiVariant,
     #[arg(long, global = true)]
     log_json: bool,
     #[arg(long, env = "POLYPHONY_SQLITE_URL", global = true)]
@@ -195,6 +198,12 @@ enum DispatchModeArg {
     Automatic,
     Nightshift,
     Idle,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TuiVariant {
+    Current,
+    Next,
 }
 
 impl DispatchModeArg {
@@ -398,7 +407,7 @@ async fn try_main() -> Result<(), Error> {
             std::env::set_var("POLYPHONY_DAEMON__LISTEN_ADDRESS", address);
         }
     }
-    let tui_mode = !daemon_foreground && !serve_mode && tui_available() && !cli.no_tui;
+    let tui_mode = !daemon_foreground && !serve_mode && tui_available(cli.tui) && !cli.no_tui;
     if let Some(dir) = &cli.directory {
         std::env::set_current_dir(dir).map_err(|e| {
             Error::Config(format!("cannot change to directory {}: {e}", dir.display()))
@@ -511,7 +520,9 @@ async fn try_main() -> Result<(), Error> {
         runtime.handle.command_tx.clone(),
         runtime.tui_logs,
         runtime.tracing_output,
-        |snapshot_rx, command_tx, tui_logs| Box::pin(run_tui(snapshot_rx, command_tx, tui_logs)),
+        |snapshot_rx, command_tx, tui_logs| {
+            Box::pin(run_tui(cli.tui, snapshot_rx, command_tx, tui_logs))
+        },
         Box::pin(tokio::signal::ctrl_c()),
     )
     .await?;
@@ -837,13 +848,17 @@ async fn start_runtime(
     tracing::info!(
         workflow_path = %workflow_path.display(),
         no_tui = !tui_mode,
-        tui_compiled = tui_available(),
+        tui_compiled = tui_available(cli.tui),
+        tui_variant = ?cli.tui,
         sqlite_enabled = cli.sqlite_url.is_some(),
         "starting polyphony"
     );
-    if !tui_available() && !cli.no_tui {
-        eprintln!("polyphony: tui support is disabled for this build, continuing headless.");
-        tracing::warn!("tui support is disabled for this build; continuing headless");
+    if !tui_available(cli.tui) && !cli.no_tui {
+        eprintln!(
+            "polyphony: {:?} tui support is disabled for this build, continuing headless.",
+            cli.tui
+        );
+        tracing::warn!(?cli.tui, "tui support is disabled for this build; continuing headless");
     }
     let user_config_path = user_config_path()?;
     if ensure_user_config_file(&user_config_path)? {

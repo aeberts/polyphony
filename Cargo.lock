@@ -3512,6 +3512,7 @@ dependencies = [
  "polyphony-sqlite",
  "polyphony-tools",
  "polyphony-tui",
+ "polyphony-tui-next",
  "polyphony-workflow",
  "polyphony-workspace",
  "reqwest",
@@ -3735,6 +3736,20 @@ dependencies = [
  "tracing",
  "tui-markdown",
  "vt100",
+]
+
+[[package]]
+name = "polyphony-tui-next"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crossterm",
+ "futures-util",
+ "polyphony-core",
+ "polyphony-orchestrator",
+ "ratatui",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
