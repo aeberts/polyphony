@@ -104,7 +104,33 @@ pub(crate) fn display_rows_matching(snapshot: &RuntimeSnapshot, query: &str) -> 
             .cmp(a_score)
             .then_with(|| a_row.item_idx.cmp(&b_row.item_idx))
     });
-    matches.into_iter().map(|(_, row)| row).collect()
+    let mut seen = HashSet::new();
+    let mut with_parents = Vec::new();
+    for (_, row) in matches {
+        if row.depth > 0
+            && let Some(parent_idx) = parent_index(snapshot, row.item_idx)
+            && seen.insert(parent_idx)
+        {
+            with_parents.push(DisplayRow {
+                item_idx: parent_idx,
+                depth: 0,
+                last_child: false,
+            });
+        }
+        if seen.insert(row.item_idx) {
+            with_parents.push(row);
+        }
+    }
+    with_parents
+}
+
+fn parent_index(snapshot: &RuntimeSnapshot, child_idx: usize) -> Option<usize> {
+    let child = snapshot.inbox_items.get(child_idx)?;
+    let parent_id = child.parent_id.as_deref()?;
+    snapshot
+        .inbox_items
+        .iter()
+        .position(|item| item.item_id == parent_id || item.identifier == parent_id)
 }
 
 fn searchable_text(snapshot: &RuntimeSnapshot, item: &InboxItemRow) -> String {
