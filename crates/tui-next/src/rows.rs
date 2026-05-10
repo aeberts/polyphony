@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use polyphony_core::RuntimeSnapshot;
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
+use polyphony_core::{InboxItemRow, RuntimeSnapshot};
 
 #[derive(Clone, Copy)]
 pub(crate) struct DisplayRow {
@@ -78,6 +79,68 @@ pub(crate) fn display_rows(snapshot: &RuntimeSnapshot) -> Vec<DisplayRow> {
         }
     }
     rows
+}
+
+pub(crate) fn display_rows_matching(snapshot: &RuntimeSnapshot, query: &str) -> Vec<DisplayRow> {
+    let rows = display_rows(snapshot);
+    let query = query.trim();
+    if query.is_empty() {
+        return rows;
+    }
+
+    let matcher = SkimMatcherV2::default().smart_case();
+    let mut matches = rows
+        .into_iter()
+        .filter_map(|row| {
+            let item = snapshot.inbox_items.get(row.item_idx)?;
+            let haystack = searchable_text(snapshot, item);
+            matcher
+                .fuzzy_match(&haystack, query)
+                .map(|score| (score, row))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(a_score, a_row), (b_score, b_row)| {
+        b_score
+            .cmp(a_score)
+            .then_with(|| a_row.item_idx.cmp(&b_row.item_idx))
+    });
+    matches.into_iter().map(|(_, row)| row).collect()
+}
+
+fn searchable_text(snapshot: &RuntimeSnapshot, item: &InboxItemRow) -> String {
+    let mut fields = vec![
+        item.repo_id.clone(),
+        item.item_id.clone(),
+        item.source.clone(),
+        item.identifier.clone(),
+        item.title.clone(),
+        item.status.clone(),
+    ];
+
+    if let Some(description) = item.description.as_deref() {
+        fields.push(description.to_string());
+    }
+    if let Some(url) = item.url.as_deref() {
+        fields.push(url.to_string());
+    }
+    if let Some(author) = item.author.as_deref() {
+        fields.push(author.to_string());
+    }
+    if let Some(parent_id) = item.parent_id.as_deref() {
+        fields.push(parent_id.to_string());
+    }
+    fields.extend(item.labels.iter().cloned());
+
+    for run in snapshot
+        .runs
+        .iter()
+        .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
+    {
+        fields.push(run.title.clone());
+        fields.push(run.status.to_string());
+    }
+
+    fields.join(" ")
 }
 
 pub(crate) fn hierarchy_prefix(depth: u8, last_child: bool) -> &'static str {

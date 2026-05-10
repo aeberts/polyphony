@@ -13,9 +13,9 @@ use crate::{
     command_palette,
     detail::draw_detail,
     format::{item_time_label, truncate},
-    rows::{display_rows, hierarchy_prefix},
+    rows::{display_rows_matching, hierarchy_prefix},
     status::{state_color, state_icon},
-    theme,
+    theme, tracker,
 };
 
 pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &RuntimeSnapshot, app: &mut AppState) {
@@ -26,8 +26,8 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &RuntimeSnapshot, a
     match route {
         Route::Inbox => {
             let panel_width = 112u16.min(area.width.saturating_sub(4)).max(60);
-            let list_height = 14u16.min(area.height.saturating_sub(12)).max(5);
-            let panel_height = list_height + 11;
+            let list_height = 14u16.min(area.height.saturating_sub(13)).max(5);
+            let panel_height = list_height + 12;
             let panel = Rect::new(
                 area.x + area.width.saturating_sub(panel_width) / 2,
                 area.y + area.height.saturating_sub(panel_height) / 2,
@@ -78,11 +78,13 @@ fn draw_inbox(
     snapshot: &RuntimeSnapshot,
     app: &mut AppState,
 ) {
-    let list = Rect::new(panel.x, panel.y + 7, panel.width, list_height);
+    draw_search(frame, panel, app);
+
+    let list = Rect::new(panel.x, panel.y + 8, panel.width, list_height);
     let scrollbar_width = 2u16;
     let table_width = list.width.saturating_sub(scrollbar_width);
     let visible_rows = list.height.saturating_sub(2) as usize;
-    let rows = display_rows(snapshot);
+    let rows = display_rows_matching(snapshot, &app.search_query);
     clamp_selection(app, rows.len());
     let max_scroll = rows.len().saturating_sub(visible_rows);
     let scroll = app
@@ -192,6 +194,35 @@ fn draw_inbox(
     draw_table_footer(frame, panel, list, rows.len(), visible_rows, scroll);
 }
 
+fn draw_search(frame: &mut ratatui::Frame<'_>, panel: Rect, app: &AppState) {
+    let cursor_on = (app.tick / 6).is_multiple_of(2);
+    let label = if app.search_query.is_empty() {
+        let first_char_style = if cursor_on {
+            Style::new().fg(theme::bg()).bg(theme::primary())
+        } else {
+            Style::new().fg(theme::muted())
+        };
+        Line::from(vec![
+            Span::styled("t", first_char_style),
+            Span::styled("ype to filter", Style::new().fg(theme::muted())),
+        ])
+    } else {
+        let cursor = if cursor_on {
+            "█"
+        } else {
+            " "
+        };
+        Line::from(vec![
+            Span::styled(&app.search_query, Style::new().fg(theme::text())),
+            Span::styled(cursor, Style::new().fg(theme::primary())),
+        ])
+    };
+    label.render(
+        Rect::new(panel.x, panel.y + 6, panel.width, 1),
+        frame.buffer_mut(),
+    );
+}
+
 fn draw_table_footer(
     frame: &mut ratatui::Frame<'_>,
     panel: Rect,
@@ -245,16 +276,16 @@ fn draw_table_footer(
     );
 
     let hint = Line::from(vec![
-        Span::styled("j/k", Style::new().fg(theme::text())),
+        Span::styled("↑/↓", Style::new().fg(theme::text())),
         Span::styled(":navigate  ", Style::new().fg(theme::muted())),
+        Span::styled("typing", Style::new().fg(theme::text())),
+        Span::styled(":search  ", Style::new().fg(theme::muted())),
         Span::styled("Enter", Style::new().fg(theme::text())),
         Span::styled(":open  ", Style::new().fg(theme::muted())),
-        Span::styled("q", Style::new().fg(theme::text())),
-        Span::styled(":quit  ", Style::new().fg(theme::muted())),
         Span::styled("Ctrl+P", Style::new().fg(theme::text())),
         Span::styled(":commands", Style::new().fg(theme::muted())),
     ]);
-    let hint_width = 51u16;
+    let hint_width = 62u16;
     let hint_x = panel.x + panel.width.saturating_sub(hint_width);
     hint.render(
         Rect::new(hint_x, list.y + list.height + 2, hint_width, 1),
@@ -273,10 +304,9 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, snapshot: &RuntimeSna
         1,
     )
     .inner(Margin::new(2, 0));
-    let tracker = snapshot.tracker_kind.to_string();
     Line::from(vec![
         Span::styled("tracker:", Style::new().fg(theme::muted())),
-        Span::styled(tracker, Style::new().fg(theme::primary())),
+        Span::styled(tracker::label(snapshot), Style::new().fg(theme::primary())),
     ])
     .render(footer, frame.buffer_mut());
 

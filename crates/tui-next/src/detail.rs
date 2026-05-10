@@ -9,9 +9,9 @@ use ratatui::{
 use crate::{
     app::AppState,
     format::item_time_label,
-    rows::display_rows,
+    rows::display_rows_matching,
     status::{state_color, state_icon},
-    theme,
+    theme, tracker,
 };
 
 pub(crate) fn draw_detail(
@@ -319,10 +319,7 @@ fn draw_sidebar(
 
     Line::from(vec![
         Span::styled("tracker:", Style::new().fg(theme::muted())),
-        Span::styled(
-            snapshot.tracker_kind.to_string(),
-            Style::new().fg(theme::primary()),
-        ),
+        Span::styled(tracker::label(snapshot), Style::new().fg(theme::primary())),
     ])
     .render(footer, frame.buffer_mut());
 }
@@ -357,7 +354,7 @@ fn sidebar_kv(label: &str, value: &str, label_width: usize, value_width: usize) 
 }
 
 fn selected_item<'a>(snapshot: &'a RuntimeSnapshot, app: &AppState) -> Option<&'a InboxItemRow> {
-    display_rows(snapshot)
+    display_rows_matching(snapshot, &app.search_query)
         .get(app.selected)
         .and_then(|row| snapshot.inbox_items.get(row.item_idx))
 }

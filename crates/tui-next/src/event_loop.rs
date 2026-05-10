@@ -18,7 +18,7 @@ use crate::{
     app::{AppState, Route, clamp_selection},
     command_palette,
     render::draw,
-    rows::display_rows,
+    rows::display_rows_matching,
 };
 
 pub async fn run(
@@ -71,12 +71,13 @@ pub async fn run(
                     break;
                 }
                 snapshot = snapshot_rx.borrow().clone();
-                clamp_selection(&mut app, display_rows(&snapshot).len());
+                let row_count = display_rows_matching(&snapshot, &app.search_query).len();
+                clamp_selection(&mut app, row_count);
                 needs_draw = true;
             }
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 app.tick = app.tick.wrapping_add(1);
-                if !snapshot.running.is_empty() || snapshot.inbox_items.iter().any(|item| item.status.eq_ignore_ascii_case("in progress")) {
+                if app.route == Route::Inbox || !snapshot.running.is_empty() || snapshot.inbox_items.iter().any(|item| item.status.eq_ignore_ascii_case("in progress")) {
                     needs_draw = true;
                 }
             }
@@ -97,13 +98,19 @@ fn handle_key(
         return handle_command_palette_key(app, code, modifiers);
     }
 
-    let rows = display_rows(snapshot);
+    let rows = display_rows_matching(snapshot, &app.search_query);
     match code {
+        KeyCode::Esc if app.route == Route::Inbox && !app.search_query.is_empty() => {
+            app.search_query.clear();
+            app.selected = 0;
+            app.scroll = 0;
+        },
         KeyCode::Esc if app.route == Route::Detail => {
             app.route = Route::Inbox;
             app.detail_scroll = 0;
         },
-        KeyCode::Esc | KeyCode::Char('q') => return true,
+        KeyCode::Esc => return true,
+        KeyCode::Char('q') if app.route != Route::Inbox => return true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.command_palette_open = true;
@@ -125,8 +132,17 @@ fn handle_key(
         KeyCode::PageDown if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_add(8);
         },
-        KeyCode::Up | KeyCode::Char('k') => app.selected = app.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Backspace if app.route == Route::Inbox => {
+            app.search_query.pop();
+            app.selected = app.selected.min(rows.len().saturating_sub(1));
+        },
+        KeyCode::Char(c) if app.route == Route::Inbox && is_search_char(c, modifiers) => {
+            app.search_query.push(c);
+            app.selected = 0;
+            app.scroll = 0;
+        },
+        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
+        KeyCode::Down => {
             app.selected = (app.selected + 1).min(rows.len().saturating_sub(1));
         },
         KeyCode::PageUp => app.selected = app.selected.saturating_sub(app.visible_rows.max(1)),
@@ -139,6 +155,17 @@ fn handle_key(
         _ => {},
     }
     false
+}
+
+fn is_search_char(c: char, modifiers: KeyModifiers) -> bool {
+    if modifiers.contains(KeyModifiers::CONTROL)
+        || modifiers.contains(KeyModifiers::ALT)
+        || modifiers.contains(KeyModifiers::SUPER)
+    {
+        return false;
+    }
+
+    c.is_ascii() && !c.is_ascii_control()
 }
 
 fn handle_command_palette_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -166,7 +193,7 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
         return;
     }
 
-    let rows = display_rows(snapshot);
+    let rows = display_rows_matching(snapshot, &app.search_query);
     match mouse.kind {
         MouseEventKind::ScrollDown => {
             if app.route == Route::Detail {

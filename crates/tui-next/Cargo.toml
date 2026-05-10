@@ -8,6 +8,7 @@ license.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
+fuzzy-matcher.workspace = true
 polyphony-core = { path = "../core" }
 polyphony-orchestrator = { path = "../orchestrator" }
 ratatui.workspace = true

@@ -7,6 +7,7 @@ mod render;
 mod rows;
 mod status;
 mod theme;
+mod tracker;
 
 use std::io;
 
