@@ -122,62 +122,61 @@ fn draw_main(
 
     let children = children_for_item(snapshot, item);
     let children_expandable = children.len() > CHILDREN_COLLAPSED_LIMIT;
-    let mut block = vec![Line::styled(
-        "Children",
-        Style::new().fg(theme::text()).bold(),
-    )];
-    if children.is_empty() {
-        block.push(Line::styled(
-            "No children.",
-            Style::new().fg(theme::muted()),
-        ));
-    } else {
-        let last_idx = children.len().saturating_sub(1);
-        let visible_children = match (children_expandable, app.children_expanded) {
-            (true, false) => CHILDREN_COLLAPSED_LIMIT,
-            _ => children.len(),
-        };
-        for (idx, child) in children.iter().take(visible_children).enumerate() {
-            let connector = match (
-                children_expandable && !app.children_expanded,
-                idx == last_idx,
-            ) {
-                (false, true) => "└── ",
-                _ => "├── ",
+    let children_panel_index = match children.is_empty() {
+        true => None,
+        false => {
+            let mut block = vec![Line::styled(
+                "Children",
+                Style::new().fg(theme::text()).bold(),
+            )];
+            let last_idx = children.len().saturating_sub(1);
+            let visible_children = match (children_expandable, app.children_expanded) {
+                (true, false) => CHILDREN_COLLAPSED_LIMIT,
+                _ => children.len(),
             };
-            block.push(Line::from(vec![
-                Span::styled(connector, Style::new().fg(theme::muted())),
-                Span::styled(
-                    format!("{} ", state_icon(&child.status)),
-                    Style::new().fg(state_color(&child.status)),
-                ),
-                Span::styled(child.title.clone(), Style::new().fg(theme::muted())),
-            ]));
-        }
-        match (children_expandable, app.children_expanded) {
-            (true, false) => {
-                block.push(Line::styled("…", Style::new().fg(theme::muted())));
-                block.push(Line::styled(
-                    "Click to expand",
-                    Style::new().fg(theme::secondary()),
-                ));
-            },
-            (true, true) => {
-                block.push(Line::styled(
-                    "Click to collapse",
-                    Style::new().fg(theme::secondary()),
-                ));
-            },
-            (false, _) => {},
-        }
-    }
-    let children_height = block.len().saturating_add(2) as u16;
-    let children_panel_index = panels.len();
-    panels.push(
-        LeftRailPanel::new(block)
-            .max_height(children_height)
-            .bg(theme::element()),
-    );
+            for (idx, child) in children.iter().take(visible_children).enumerate() {
+                let connector = match (
+                    children_expandable && !app.children_expanded,
+                    idx == last_idx,
+                ) {
+                    (false, true) => "└── ",
+                    _ => "├── ",
+                };
+                block.push(Line::from(vec![
+                    Span::styled(connector, Style::new().fg(theme::muted())),
+                    Span::styled(
+                        format!("{} ", state_icon(&child.status)),
+                        Style::new().fg(state_color(&child.status)),
+                    ),
+                    Span::styled(child.title.clone(), Style::new().fg(theme::muted())),
+                ]));
+            }
+            match (children_expandable, app.children_expanded) {
+                (true, false) => {
+                    block.push(Line::styled("…", Style::new().fg(theme::muted())));
+                    block.push(Line::styled(
+                        "Click to expand",
+                        Style::new().fg(theme::secondary()),
+                    ));
+                },
+                (true, true) => {
+                    block.push(Line::styled(
+                        "Click to collapse",
+                        Style::new().fg(theme::secondary()),
+                    ));
+                },
+                (false, _) => {},
+            }
+            let children_height = block.len().saturating_add(2) as u16;
+            let panel_index = panels.len();
+            panels.push(
+                LeftRailPanel::new(block)
+                    .max_height(children_height)
+                    .bg(theme::element()),
+            );
+            Some(panel_index)
+        },
+    };
 
     let runs = snapshot
         .runs
@@ -206,10 +205,8 @@ fn draw_main(
     }
 
     let tasks = tasks_for_item(snapshot, item);
-    let mut block = vec![Line::styled("Tasks", Style::new().fg(theme::text()).bold())];
-    if tasks.is_empty() {
-        block.push(Line::styled("No tasks.", Style::new().fg(theme::muted())));
-    } else {
+    if !tasks.is_empty() {
+        let mut block = vec![Line::styled("Tasks", Style::new().fg(theme::text()).bold())];
         for task in tasks {
             let icon = match task.status.to_string().as_str() {
                 "completed" => "✓",
@@ -230,8 +227,8 @@ fn draw_main(
                 Style::new().fg(theme::muted()),
             ));
         }
+        panels.push(LeftRailPanel::new(block));
     }
-    panels.push(LeftRailPanel::new(block));
 
     let panel_width = area.width.saturating_sub(1);
     let rendered_height = panels
@@ -247,13 +244,10 @@ fn draw_main(
         area,
         &panels,
         app.detail_scroll,
-        match children_expandable {
-            true => Some(children_panel_index),
-            false => None,
-        },
+        children_panel_index.filter(|_| children_expandable),
         app.mouse_pos,
     );
-    if children_expandable {
+    if let Some(children_panel_index) = children_panel_index.filter(|_| children_expandable) {
         app.children_expand_rect = rendered_areas
             .get(children_panel_index)
             .copied()

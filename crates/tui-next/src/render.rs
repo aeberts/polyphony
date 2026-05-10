@@ -87,11 +87,16 @@ fn draw_inbox(
     let rows = display_rows_matching(snapshot, &app.search_query);
     clamp_selection(app, rows.len());
     let max_scroll = rows.len().saturating_sub(visible_rows);
-    let scroll = app
-        .selected
-        .saturating_sub(visible_rows.saturating_sub(1))
-        .min(max_scroll);
-    app.scroll = scroll;
+    app.scroll = app.scroll.min(max_scroll);
+    if app.selected < app.scroll {
+        app.scroll = app.selected;
+    } else if app.selected >= app.scroll.saturating_add(visible_rows) {
+        app.scroll = app
+            .selected
+            .saturating_sub(visible_rows.saturating_sub(1))
+            .min(max_scroll);
+    }
+    let scroll = app.scroll;
     app.visible_rows = visible_rows;
     app.list_rect = list;
 
