@@ -1,5 +1,6 @@
 mod app;
 mod command_palette;
+mod detail;
 mod event_loop;
 mod format;
 mod render;

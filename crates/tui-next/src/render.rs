@@ -9,8 +9,9 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, clamp_selection},
+    app::{AppState, Route, clamp_selection},
     command_palette,
+    detail::draw_detail,
     format::{item_time_label, truncate},
     rows::{display_rows, hierarchy_prefix},
     status::{state_color, state_icon},
@@ -21,19 +22,27 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &RuntimeSnapshot, a
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::new().bg(theme::bg())), area);
 
-    let panel_width = 112u16.min(area.width.saturating_sub(4)).max(60);
-    let list_height = 14u16.min(area.height.saturating_sub(12)).max(5);
-    let panel_height = list_height + 11;
-    let panel = Rect::new(
-        area.x + area.width.saturating_sub(panel_width) / 2,
-        area.y + area.height.saturating_sub(panel_height) / 2,
-        panel_width,
-        panel_height.min(area.height),
-    );
+    let route = app.route;
+    match route {
+        Route::Inbox => {
+            let panel_width = 112u16.min(area.width.saturating_sub(4)).max(60);
+            let list_height = 14u16.min(area.height.saturating_sub(12)).max(5);
+            let panel_height = list_height + 11;
+            let panel = Rect::new(
+                area.x + area.width.saturating_sub(panel_width) / 2,
+                area.y + area.height.saturating_sub(panel_height) / 2,
+                panel_width,
+                panel_height.min(area.height),
+            );
 
-    draw_logo(frame, panel);
-    draw_inbox(frame, panel, list_height, snapshot, app);
-    draw_footer(frame, area, snapshot);
+            draw_logo(frame, panel);
+            draw_inbox(frame, panel, list_height, snapshot, app);
+        },
+        Route::Detail => draw_detail(frame, area, snapshot, app),
+    }
+    if route == Route::Inbox {
+        draw_footer(frame, area, snapshot);
+    }
 
     if app.command_palette_open {
         command_palette::render(frame, area, app);
@@ -238,12 +247,14 @@ fn draw_table_footer(
     let hint = Line::from(vec![
         Span::styled("j/k", Style::new().fg(theme::text())),
         Span::styled(":navigate  ", Style::new().fg(theme::muted())),
+        Span::styled("Enter", Style::new().fg(theme::text())),
+        Span::styled(":open  ", Style::new().fg(theme::muted())),
         Span::styled("q", Style::new().fg(theme::text())),
         Span::styled(":quit  ", Style::new().fg(theme::muted())),
         Span::styled("Ctrl+P", Style::new().fg(theme::text())),
         Span::styled(":commands", Style::new().fg(theme::muted())),
     ]);
-    let hint_width = 38u16;
+    let hint_width = 51u16;
     let hint_x = panel.x + panel.width.saturating_sub(hint_width);
     hint.render(
         Rect::new(hint_x, list.y + list.height + 2, hint_width, 1),

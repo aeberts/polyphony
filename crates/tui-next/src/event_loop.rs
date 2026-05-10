@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     Error,
-    app::{AppState, clamp_selection},
+    app::{AppState, Route, clamp_selection},
     command_palette,
     render::draw,
     rows::display_rows,
@@ -99,11 +99,31 @@ fn handle_key(
 
     let rows = display_rows(snapshot);
     match code {
+        KeyCode::Esc if app.route == Route::Detail => {
+            app.route = Route::Inbox;
+            app.detail_scroll = 0;
+        },
         KeyCode::Esc | KeyCode::Char('q') => return true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.command_palette_open = true;
             command_palette::reset(app);
+        },
+        KeyCode::Enter if app.route == Route::Inbox && !rows.is_empty() => {
+            app.route = Route::Detail;
+            app.detail_scroll = 0;
+        },
+        KeyCode::Up | KeyCode::Char('k') if app.route == Route::Detail => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(1);
+        },
+        KeyCode::Down | KeyCode::Char('j') if app.route == Route::Detail => {
+            app.detail_scroll = app.detail_scroll.saturating_add(1);
+        },
+        KeyCode::PageUp if app.route == Route::Detail => {
+            app.detail_scroll = app.detail_scroll.saturating_sub(8);
+        },
+        KeyCode::PageDown if app.route == Route::Detail => {
+            app.detail_scroll = app.detail_scroll.saturating_add(8);
         },
         KeyCode::Up | KeyCode::Char('k') => app.selected = app.selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
@@ -149,12 +169,26 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
     let rows = display_rows(snapshot);
     match mouse.kind {
         MouseEventKind::ScrollDown => {
-            app.selected = (app.selected + 1).min(rows.len().saturating_sub(1));
+            if app.route == Route::Detail {
+                app.detail_scroll = app.detail_scroll.saturating_add(1);
+            } else {
+                app.selected = (app.selected + 1).min(rows.len().saturating_sub(1));
+            }
         },
-        MouseEventKind::ScrollUp => app.selected = app.selected.saturating_sub(1),
+        MouseEventKind::ScrollUp => {
+            if app.route == Route::Detail {
+                app.detail_scroll = app.detail_scroll.saturating_sub(1);
+            } else {
+                app.selected = app.selected.saturating_sub(1);
+            }
+        },
         MouseEventKind::Up(event::MouseButton::Left) => {
-            if let Some(row) = list_row_at_mouse(app, mouse.column, mouse.row) {
+            if app.route == Route::Inbox
+                && let Some(row) = list_row_at_mouse(app, mouse.column, mouse.row)
+            {
                 app.selected = row.min(rows.len().saturating_sub(1));
+                app.route = Route::Detail;
+                app.detail_scroll = 0;
             }
         },
         _ => {},

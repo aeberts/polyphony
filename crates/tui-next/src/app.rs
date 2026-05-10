@@ -1,9 +1,18 @@
 use ratatui::layout::Rect;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Route {
+    #[default]
+    Inbox,
+    Detail,
+}
+
 #[derive(Default)]
 pub(crate) struct AppState {
+    pub route: Route,
     pub selected: usize,
     pub scroll: usize,
+    pub detail_scroll: u16,
     pub visible_rows: usize,
     pub list_rect: Rect,
     pub tick: u32,
