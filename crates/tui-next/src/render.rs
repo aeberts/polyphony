@@ -162,6 +162,14 @@ fn draw_inbox(
             state_icon(&item.status),
             item.title
         );
+        let row_text_color = match display_row.context_only {
+            true => theme::secondary(),
+            false => theme::text(),
+        };
+        let row_source_color = match display_row.context_only {
+            true => theme::secondary(),
+            false => theme::primary(),
+        };
 
         Line::from(vec![
             Span::styled(
@@ -178,11 +186,11 @@ fn draw_inbox(
             ),
             Span::styled(
                 format!("{:<source_width$}", item.source),
-                Style::new().fg(theme::primary()).bg(bg),
+                Style::new().fg(row_source_color).bg(bg),
             ),
             Span::styled(
                 format!("{:<title_width$}", truncate(&title, title_width)),
-                Style::new().fg(theme::text()).bg(bg),
+                Style::new().fg(row_text_color).bg(bg),
             ),
             Span::styled(
                 format!(" {:>state_width$}", state_icon(&item.status)),

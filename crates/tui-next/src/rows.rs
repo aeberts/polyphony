@@ -8,6 +8,7 @@ pub(crate) struct DisplayRow {
     pub item_idx: usize,
     pub depth: u8,
     pub last_child: bool,
+    pub context_only: bool,
 }
 
 pub(crate) fn display_rows(snapshot: &RuntimeSnapshot) -> Vec<DisplayRow> {
@@ -42,6 +43,7 @@ pub(crate) fn display_rows(snapshot: &RuntimeSnapshot) -> Vec<DisplayRow> {
                 item_idx,
                 depth: 0,
                 last_child: false,
+                context_only: false,
             })
             .collect();
     }
@@ -67,6 +69,7 @@ pub(crate) fn display_rows(snapshot: &RuntimeSnapshot) -> Vec<DisplayRow> {
             item_idx: idx,
             depth: 0,
             last_child: false,
+            context_only: false,
         });
         if let Some(children) = children_by_parent.get(issues[idx].item_id.as_str()) {
             for (child_idx, &idx) in children.iter().enumerate() {
@@ -74,6 +77,7 @@ pub(crate) fn display_rows(snapshot: &RuntimeSnapshot) -> Vec<DisplayRow> {
                     item_idx: idx,
                     depth: 1,
                     last_child: child_idx == children.len() - 1,
+                    context_only: false,
                 });
             }
         }
@@ -104,24 +108,26 @@ pub(crate) fn display_rows_matching(snapshot: &RuntimeSnapshot, query: &str) -> 
             .cmp(a_score)
             .then_with(|| a_row.item_idx.cmp(&b_row.item_idx))
     });
-    let mut seen = HashSet::new();
     let mut with_parents = Vec::new();
     for (_, row) in matches {
         if row.depth > 0
             && let Some(parent_idx) = parent_index(snapshot, row.item_idx)
-            && seen.insert(parent_idx)
+            && !matches_previous_parent(&with_parents, parent_idx)
         {
             with_parents.push(DisplayRow {
                 item_idx: parent_idx,
                 depth: 0,
                 last_child: false,
+                context_only: true,
             });
         }
-        if seen.insert(row.item_idx) {
-            with_parents.push(row);
-        }
+        with_parents.push(row);
     }
     with_parents
+}
+
+fn matches_previous_parent(rows: &[DisplayRow], parent_idx: usize) -> bool {
+    rows.last().is_some_and(|row| row.item_idx == parent_idx)
 }
 
 fn parent_index(snapshot: &RuntimeSnapshot, child_idx: usize) -> Option<usize> {
