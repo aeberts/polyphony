@@ -111,8 +111,11 @@ fn draw_main(
             _ => children.len(),
         };
         for (idx, child) in children.iter().take(visible_children).enumerate() {
-            let connector = match (app.children_expanded, idx == last_idx) {
-                (true, true) => "└── ",
+            let connector = match (
+                children_expandable && !app.children_expanded,
+                idx == last_idx,
+            ) {
+                (false, true) => "└── ",
                 _ => "├── ",
             };
             block.push(Line::from(vec![
@@ -126,16 +129,16 @@ fn draw_main(
         }
         match (children_expandable, app.children_expanded) {
             (true, false) => {
-                block.push(Line::styled("...", Style::new().fg(theme::muted())));
+                block.push(Line::styled("…", Style::new().fg(theme::muted())));
                 block.push(Line::styled(
                     "Click to expand",
-                    Style::new().fg(theme::muted()),
+                    Style::new().fg(theme::secondary()),
                 ));
             },
             (true, true) => {
                 block.push(Line::styled(
                     "Click to collapse",
-                    Style::new().fg(theme::muted()),
+                    Style::new().fg(theme::secondary()),
                 ));
             },
             (false, _) => {},

@@ -35,6 +35,10 @@ pub(crate) const fn primary() -> Color {
     Color::Rgb(250, 178, 131)
 }
 
+pub(crate) const fn secondary() -> Color {
+    Color::Rgb(112, 112, 112)
+}
+
 pub(crate) const fn error() -> Color {
     Color::Rgb(224, 108, 117)
 }
