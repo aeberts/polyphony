@@ -7,6 +7,26 @@ pub(crate) enum Route {
     Detail,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DetailInputMode {
+    #[default]
+    None,
+    Hijack,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IssueIntervention {
+    pub issue_id: String,
+    pub run_id: Option<String>,
+    pub prompt: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct IssueNotice {
+    pub issue_id: String,
+    pub message: String,
+}
+
 #[derive(Default)]
 pub(crate) struct AppState {
     pub route: Route,
@@ -21,6 +41,10 @@ pub(crate) struct AppState {
     pub list_rect: Rect,
     pub search_query: String,
     pub input: String,
+    pub detail_input_mode: DetailInputMode,
+    pub status_message: Option<String>,
+    pub interventions: Vec<IssueIntervention>,
+    pub notices: Vec<IssueNotice>,
     pub tick: u32,
     pub command_palette_open: bool,
     pub command_selected: usize,

@@ -74,6 +74,7 @@ pub(crate) struct LeftRailPanel {
 pub(crate) struct InputBottomPanel<'a> {
     input: &'a str,
     focused: bool,
+    cursor_visible: bool,
     blink_on: bool,
     border_color: Color,
     content_bg: Color,
@@ -92,6 +93,7 @@ impl<'a> InputBottomPanel<'a> {
         Self {
             input,
             focused: false,
+            cursor_visible: true,
             blink_on: false,
             border_color: Color::Reset,
             content_bg: Color::Reset,
@@ -109,6 +111,12 @@ impl<'a> InputBottomPanel<'a> {
     #[must_use]
     pub(crate) const fn focused(mut self, focused: bool) -> Self {
         self.focused = focused;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn cursor_visible(mut self, cursor_visible: bool) -> Self {
+        self.cursor_visible = cursor_visible;
         self
     }
 
@@ -207,6 +215,9 @@ impl<'a> InputBottomPanel<'a> {
             .split('\n')
             .map(|line| Line::styled(line, Style::new().fg(self.text_color)))
             .collect::<Vec<_>>();
+        if !self.cursor_visible {
+            return lines;
+        }
         let cursor = match (self.focused, self.blink_on) {
             (true, true) => "█",
             (true, false) => " ",

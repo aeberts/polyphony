@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
-use polyphony_core::RuntimeSnapshot;
+use polyphony_core::{DispatchMode, InboxItemKind, RunStatus, RuntimeSnapshot, TaskStatus};
 use polyphony_orchestrator::RuntimeCommand;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::{mpsc, watch};
@@ -53,7 +53,7 @@ pub async fn run(
             event = event_stream.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                        if handle_key(&mut app, key.code, key.modifiers, &snapshot) {
+                        if handle_key(&mut app, key.code, key.modifiers, &snapshot, &command_tx) {
                             break;
                         }
                         needs_draw = true;
@@ -95,13 +95,21 @@ fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
     snapshot: &RuntimeSnapshot,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
 ) -> bool {
     if app.command_palette_open {
-        return handle_command_palette_key(app, code, modifiers);
+        return handle_command_palette_key(app, code, modifiers, command_tx);
     }
 
     let rows = display_rows_matching(snapshot, &app.search_query);
     match code {
+        KeyCode::Esc
+            if app.route == Route::Detail
+                && app.detail_input_mode != crate::app::DetailInputMode::None =>
+        {
+            app.detail_input_mode = crate::app::DetailInputMode::None;
+            app.input.clear();
+        },
         KeyCode::Esc if app.route == Route::Inbox && !app.search_query.is_empty() => {
             app.search_query.clear();
             app.selected = 0;
@@ -112,6 +120,8 @@ fn handle_key(
             app.detail_scroll = 0;
             app.detail_follow_bottom = false;
             app.children_expanded = false;
+            app.detail_input_mode = crate::app::DetailInputMode::None;
+            app.input.clear();
         },
         KeyCode::Esc => return true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
@@ -123,6 +133,43 @@ fn handle_key(
             app.route = Route::Detail;
             app.detail_follow_bottom = true;
             app.children_expanded = false;
+        },
+        KeyCode::Enter
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::Hijack =>
+        {
+            submit_hijack(app, snapshot, command_tx);
+        },
+        KeyCode::Enter | KeyCode::Char('d')
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::None =>
+        {
+            dispatch_selected(app, snapshot, command_tx);
+        },
+        KeyCode::Char('s')
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::None =>
+        {
+            stop_selected(app, snapshot, command_tx);
+        },
+        KeyCode::Char('p')
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::None =>
+        {
+            pause_or_resume_selected(app, snapshot, command_tx);
+        },
+        KeyCode::Char('r')
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::None =>
+        {
+            retry_selected(app, snapshot, command_tx);
+        },
+        KeyCode::Char('h')
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::None =>
+        {
+            app.detail_input_mode = crate::app::DetailInputMode::Hijack;
+            app.input.clear();
         },
         KeyCode::Up if app.route == Route::Detail => {
             app.detail_scroll = app.detail_scroll.saturating_sub(1);
@@ -140,10 +187,17 @@ fn handle_key(
             app.detail_scroll = app.detail_scroll.saturating_add(8);
             app.detail_follow_bottom = false;
         },
-        KeyCode::Backspace if app.route == Route::Detail => {
+        KeyCode::Backspace
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::Hijack =>
+        {
             app.input.pop();
         },
-        KeyCode::Char(c) if app.route == Route::Detail && is_search_char(c, modifiers) => {
+        KeyCode::Char(c)
+            if app.route == Route::Detail
+                && app.detail_input_mode == crate::app::DetailInputMode::Hijack
+                && is_search_char(c, modifiers) =>
+        {
             app.input.push(c);
         },
         KeyCode::Backspace if app.route == Route::Inbox => {
@@ -182,11 +236,272 @@ fn is_search_char(c: char, modifiers: KeyModifiers) -> bool {
     c.is_ascii() && !c.is_ascii_control()
 }
 
-fn handle_command_palette_key(app: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> bool {
+fn selected_item(
+    snapshot: &RuntimeSnapshot,
+    app: &AppState,
+) -> Option<polyphony_core::InboxItemRow> {
+    display_rows_matching(snapshot, &app.search_query)
+        .get(app.selected)
+        .and_then(|row| snapshot.inbox_items.get(row.item_idx))
+        .cloned()
+}
+
+fn dispatch_selected(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    let Some(item) = selected_item(snapshot, app) else {
+        app.status_message = Some("no inbox item selected".to_string());
+        return;
+    };
+    dispatch_item(&item, None, command_tx);
+    app.detail_follow_bottom = true;
+    record_notice(
+        app,
+        &item,
+        format!("dispatch queued for {}", item.identifier),
+    );
+}
+
+fn dispatch_item(
+    item: &polyphony_core::InboxItemRow,
+    directives: Option<String>,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    match item.kind {
+        InboxItemKind::Issue => {
+            let _ = command_tx.send(RuntimeCommand::DispatchIssue {
+                issue_id: item.item_id.clone(),
+                agent_name: None,
+                directives,
+            });
+        },
+        InboxItemKind::PullRequestReview
+        | InboxItemKind::PullRequestComment
+        | InboxItemKind::PullRequestConflict => {
+            let _ = command_tx.send(RuntimeCommand::DispatchPullRequestInboxItem {
+                item_id: item.item_id.clone(),
+                directives,
+            });
+        },
+    }
+}
+
+fn stop_selected(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    let Some(item) = selected_item(snapshot, app) else {
+        app.status_message = Some("no inbox item selected".to_string());
+        return;
+    };
+    let _ = command_tx.send(RuntimeCommand::StopAgent {
+        issue_id: item.item_id.clone(),
+    });
+    app.detail_follow_bottom = true;
+    record_notice(
+        app,
+        &item,
+        format!("stop requested for {}", item.identifier),
+    );
+}
+
+fn pause_or_resume_selected(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    let Some(item) = selected_item(snapshot, app) else {
+        app.status_message = Some("no inbox item selected".to_string());
+        return;
+    };
+    if issue_has_running_agent(snapshot, &item) {
+        let _ = command_tx.send(RuntimeCommand::StopAgent {
+            issue_id: item.item_id.clone(),
+        });
+        record_notice(
+            app,
+            &item,
+            format!("pause requested for {}", item.identifier),
+        );
+        app.detail_follow_bottom = true;
+        return;
+    }
+    if retry_latest_stopped(snapshot, &item, command_tx) {
+        record_notice(app, &item, format!("resume queued for {}", item.identifier));
+        app.detail_follow_bottom = true;
+        return;
+    }
+    dispatch_item(&item, None, command_tx);
+    record_notice(
+        app,
+        &item,
+        format!("dispatch queued for {}", item.identifier),
+    );
+    app.detail_follow_bottom = true;
+}
+
+fn retry_selected(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    let Some(item) = selected_item(snapshot, app) else {
+        app.status_message = Some("no inbox item selected".to_string());
+        return;
+    };
+    if retry_latest_stopped(snapshot, &item, command_tx) {
+        record_notice(app, &item, format!("retry queued for {}", item.identifier));
+        app.detail_follow_bottom = true;
+    } else {
+        record_notice(
+            app,
+            &item,
+            "nothing failed or cancelled to retry".to_string(),
+        );
+    }
+}
+
+fn submit_hijack(
+    app: &mut AppState,
+    snapshot: &RuntimeSnapshot,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    let prompt = app.input.trim().to_string();
+    if prompt.is_empty() {
+        app.detail_input_mode = crate::app::DetailInputMode::None;
+        app.input.clear();
+        if let Some(item) = selected_item(snapshot, app) {
+            record_notice(
+                app,
+                &item,
+                "hijack cancelled: empty intervention".to_string(),
+            );
+        }
+        return;
+    }
+    let Some(item) = selected_item(snapshot, app) else {
+        app.status_message = Some("no inbox item selected".to_string());
+        return;
+    };
+
+    if issue_has_running_agent(snapshot, &item) {
+        let _ = command_tx.send(RuntimeCommand::StopAgent {
+            issue_id: item.item_id.clone(),
+        });
+    }
+    let run_id = latest_run(snapshot, &item).map(|run| run.id.clone());
+    if let Some(run_id) = run_id.clone() {
+        let _ = command_tx.send(RuntimeCommand::InjectRunFeedback {
+            run_id,
+            prompt: prompt.clone(),
+            agent_name: None,
+        });
+    } else {
+        dispatch_item(&item, Some(prompt.clone()), command_tx);
+    }
+    app.interventions.push(crate::app::IssueIntervention {
+        issue_id: item.item_id.clone(),
+        run_id,
+        prompt,
+    });
+    app.detail_input_mode = crate::app::DetailInputMode::None;
+    app.input.clear();
+    app.detail_follow_bottom = true;
+    record_notice(
+        app,
+        &item,
+        format!("intervention queued for {}", item.identifier),
+    );
+}
+
+fn record_notice(app: &mut AppState, item: &polyphony_core::InboxItemRow, message: String) {
+    app.status_message = None;
+    app.notices.push(crate::app::IssueNotice {
+        issue_id: item.item_id.clone(),
+        message,
+    });
+    if app.notices.len() > 64 {
+        app.notices.remove(0);
+    }
+}
+
+fn issue_has_running_agent(
+    snapshot: &RuntimeSnapshot,
+    item: &polyphony_core::InboxItemRow,
+) -> bool {
+    snapshot
+        .running
+        .iter()
+        .any(|agent| agent.issue_id == item.item_id || agent.issue_identifier == item.identifier)
+}
+
+fn retry_latest_stopped(
+    snapshot: &RuntimeSnapshot,
+    item: &polyphony_core::InboxItemRow,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) -> bool {
+    if let Some(task) = latest_failed_task(snapshot, item) {
+        let _ = command_tx.send(RuntimeCommand::RetryTask {
+            run_id: task.run_id.clone(),
+            task_id: task.id.clone(),
+        });
+        return true;
+    }
+    if let Some(run) = latest_run(snapshot, item)
+        .filter(|run| matches!(run.status, RunStatus::Failed | RunStatus::Cancelled))
+    {
+        let _ = command_tx.send(RuntimeCommand::RetryRun {
+            run_id: run.id.clone(),
+        });
+        return true;
+    }
+    false
+}
+
+fn latest_failed_task<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    item: &polyphony_core::InboxItemRow,
+) -> Option<&'a polyphony_core::TaskRow> {
+    let run_ids = snapshot
+        .runs
+        .iter()
+        .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
+        .map(|run| &run.id)
+        .collect::<Vec<_>>();
+    snapshot
+        .tasks
+        .iter()
+        .filter(|task| {
+            run_ids.contains(&&task.run_id)
+                && matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled)
+        })
+        .max_by_key(|task| task.updated_at)
+}
+
+fn latest_run<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    item: &polyphony_core::InboxItemRow,
+) -> Option<&'a polyphony_core::RunRow> {
+    snapshot
+        .runs
+        .iter()
+        .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
+        .max_by_key(|run| run.created_at)
+}
+
+fn handle_command_palette_key(
+    app: &mut AppState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) -> bool {
     match code {
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Esc => app.command_palette_open = false,
-        KeyCode::Enter => app.command_palette_open = false,
+        KeyCode::Enter => run_command_palette_selection(app, command_tx),
         KeyCode::Up | KeyCode::Char('k') => command_palette::selected_up(app),
         KeyCode::Down | KeyCode::Char('j') => command_palette::selected_down(app),
         KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -195,6 +510,35 @@ fn handle_command_palette_key(app: &mut AppState, code: KeyCode, modifiers: KeyM
         _ => {},
     }
     false
+}
+
+fn run_command_palette_selection(
+    app: &mut AppState,
+    command_tx: &mpsc::UnboundedSender<RuntimeCommand>,
+) {
+    match command_palette::COMMANDS
+        .get(app.command_selected)
+        .map(|command| command.name)
+    {
+        Some("Refresh trackers") => {
+            let _ = command_tx.send(RuntimeCommand::Refresh);
+            app.status_message = Some("refresh requested".to_string());
+        },
+        Some("Stop dispatching") => {
+            let _ = command_tx.send(RuntimeCommand::SetMode(DispatchMode::Stop));
+            app.status_message = Some("global dispatch stopped".to_string());
+        },
+        Some("Manual dispatch mode") => {
+            let _ = command_tx.send(RuntimeCommand::SetMode(DispatchMode::Manual));
+            app.status_message = Some("global dispatch set to manual".to_string());
+        },
+        Some("Switch to nightshift mode") => {
+            let _ = command_tx.send(RuntimeCommand::SetMode(DispatchMode::Nightshift));
+            app.status_message = Some("global dispatch set to nightshift".to_string());
+        },
+        _ => {},
+    }
+    app.command_palette_open = false;
 }
 
 fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::MouseEvent) {

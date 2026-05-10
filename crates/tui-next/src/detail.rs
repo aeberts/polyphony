@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::AppState,
+    app::{AppState, DetailInputMode},
     format::item_time_label,
     rows::display_rows_matching,
     session, theme, tracker,
@@ -45,30 +45,100 @@ pub(crate) fn draw_detail(
         (content_area, None)
     };
 
-    let [main_content, input_area] = Layout::vertical([Constraint::Min(1), Constraint::Length(5)])
+    let [main_content, bottom_area] = Layout::vertical([Constraint::Min(1), Constraint::Length(6)])
         .spacing(1)
         .areas(main_area);
+    let [input_area, footer_area] =
+        Layout::vertical([Constraint::Length(5), Constraint::Length(1)]).areas(bottom_area);
 
     draw_main(frame, main_content, snapshot, item, app);
-    draw_input(frame, input_area, app);
+    draw_action_bar(frame, input_area, app);
+    draw_detail_footer(frame, footer_area, snapshot, item, app);
     if let Some(sidebar) = sidebar_area {
         draw_sidebar(frame, sidebar, snapshot, item, app.tick);
     }
 }
 
-fn draw_input(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
-    InputBottomPanel::new(&app.input)
-        .focused(true)
+fn draw_action_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &AppState) {
+    let hijacking = app.detail_input_mode == DetailInputMode::Hijack;
+    let input = if hijacking {
+        app.input.as_str()
+    } else {
+        ""
+    };
+    let (mode, submit, escape) = if hijacking {
+        ("hijack", "Enter submit", "Esc cancel")
+    } else {
+        (
+            "Enter dispatch",
+            "p pause/resume",
+            "s stop  r retry  h hijack",
+        )
+    };
+
+    InputBottomPanel::new(input)
+        .focused(hijacking)
+        .cursor_visible(hijacking)
         .blink_on((app.tick / 6).is_multiple_of(2))
-        .border_color(theme::primary())
+        .border_color(match hijacking {
+            true => theme::secondary(),
+            false => theme::primary(),
+        })
         .content_bg(theme::element())
         .text_color(theme::text())
         .muted_color(theme::muted())
-        .label_accent(theme::primary())
+        .label_accent(match hijacking {
+            true => theme::secondary(),
+            false => theme::primary(),
+        })
         .bottom_half_bg(theme::bg())
         .padding(Padding::new(1, 1, 1, 0))
-        .labels("build", "GPT-5.5", "OpenAI")
+        .labels(mode, submit, escape)
         .render(area, frame.buffer_mut());
+}
+
+fn draw_detail_footer(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    item: &InboxItemRow,
+    app: &AppState,
+) {
+    let state = issue_control_state(snapshot, item);
+    let mut spans = vec![
+        Span::styled("Ctrl+P", Style::new().fg(theme::text()).bold()),
+        Span::styled(":commands  ", Style::new().fg(theme::muted())),
+        Span::styled("Esc", Style::new().fg(theme::text()).bold()),
+        Span::styled(":back  ", Style::new().fg(theme::muted())),
+        Span::styled("orchestrator ", Style::new().fg(theme::muted())),
+        Span::styled("•", Style::new().fg(orchestrator_status_color(snapshot))),
+        Span::styled(
+            format!("{}  ", snapshot.dispatch_mode),
+            Style::new().fg(theme::muted()),
+        ),
+        Span::styled("state ", Style::new().fg(theme::muted())),
+        Span::styled(state, Style::new().fg(theme::primary())),
+    ];
+    if let Some(message) = app.status_message.as_deref() {
+        spans.push(Span::styled("  ", Style::new().fg(theme::muted())));
+        spans.push(Span::styled(
+            message.to_string(),
+            Style::new().fg(theme::secondary()),
+        ));
+    }
+    Line::from(spans).render(area, frame.buffer_mut());
+}
+
+fn orchestrator_status_color(snapshot: &RuntimeSnapshot) -> ratatui::style::Color {
+    match snapshot.dispatch_mode {
+        polyphony_core::DispatchMode::Stop => theme::error(),
+        polyphony_core::DispatchMode::Idle | polyphony_core::DispatchMode::Manual => {
+            theme::secondary()
+        },
+        polyphony_core::DispatchMode::Automatic | polyphony_core::DispatchMode::Nightshift => {
+            theme::done()
+        },
+    }
 }
 
 fn draw_main(
@@ -80,7 +150,13 @@ fn draw_main(
 ) {
     app.children_expand_rect = Rect::default();
 
-    let session = session::build_issue_session(snapshot, item, app.children_expanded);
+    let session = session::build_issue_session(
+        snapshot,
+        item,
+        app.children_expanded,
+        &app.interventions,
+        &app.notices,
+    );
     let panel_styles = session
         .blocks
         .iter()
@@ -130,15 +206,10 @@ fn draw_main(
         &panel_heights,
         &panel_offsets,
         app.detail_scroll,
-        session
-            .children_block_index
-            .filter(|_| session.children_expandable),
+        session.expand_block_index.filter(|_| session.expandable),
         app.mouse_pos,
     );
-    if let Some(children_panel_index) = session
-        .children_block_index
-        .filter(|_| session.children_expandable)
-    {
+    if let Some(children_panel_index) = session.expand_block_index.filter(|_| session.expandable) {
         app.children_expand_rect = rendered_areas
             .get(children_panel_index)
             .copied()
@@ -501,6 +572,35 @@ fn workspace_label(snapshot: &RuntimeSnapshot, item: &InboxItemRow, tick: u32) -
     } else {
         "no".to_string()
     }
+}
+
+fn issue_control_state(snapshot: &RuntimeSnapshot, item: &InboxItemRow) -> &'static str {
+    if snapshot
+        .running
+        .iter()
+        .any(|agent| agent.issue_id == item.item_id || agent.issue_identifier == item.identifier)
+    {
+        return "agent running";
+    }
+    match latest_run(snapshot, item).map(|run| run.status) {
+        Some(
+            RunStatus::Pending | RunStatus::Planning | RunStatus::InProgress | RunStatus::Review,
+        ) => "orchestrating",
+        Some(RunStatus::Failed | RunStatus::Cancelled) => "paused/stopped",
+        Some(RunStatus::Delivered) => "delivered",
+        None => "ready",
+    }
+}
+
+fn latest_run<'a>(
+    snapshot: &'a RuntimeSnapshot,
+    item: &InboxItemRow,
+) -> Option<&'a polyphony_core::RunRow> {
+    snapshot
+        .runs
+        .iter()
+        .filter(|run| run.issue_identifier.as_deref() == Some(item.identifier.as_str()))
+        .max_by_key(|run| run.created_at)
 }
 
 fn sidebar_kv(label: &str, value: &str, label_width: usize, value_width: usize) -> Line<'static> {

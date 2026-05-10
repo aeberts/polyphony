@@ -46,6 +46,11 @@ pub(crate) const COMMANDS: &[Command] = &[
     },
     Command {
         section: "Runtime",
+        name: "Manual dispatch mode",
+        description: "Resume issue-scoped manual dispatch",
+    },
+    Command {
+        section: "Runtime",
         name: "Switch to nightshift mode",
         description: "Let Polyphony work unattended",
     },
@@ -110,11 +115,11 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppSt
     sync_scroll_for_height(app, content.height as usize);
     let mut lines = vec![Line::from(vec![
         Span::styled("Command Palette  ", Style::new().fg(theme::text()).bold()),
-        Span::styled("fake actions  ", Style::new().fg(theme::muted())),
+        Span::styled("global actions  ", Style::new().fg(theme::muted())),
         Span::styled("Ctrl+P", Style::new().fg(theme::text())),
         Span::styled(":commands  ", Style::new().fg(theme::muted())),
         Span::styled("Enter", Style::new().fg(theme::text())),
-        Span::styled(":run fake  ", Style::new().fg(theme::muted())),
+        Span::styled(":run  ", Style::new().fg(theme::muted())),
         Span::styled("Esc", Style::new().fg(theme::text())),
         Span::styled(":close", Style::new().fg(theme::muted())),
     ])];
