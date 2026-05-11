@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, io::Write, process::Command, time::Duration};
 
 use crossterm::{
     event::{
@@ -10,7 +10,7 @@ use crossterm::{
 use futures_util::StreamExt;
 use polyphony_core::{DispatchMode, InboxItemKind, RunStatus, RuntimeSnapshot, TaskStatus};
 use polyphony_orchestrator::RuntimeCommand;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
@@ -22,6 +22,8 @@ use crate::{
 };
 
 const DETAIL_MOUSE_SCROLL_ROWS: u16 = 5;
+const SELECTION_EDGE_SCROLL_ROWS: u16 = 2;
+const SELECTION_EDGE_SCROLL_THRESHOLD: u16 = 2;
 
 pub async fn run(
     mut snapshot_rx: watch::Receiver<RuntimeSnapshot>,
@@ -79,7 +81,8 @@ pub async fn run(
             }
             _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 app.tick = app.tick.wrapping_add(1);
-                if app.route == Route::Inbox || !snapshot.running.is_empty() || snapshot.inbox_items.iter().any(|item| item.status.eq_ignore_ascii_case("in progress")) {
+                let selection_scrolled = auto_scroll_session_selection(&mut app);
+                if selection_scrolled || app.route == Route::Inbox || app.toast_message.is_some() || !snapshot.running.is_empty() || snapshot.inbox_items.iter().any(|item| item.status.eq_ignore_ascii_case("in progress")) {
                     needs_draw = true;
                 }
             }
@@ -88,6 +91,41 @@ pub async fn run(
 
     terminal.show_cursor()?;
     Ok(())
+}
+
+fn auto_scroll_session_selection(app: &mut AppState) -> bool {
+    if app.route != Route::Detail || !app.session_selecting || app.session_text_rect.is_empty() {
+        return false;
+    }
+    let Some((column, row)) = app.mouse_pos else {
+        return false;
+    };
+    let area = app.session_text_rect;
+    if column < area.x || column >= area.x.saturating_add(area.width) {
+        return false;
+    }
+
+    let top_edge = area.y.saturating_add(SELECTION_EDGE_SCROLL_THRESHOLD);
+    let bottom_edge = area
+        .y
+        .saturating_add(area.height.saturating_sub(1))
+        .saturating_sub(SELECTION_EDGE_SCROLL_THRESHOLD);
+    let previous_scroll = app.detail_scroll;
+    if row <= top_edge {
+        app.detail_scroll = app.detail_scroll.saturating_sub(SELECTION_EDGE_SCROLL_ROWS);
+    } else if row >= bottom_edge {
+        app.detail_scroll = app
+            .detail_scroll
+            .saturating_add(SELECTION_EDGE_SCROLL_ROWS)
+            .min(app.detail_scroll_max);
+    }
+    if app.detail_scroll == previous_scroll {
+        return false;
+    }
+
+    app.detail_follow_bottom = false;
+    app.session_selection_end = Some(session_position_at_mouse(app, column, row));
+    true
 }
 
 fn handle_key(
@@ -625,6 +663,8 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
         MouseEventKind::Down(event::MouseButton::Left)
         | MouseEventKind::Drag(event::MouseButton::Left)
             if app.route == Route::Detail
+                && !app.session_selecting
+                && !app.sidebar_selecting
                 && (app.detail_scrollbar_active
                     || app
                         .detail_scrollbar_rect
@@ -634,11 +674,73 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
             app.detail_scroll = scroll_from_scrollbar(app, mouse.row);
             app.detail_follow_bottom = false;
         },
+        MouseEventKind::Down(event::MouseButton::Left)
+            if app.route == Route::Detail
+                && app
+                    .session_text_rect
+                    .contains((mouse.column, mouse.row).into()) =>
+        {
+            app.session_selecting = true;
+            let position = session_position_at_mouse(app, mouse.column, mouse.row);
+            app.session_selection_start = Some(position);
+            app.session_selection_end = Some(position);
+        },
+        MouseEventKind::Down(event::MouseButton::Left)
+            if app.route == Route::Detail
+                && app
+                    .sidebar_text_rect
+                    .contains((mouse.column, mouse.row).into()) =>
+        {
+            app.sidebar_selecting = true;
+            let position = sidebar_position_at_mouse(app, mouse.column, mouse.row);
+            app.sidebar_selection_start = Some(position);
+            app.sidebar_selection_end = Some(position);
+        },
+        MouseEventKind::Drag(event::MouseButton::Left)
+            if app.route == Route::Detail && app.session_selecting =>
+        {
+            app.session_selection_end =
+                Some(session_position_at_mouse(app, mouse.column, mouse.row));
+        },
+        MouseEventKind::Drag(event::MouseButton::Left)
+            if app.route == Route::Detail && app.sidebar_selecting =>
+        {
+            app.sidebar_selection_end =
+                Some(sidebar_position_at_mouse(app, mouse.column, mouse.row));
+        },
         MouseEventKind::Up(event::MouseButton::Left) => {
             if app.route == Route::Detail && app.detail_scrollbar_active {
                 app.detail_scroll = scroll_from_scrollbar(app, mouse.row);
                 app.detail_scrollbar_active = false;
                 app.detail_follow_bottom = false;
+                return;
+            }
+            if app.route == Route::Detail && app.session_selecting {
+                app.session_selection_end =
+                    Some(session_position_at_mouse(app, mouse.column, mouse.row));
+                copy_session_selection(app);
+                app.session_selecting = false;
+                app.session_selection_start = None;
+                app.session_selection_end = None;
+                return;
+            }
+            if app.route == Route::Detail && app.sidebar_selecting {
+                app.sidebar_selection_end =
+                    Some(sidebar_position_at_mouse(app, mouse.column, mouse.row));
+                let copied = copy_sidebar_selection(app);
+                app.sidebar_selecting = false;
+                app.sidebar_selection_start = None;
+                app.sidebar_selection_end = None;
+                if copied {
+                    return;
+                }
+            }
+            if app.route == Route::Detail
+                && app
+                    .workspace_path_rect
+                    .contains((mouse.column, mouse.row).into())
+            {
+                copy_workspace_path(app);
                 return;
             }
             if app.route == Route::Detail
@@ -659,6 +761,234 @@ fn handle_mouse(app: &mut AppState, snapshot: &RuntimeSnapshot, mouse: event::Mo
             }
         },
         _ => {},
+    }
+}
+
+fn sidebar_position_at_mouse(app: &AppState, column: u16, row: u16) -> (u16, u16) {
+    let area = app.sidebar_text_rect;
+    clamp_to_rect((column, row), area)
+}
+
+fn session_position_at_mouse(app: &AppState, column: u16, row: u16) -> (u16, u16) {
+    let area = app.session_text_rect;
+    let (column, row) = clamp_to_rect((column, row), area);
+    (
+        column.saturating_sub(area.x),
+        app.detail_scroll.saturating_add(row.saturating_sub(area.y)),
+    )
+}
+
+fn copy_session_selection(app: &mut AppState) {
+    let Some(text) = selected_session_text(app) else {
+        app.session_selection_start = None;
+        app.session_selection_end = None;
+        return;
+    };
+    if text.trim().is_empty() {
+        app.session_selection_start = None;
+        app.session_selection_end = None;
+        return;
+    }
+    match copy_to_clipboard(&text) {
+        Ok(()) => {
+            app.toast_message = Some("selection copied".to_string());
+            app.toast_until_tick = app.tick.saturating_add(24);
+        },
+        Err(_) => {
+            app.toast_message = Some("copy failed".to_string());
+            app.toast_until_tick = app.tick.saturating_add(24);
+        },
+    }
+}
+
+fn copy_sidebar_selection(app: &mut AppState) -> bool {
+    let Some(text) = selected_sidebar_text(app) else {
+        return false;
+    };
+    if text.trim().is_empty() {
+        return false;
+    }
+    match copy_to_clipboard(&text) {
+        Ok(()) => {
+            app.toast_message = Some("selection copied".to_string());
+            app.toast_until_tick = app.tick.saturating_add(24);
+        },
+        Err(_) => {
+            app.toast_message = Some("copy failed".to_string());
+            app.toast_until_tick = app.tick.saturating_add(24);
+        },
+    }
+    true
+}
+
+fn selected_sidebar_text(app: &AppState) -> Option<String> {
+    let mut start = app.sidebar_selection_start?;
+    let mut end = app.sidebar_selection_end?;
+    let area = app.sidebar_text_rect;
+    if area.is_empty() || start == end {
+        return None;
+    }
+    if position_after(start, end) {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let viewport_bottom = area.y.saturating_add(area.height.saturating_sub(1));
+    if end.1 < area.y || start.1 > viewport_bottom {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    let start_row = start.1.max(area.y);
+    let end_row = end.1.min(viewport_bottom);
+    for screen_row in start_row..=end_row {
+        let visible_row = screen_row.saturating_sub(area.y);
+        let Some(line) = app.sidebar_visible_lines.get(visible_row as usize) else {
+            continue;
+        };
+        let start_col = if screen_row == start.1 {
+            start.0.saturating_sub(area.x)
+        } else {
+            0
+        } as usize;
+        let end_col = if screen_row == end.1 {
+            end.0.saturating_sub(area.x) as usize
+        } else {
+            line.chars().count().saturating_sub(1)
+        };
+        let width = end_col.saturating_sub(start_col).saturating_add(1);
+        lines.push(
+            line.chars()
+                .skip(start_col)
+                .take(width)
+                .collect::<String>()
+                .trim_end()
+                .to_string(),
+        );
+    }
+    Some(lines.join("\n"))
+}
+
+fn selected_session_text(app: &AppState) -> Option<String> {
+    let mut start = app.session_selection_start?;
+    let mut end = app.session_selection_end?;
+    if app.session_text_rect.is_empty() {
+        return None;
+    }
+    if position_after(start, end) {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let scroll = app.detail_scroll;
+    let viewport_bottom = scroll.saturating_add(app.session_text_rect.height.saturating_sub(1));
+    if end.1 < scroll || start.1 > viewport_bottom {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    let start_row = start.1.max(scroll);
+    let end_row = end.1.min(viewport_bottom);
+    for content_row in start_row..=end_row {
+        let visible_row = content_row.saturating_sub(scroll);
+        let Some(line) = app.session_visible_lines.get(visible_row as usize) else {
+            continue;
+        };
+        let start_col = if content_row == start.1 {
+            start.0
+        } else {
+            0
+        } as usize;
+        let end_col = if content_row == end.1 {
+            end.0 as usize
+        } else {
+            line.chars().count().saturating_sub(1)
+        };
+        let width = end_col.saturating_sub(start_col).saturating_add(1);
+        lines.push(
+            line.chars()
+                .skip(start_col)
+                .take(width)
+                .collect::<String>()
+                .trim_end()
+                .to_string(),
+        );
+    }
+    strip_decorative_left_borders(&mut lines);
+    Some(lines.join("\n"))
+}
+
+fn position_after(a: (u16, u16), b: (u16, u16)) -> bool {
+    (a.1, a.0) > (b.1, b.0)
+}
+
+fn strip_decorative_left_borders(lines: &mut [String]) {
+    if lines.len() <= 1 {
+        return;
+    }
+    for line in lines {
+        let trimmed = line.trim_start();
+        let Some(first) = trimmed.chars().next() else {
+            continue;
+        };
+        if is_left_border_glyph(first) {
+            *line = trimmed[first.len_utf8()..].trim_start().to_string();
+        }
+    }
+}
+
+fn is_left_border_glyph(c: char) -> bool {
+    matches!(c, '┃' | '│' | '║' | '▕' | '▏' | '▌' | '▐' | '█' | '|')
+}
+
+fn clamp_to_rect((x, y): (u16, u16), area: Rect) -> (u16, u16) {
+    let max_x = area.x.saturating_add(area.width.saturating_sub(1));
+    let max_y = area.y.saturating_add(area.height.saturating_sub(1));
+    (x.clamp(area.x, max_x), y.clamp(area.y, max_y))
+}
+
+fn copy_workspace_path(app: &mut AppState) {
+    let Some(path) = app.workspace_path_to_copy.as_deref() else {
+        return;
+    };
+    match copy_to_clipboard(path) {
+        Ok(()) => {
+            app.toast_message = Some("workspace copied".to_string());
+            app.toast_until_tick = app.tick.saturating_add(24);
+        },
+        Err(_) => {
+            app.toast_message = Some("copy failed".to_string());
+            app.toast_until_tick = app.tick.saturating_add(24);
+        },
+    }
+}
+
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let commands: &[(&str, &[&str])] = &[
+        ("pbcopy", &[]),
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    let mut last_error = None;
+    for (program, args) in commands {
+        match copy_to_clipboard_with(program, args, text) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("no clipboard command available")))
+}
+
+fn copy_to_clipboard_with(program: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{program} failed")))
     }
 }
 

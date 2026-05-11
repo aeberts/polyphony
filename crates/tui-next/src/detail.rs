@@ -2,7 +2,7 @@ use polyphony_core::{InboxItemRow, RunStatus, RuntimeSnapshot, TaskRow};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Margin, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget, Wrap,
@@ -55,7 +55,12 @@ pub(crate) fn draw_detail(
     draw_action_bar(frame, input_area, app);
     draw_detail_footer(frame, footer_area, snapshot, item, app);
     if let Some(sidebar) = sidebar_area {
-        draw_sidebar(frame, sidebar, snapshot, item, app.tick);
+        draw_sidebar(frame, sidebar, snapshot, item, app);
+    } else {
+        app.workspace_path_rect = Rect::default();
+        app.workspace_path_to_copy = None;
+        app.sidebar_text_rect = Rect::default();
+        app.sidebar_visible_lines.clear();
     }
 }
 
@@ -207,9 +212,8 @@ fn draw_main(
         &panel_styles,
         &panel_heights,
         &panel_offsets,
-        app.detail_scroll,
+        app,
         session.expand_block_index.filter(|_| session.expandable),
-        app.mouse_pos,
     );
     if let Some(children_panel_index) = session.expand_block_index.filter(|_| session.expandable) {
         app.children_expand_rect = rendered_areas
@@ -243,10 +247,10 @@ fn render_panels(
     panel_styles: &[session::SessionBlockStyle],
     panel_heights: &[usize],
     panel_offsets: &[usize],
-    scroll: u16,
+    app: &mut AppState,
     hover_panel: Option<usize>,
-    mouse_pos: Option<(u16, u16)>,
 ) -> Vec<Option<Rect>> {
+    let scroll = app.detail_scroll;
     let mut rendered_areas = vec![None; panels.len()];
     let panel_width = area.width.saturating_sub(2);
     let content_height = total_panel_height(panel_heights).min(u16::MAX as usize) as u16;
@@ -300,20 +304,45 @@ fn render_panels(
         }
     }
 
+    app.session_text_rect = Rect::new(area.x, area.y, panel_width, area.height);
+    app.session_visible_lines.clear();
+    let selection = selection_bounds(app, app.session_text_rect);
+    let multi_line_selection = selection
+        .map(|((start_row, _), (end_row, _))| start_row != end_row)
+        .unwrap_or(false);
+
     let scroll = usize::from(scroll);
     for y in 0..area.height {
         let source_y = scroll.saturating_add(usize::from(y));
         if source_y >= usize::from(content_height) {
             break;
         }
+        let mut visible_line = String::new();
+        for x in 0..panel_width {
+            let Some(source) = scratch.cell((x, source_y as u16)) else {
+                continue;
+            };
+            visible_line.push_str(source.symbol());
+        }
+        let highlight_left = selection_highlight_left(&visible_line, multi_line_selection);
         for x in 0..panel_width {
             let Some(source) = scratch.cell((x, source_y as u16)) else {
                 continue;
             };
             if let Some(dest) = frame.buffer_mut().cell_mut((area.x + x, area.y + y)) {
                 *dest = source.clone();
+                if position_selected(selection, y, x, highlight_left) {
+                    dest.set_style(
+                        dest.style()
+                            .fg(theme::bg())
+                            .bg(theme::primary())
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
             }
         }
+        app.session_visible_lines
+            .push(visible_line.trim_end().to_string());
     }
 
     for (idx, height) in panel_heights.iter().copied().enumerate() {
@@ -329,8 +358,89 @@ fn render_panels(
         }
     }
 
-    let _ = mouse_pos;
     rendered_areas
+}
+
+fn selection_bounds(app: &AppState, area: Rect) -> Option<((u16, u16), (u16, u16))> {
+    let mut start = app.session_selection_start?;
+    let mut end = app.session_selection_end?;
+    if area.is_empty() {
+        return None;
+    }
+    if position_after(start, end) {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let scroll = app.detail_scroll;
+    let viewport_bottom = scroll.saturating_add(area.height.saturating_sub(1));
+    if end.1 < scroll || start.1 > viewport_bottom {
+        return None;
+    }
+    let start_row = start.1.saturating_sub(scroll);
+    let end_row = end
+        .1
+        .saturating_sub(scroll)
+        .min(area.height.saturating_sub(1));
+    let start_col = if start.1 < scroll {
+        0
+    } else {
+        start.0
+    };
+    let end_col = if end.1 > viewport_bottom {
+        u16::MAX
+    } else {
+        end.0
+    };
+    Some(((start_row, start_col), (end_row, end_col)))
+}
+
+fn position_selected(
+    selection: Option<((u16, u16), (u16, u16))>,
+    row: u16,
+    col: u16,
+    highlight_left: u16,
+) -> bool {
+    let Some(((start_row, start_col), (end_row, end_col))) = selection else {
+        return false;
+    };
+    if row < start_row || row > end_row {
+        return false;
+    }
+    let left = if row == start_row {
+        start_col
+    } else {
+        0
+    }
+    .max(highlight_left);
+    let right = if row == end_row {
+        end_col
+    } else {
+        u16::MAX
+    };
+    col >= left && col <= right
+}
+
+fn selection_highlight_left(line: &str, multi_line_selection: bool) -> u16 {
+    if !multi_line_selection {
+        return 0;
+    }
+    let Some((border_col, border)) = line.chars().enumerate().find(|(_, c)| !c.is_whitespace())
+    else {
+        return 0;
+    };
+    if !is_left_border_glyph(border) {
+        return 0;
+    }
+    line.chars()
+        .enumerate()
+        .skip(border_col.saturating_add(1))
+        .find(|(_, c)| !c.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| line.chars().count())
+        .min(u16::MAX as usize) as u16
+}
+
+fn is_left_border_glyph(c: char) -> bool {
+    matches!(c, '┃' | '│' | '║' | '▕' | '▏' | '▌' | '▐' | '█' | '|')
 }
 
 fn panel_offsets(panel_heights: &[usize]) -> Vec<usize> {
@@ -401,15 +511,19 @@ fn draw_sidebar(
     area: Rect,
     snapshot: &RuntimeSnapshot,
     item: &InboxItemRow,
-    tick: u32,
+    app: &mut AppState,
 ) {
     frame.render_widget(
         Block::default().style(Style::new().bg(theme::element())),
         area,
     );
     let inner = area.inner(Margin::new(2, 1));
+    let workspace_path = workspace_path(snapshot, item);
+    let footer_height = sidebar_footer_height(inner.width, workspace_path.as_deref());
     let [content, footer] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+        Layout::vertical([Constraint::Min(0), Constraint::Length(footer_height)]).areas(inner);
+    app.workspace_path_to_copy = workspace_path.clone();
+    app.workspace_path_rect = workspace_path_rect(footer, workspace_path.as_deref());
     let label_width = 10usize;
     let value_width = content.width.saturating_sub(label_width as u16 + 1) as usize;
     let mut metadata = vec![
@@ -430,7 +544,7 @@ fn draw_sidebar(
     if let Some(author) = item.author.as_deref() {
         metadata.push(("author", author.to_string()));
     }
-    metadata.push(("workspace", workspace_label(snapshot, item, tick)));
+    metadata.push(("workspace", workspace_label(snapshot, item, app.tick)));
     metadata.sort_by_key(|(label, _)| *label);
 
     let mut lines = vec![Line::styled("Issue", Style::new().fg(theme::text()).bold())];
@@ -548,11 +662,137 @@ fn draw_sidebar(
         .style(Style::new().bg(theme::element()))
         .render(content, frame.buffer_mut());
 
-    Line::from(vec![
+    render_sidebar_footer(frame, footer, snapshot, workspace_path.as_deref());
+    capture_and_highlight_sidebar(frame, area, app);
+}
+
+fn capture_and_highlight_sidebar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppState) {
+    app.sidebar_text_rect = area;
+    app.sidebar_visible_lines.clear();
+    let selection = sidebar_selection_bounds(app);
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            let Some(cell) = frame.buffer_mut().cell_mut((area.x + x, area.y + y)) else {
+                continue;
+            };
+            line.push_str(cell.symbol());
+            if position_selected(selection, y, x, 0) {
+                cell.set_style(
+                    cell.style()
+                        .fg(theme::bg())
+                        .bg(theme::primary())
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+        app.sidebar_visible_lines.push(line.trim_end().to_string());
+    }
+}
+
+fn sidebar_selection_bounds(app: &AppState) -> Option<((u16, u16), (u16, u16))> {
+    let mut start = app.sidebar_selection_start?;
+    let mut end = app.sidebar_selection_end?;
+    let area = app.sidebar_text_rect;
+    if area.is_empty() {
+        return None;
+    }
+    if position_after(start, end) {
+        std::mem::swap(&mut start, &mut end);
+    }
+    let viewport_bottom = area.y.saturating_add(area.height.saturating_sub(1));
+    if end.1 < area.y || start.1 > viewport_bottom {
+        return None;
+    }
+    let start_row = start.1.saturating_sub(area.y);
+    let end_row = end
+        .1
+        .saturating_sub(area.y)
+        .min(area.height.saturating_sub(1));
+    let start_col = if start.1 < area.y {
+        0
+    } else {
+        start.0.saturating_sub(area.x)
+    };
+    let end_col = if end.1 > viewport_bottom {
+        u16::MAX
+    } else {
+        end.0.saturating_sub(area.x)
+    };
+    Some(((start_row, start_col), (end_row, end_col)))
+}
+
+fn position_after(a: (u16, u16), b: (u16, u16)) -> bool {
+    (a.1, a.0) > (b.1, b.0)
+}
+
+fn render_sidebar_footer(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    snapshot: &RuntimeSnapshot,
+    workspace_path: Option<&str>,
+) {
+    let mut lines = Vec::new();
+    if let Some(path) = workspace_path {
+        lines.push(Line::styled("workspace", Style::new().fg(theme::muted())));
+        lines.push(Line::styled(
+            path.to_string(),
+            Style::new().fg(theme::primary()),
+        ));
+    }
+    lines.push(Line::from(vec![
         Span::styled("tracker:", Style::new().fg(theme::muted())),
         Span::styled(tracker::label(snapshot), Style::new().fg(theme::primary())),
-    ])
-    .render(footer, frame.buffer_mut());
+    ]));
+
+    Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .style(Style::new().bg(theme::element()))
+        .render(area, frame.buffer_mut());
+}
+
+fn sidebar_footer_height(width: u16, workspace_path: Option<&str>) -> u16 {
+    let Some(path) = workspace_path else {
+        return 1;
+    };
+    let path_lines = (path.chars().count() as u16).div_ceil(width.max(1)).max(1);
+    path_lines.saturating_add(2)
+}
+
+fn workspace_path_rect(area: Rect, workspace_path: Option<&str>) -> Rect {
+    let Some(path) = workspace_path else {
+        return Rect::default();
+    };
+    let path_lines = (path.chars().count() as u16)
+        .div_ceil(area.width.max(1))
+        .max(1);
+    Rect::new(area.x, area.y.saturating_add(1), area.width, path_lines)
+}
+
+fn workspace_path(snapshot: &RuntimeSnapshot, item: &InboxItemRow) -> Option<String> {
+    latest_run(snapshot, item)
+        .and_then(|run| run.workspace_path.as_ref())
+        .map(|path| path.display().to_string())
+        .or_else(|| {
+            snapshot
+                .running
+                .iter()
+                .find(|agent| {
+                    agent.issue_id == item.item_id || agent.issue_identifier == item.identifier
+                })
+                .map(|agent| agent.workspace_path.display().to_string())
+        })
+        .or_else(|| {
+            snapshot
+                .agent_run_history
+                .iter()
+                .filter(|history| {
+                    history.issue_id == item.item_id || history.issue_identifier == item.identifier
+                })
+                .max_by_key(|history| history.started_at)
+                .and_then(|history| history.workspace_path.as_ref())
+                .map(|path| path.display().to_string())
+        })
 }
 
 fn workspace_label(snapshot: &RuntimeSnapshot, item: &InboxItemRow, tick: u32) -> String {

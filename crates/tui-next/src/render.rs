@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Margin, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget},
+    widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget},
 };
 
 use crate::{
@@ -50,6 +50,42 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, snapshot: &RuntimeSnapshot, a
     }
     if app.dispatch_mode_picker_open {
         dispatch_mode_picker::render(frame, area, snapshot, app);
+    }
+    draw_toast(frame, area, app);
+}
+
+fn draw_toast(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut AppState) {
+    if area.height < 2 {
+        return;
+    }
+    if app.toast_message.is_some() && app.tick >= app.toast_until_tick {
+        app.toast_message = None;
+    }
+    let Some(message) = app.toast_message.as_deref() else {
+        return;
+    };
+    let width = message.chars().count() as u16 + 4;
+    let toast = Rect::new(
+        area.x + area.width.saturating_sub(width.saturating_add(2)),
+        area.y + 1,
+        width.min(area.width),
+        3.min(area.height.saturating_sub(1)),
+    );
+    fill_rect(frame, toast, theme::primary());
+    Paragraph::new(Line::styled(
+        format!("  {message}  "),
+        Style::new().fg(theme::bg()).bg(theme::primary()).bold(),
+    ))
+    .render(toast.inner(Margin::new(0, 1)), frame.buffer_mut());
+}
+
+fn fill_rect(frame: &mut ratatui::Frame<'_>, area: Rect, bg: Color) {
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                cell.set_symbol(" ").set_style(Style::new().bg(bg));
+            }
+        }
     }
 }
 
