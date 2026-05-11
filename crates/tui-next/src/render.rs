@@ -371,7 +371,12 @@ fn render_scrollbar(
         .track_style(Style::new().bg(theme::element()))
         .thumb_symbol(" ")
         .thumb_style(Style::new().bg(theme::border()));
-    let scrollbar_area = Rect::new(list.x, list.y, list.width, list.height.saturating_sub(1));
+    let scrollbar_area = Rect::new(
+        list.x,
+        list.y.saturating_add(1),
+        list.width,
+        list.height.saturating_sub(2),
+    );
     let track_height = scrollbar_area.height;
     let max_scroll = total.saturating_sub(visible_rows);
     let thumb_height = ((u32::from(track_height) * visible_rows as u32) / total as u32)
