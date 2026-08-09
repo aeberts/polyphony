@@ -1063,11 +1063,14 @@ fn diff_tail(previous: &str, current: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         os::unix::{fs::PermissionsExt, process::ExitStatusExt},
         process::{ExitStatus, Output},
+        sync::mpsc as std_mpsc,
         time::Duration,
     };
 
+    use polyphony_agent_common::pty::{PtyCommand, PtySpawnConfig, default_pty_backend};
     use polyphony_core::{
         AgentDefinition, AgentInteractionMode, AgentPromptMode, AgentProviderRuntime, AgentRunSpec,
         AgentTransport, Error as CoreError, Issue,
@@ -1075,7 +1078,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
-    use super::{LocalCliRuntime, codex_command_uses_exec_mode};
+    use super::{LocalCliRuntime, PendingPtySpawn, codex_command_uses_exec_mode, join_error};
 
     fn test_issue() -> Issue {
         Issue {
@@ -1134,35 +1137,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelling_pty_run_terminates_spawned_child() {
-        let runtime = LocalCliRuntime::fallback_transport();
+    async fn cancelling_pty_startup_handoff_terminates_portable_pty_child() {
         let dir = tempdir().unwrap();
         let pid_file = dir.path().join("local-cli.pid");
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let spec = AgentRunSpec {
-            issue: test_issue(),
-            attempt: None,
-            workspace_path: dir.path().to_path_buf(),
-            prompt: "hello".into(),
-            max_turns: 1,
-            prior_context: None,
-            agent: AgentDefinition {
-                name: "local-fixture".into(),
-                kind: "local".into(),
-                transport: AgentTransport::LocalCli,
-                command: Some(format!(
-                    "printf '%s' \"$$\" > {}; while :; do sleep 1; done",
-                    pid_file.display()
-                )),
-                turn_timeout_ms: 60_000,
-                read_timeout_ms: 1_000,
-                stall_timeout_ms: 60_000,
-                idle_timeout_ms: 60_000,
-                ..AgentDefinition::default()
+        let (spawned_tx, spawned_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let config = PtySpawnConfig {
+            rows: 24,
+            cols: 80,
+            command: PtyCommand {
+                program: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("printf '%s' \"$$\" > {}; exec sleep 60", pid_file.display()),
+                ],
+                cwd: Some(dir.path().to_path_buf()),
+                env: BTreeMap::new(),
+                env_remove: Vec::new(),
             },
         };
-
-        let run = tokio::spawn(async move { runtime.run(spec, tx).await });
+        let blocking_startup = tokio::task::spawn_blocking(move || {
+            let spawned = default_pty_backend().spawn(&config)?;
+            // The child exists now, but the `PendingPtySpawn` result has not
+            // crossed the spawn_blocking handoff to its async caller yet.
+            spawned_tx.send(()).expect("test should await PTY spawn");
+            release_rx.recv().expect("test should release PTY startup");
+            Ok::<_, CoreError>(PendingPtySpawn::new(spawned))
+        });
+        let startup = tokio::spawn(async move {
+            let pending = blocking_startup.await.map_err(join_error)??;
+            pending.into_spawned()
+        });
+        spawned_rx.await.expect("portable PTY should be spawned");
         let pid = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await
@@ -1176,8 +1182,12 @@ mod tests {
         .await
         .expect("local PTY command should record its pid");
 
-        run.abort();
-        assert!(run.await.unwrap_err().is_cancelled());
+        // This is the real race: cancelling the async caller does not stop
+        // `spawn_blocking`; its eventual PendingPtySpawn drop must kill the
+        // child even though no PtySession was ever constructed.
+        startup.abort();
+        assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
+        release_tx.send(()).unwrap();
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1197,7 +1207,7 @@ mod tests {
             }
         })
         .await
-        .expect("cancelling a local PTY run must terminate its child pid");
+        .expect("cancelling a PTY startup handoff must terminate its child pid");
     }
 
     #[test]

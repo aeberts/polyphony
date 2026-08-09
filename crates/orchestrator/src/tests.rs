@@ -613,6 +613,15 @@ struct BlockingSession {
 }
 
 #[derive(Clone, Default)]
+struct FailingStopSessionAgent {
+    started: Arc<Notify>,
+}
+
+struct FailingStopSession {
+    started: Arc<Notify>,
+}
+
+#[derive(Clone, Default)]
 struct StartupBlockingProcessAgent {
     started: Arc<Notify>,
     pid: Arc<Mutex<Option<u32>>>,
@@ -691,6 +700,45 @@ impl AgentRuntime for BlockingSessionAgent {
         Err(polyphony_core::Error::Adapter(
             "run() should not be used when live sessions are available".into(),
         ))
+    }
+}
+
+#[async_trait]
+impl AgentSession for FailingStopSession {
+    async fn run_turn(&mut self, _prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn stop(&mut self) -> Result<(), polyphony_core::Error> {
+        Err(polyphony_core::Error::Adapter(
+            "simulated process termination failure".into(),
+        ))
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for FailingStopSessionAgent {
+    fn component_key(&self) -> String {
+        "provider:failing-stop-session-test".into()
+    }
+
+    async fn start_session(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<Box<dyn AgentSession>>, polyphony_core::Error> {
+        Ok(Some(Box::new(FailingStopSession {
+            started: self.started.clone(),
+        })))
+    }
+
+    async fn run(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<AgentRunResult, polyphony_core::Error> {
+        unreachable!("run_worker_attempt starts a session first")
     }
 }
 
@@ -3031,6 +3079,124 @@ async fn run_worker_attempt_stops_live_session_when_eligibility_is_revoked() {
         Some("eligibility revoked: issue state changed to Blocked")
     );
     assert_eq!(agent.stops(), 1, "live session stop must be invoked");
+}
+
+#[tokio::test]
+async fn run_worker_attempt_stops_before_provider_startup_when_already_revoked() {
+    let workspace_root = unique_workspace_root("eligibility-stop-before-startup");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue("issue-stop-before-start", "FAC-STOP-BEFORE", "Todo", "Stop");
+    let agent = Arc::new(RecordingSessionAgent::default());
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = watch::channel(Some("eligibility revoked before startup".into()));
+    drop(stop_tx);
+
+    let result = run_worker_attempt(
+        &workspace_manager,
+        &HooksConfig {
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            after_outcome: None,
+            before_remove: None,
+            timeout_ms: 1_000,
+        },
+        agent.clone(),
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        issue,
+        None,
+        workspace_root.join("FAC-STOP-BEFORE"),
+        "Initial prompt".into(),
+        vec!["Todo".into()],
+        1,
+        None,
+        polyphony_core::AgentDefinition::default(),
+        None,
+        stop_rx,
+        command_tx,
+    )
+    .await
+    .expect("an already-revoked worker should cancel cleanly");
+
+    assert_eq!(result.status, AttemptStatus::CancelledByReconciliation);
+    assert_eq!(
+        agent.session_starts(),
+        0,
+        "provider startup must not be called"
+    );
+}
+
+#[tokio::test]
+async fn run_worker_attempt_reports_live_session_termination_failure() {
+    let workspace_root = unique_workspace_root("eligibility-stop-termination-failure");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue("issue-stop-fail", "FAC-STOP-FAIL", "Todo", "Stop");
+    let agent = Arc::new(FailingStopSessionAgent::default());
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let started = agent.started.clone();
+    let worker_agent = agent.clone();
+    let worker = tokio::spawn(async move {
+        run_worker_attempt(
+            &workspace_manager,
+            &HooksConfig {
+                after_create: None,
+                before_run: None,
+                after_run: None,
+                after_outcome: None,
+                before_remove: None,
+                timeout_ms: 1_000,
+            },
+            worker_agent,
+            Arc::new(TestTracker::new(vec![issue.clone()])),
+            issue,
+            None,
+            workspace_root.join("FAC-STOP-FAIL"),
+            "Initial prompt".into(),
+            vec!["Todo".into()],
+            1,
+            None,
+            polyphony_core::AgentDefinition::default(),
+            None,
+            stop_rx,
+            command_tx,
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("worker should begin its live turn");
+    stop_tx.send(Some("eligibility revoked".into())).unwrap();
+    let error = timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("worker should report termination failure promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("simulated process termination failure"),
+        "termination failure must be surfaced instead of claiming cancellation: {error}"
+    );
 }
 
 #[tokio::test]

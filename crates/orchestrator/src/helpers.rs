@@ -94,6 +94,12 @@ pub(crate) async fn run_worker_attempt(
     workspace_manager
         .run_before_run(hooks, &workspace_path)
         .await?;
+    // A stop may have arrived before the worker reached provider startup. Do
+    // not race that already-observed revocation against `start_session`: a
+    // provider is allowed to spawn a subprocess as part of its handshake.
+    if let Some(reason) = stop_rx.borrow().clone() {
+        return Ok(AgentRunResult::cancelled(reason));
+    }
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let issue_id = issue.id.clone();
     let forward_command_tx = command_tx.clone();
@@ -116,10 +122,11 @@ pub(crate) async fn run_worker_attempt(
     // leave a process starting after the run has been marked cancelled. Provider
     // commands are configured kill-on-drop for this cancellation path.
     let session = tokio::select! {
-        result = agent.start_session(run_spec.clone(), event_tx.clone()) => result?,
+        biased;
         reason = wait_for_stop(&mut stop_rx) => {
             return Ok(AgentRunResult::cancelled(reason));
         }
+        result = agent.start_session(run_spec.clone(), event_tx.clone()) => result?,
     };
     let result = if let Some(mut session) = session {
         info!(
