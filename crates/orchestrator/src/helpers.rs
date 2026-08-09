@@ -81,6 +81,7 @@ pub(crate) async fn run_worker_attempt(
     continuation_prompt_template: Option<String>,
     selected_agent: polyphony_core::AgentDefinition,
     saved_context: Option<AgentContextSnapshot>,
+    mut stop_rx: watch::Receiver<Option<String>>,
     command_tx: mpsc::UnboundedSender<OrchestratorMessage>,
 ) -> Result<AgentRunResult, Error> {
     info!(
@@ -129,7 +130,17 @@ pub(crate) async fn run_worker_attempt(
                 turn_number,
                 "starting live agent turn"
             );
-            let turn_result = session.run_turn(current_prompt).await?;
+            let turn_result = tokio::select! {
+                result = session.run_turn(current_prompt) => result?,
+                reason = wait_for_stop(&mut stop_rx) => {
+                    info!(
+                        issue_identifier = %current_issue.identifier,
+                        %reason,
+                        "stopping live agent session after eligibility revocation"
+                    );
+                    break Ok(AgentRunResult::cancelled(reason));
+                }
+            };
             total_turns += turn_result.turns_completed;
             if !matches!(turn_result.status, AttemptStatus::Succeeded) {
                 info!(
@@ -207,7 +218,10 @@ pub(crate) async fn run_worker_attempt(
             agent = %run_spec.agent.name,
             "provider does not support live sessions, falling back to single run"
         );
-        agent.run(run_spec, event_tx).await
+        tokio::select! {
+            result = agent.run(run_spec, event_tx) => result,
+            reason = wait_for_stop(&mut stop_rx) => Ok(AgentRunResult::cancelled(reason)),
+        }
     };
     forwarder.abort();
     workspace_manager
@@ -224,6 +238,17 @@ pub(crate) async fn run_worker_attempt(
             warn!(issue_id = %issue_id, %error, "worker attempt failed");
             Err(Error::Core(error))
         },
+    }
+}
+
+async fn wait_for_stop(stop_rx: &mut watch::Receiver<Option<String>>) -> String {
+    loop {
+        if let Some(reason) = stop_rx.borrow().clone() {
+            return reason;
+        }
+        if stop_rx.changed().await.is_err() {
+            return "worker stop channel closed".into();
+        }
     }
 }
 

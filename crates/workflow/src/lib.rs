@@ -65,6 +65,8 @@ pub struct TrackerConfig {
     pub team_id: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    #[serde(default)]
+    pub stop_when_ineligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -81,6 +83,7 @@ struct TrackerProfileConfig {
     pub team_id: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    pub stop_when_ineligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

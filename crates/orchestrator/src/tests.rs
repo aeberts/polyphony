@@ -519,6 +519,64 @@ struct RecordingSession {
     stops: Arc<Mutex<u32>>,
 }
 
+#[derive(Clone, Default)]
+struct BlockingSessionAgent {
+    started: Arc<Notify>,
+    stops: Arc<Mutex<u32>>,
+}
+
+impl BlockingSessionAgent {
+    fn stops(&self) -> u32 {
+        *self.stops.lock().unwrap()
+    }
+}
+
+struct BlockingSession {
+    started: Arc<Notify>,
+    stops: Arc<Mutex<u32>>,
+}
+
+#[async_trait]
+impl AgentSession for BlockingSession {
+    async fn run_turn(&mut self, _prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn stop(&mut self) -> Result<(), polyphony_core::Error> {
+        *self.stops.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for BlockingSessionAgent {
+    fn component_key(&self) -> String {
+        "provider:blocking-session-test".into()
+    }
+
+    async fn start_session(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<Box<dyn AgentSession>>, polyphony_core::Error> {
+        Ok(Some(Box::new(BlockingSession {
+            started: self.started.clone(),
+            stops: self.stops.clone(),
+        })))
+    }
+
+    async fn run(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<AgentRunResult, polyphony_core::Error> {
+        Err(polyphony_core::Error::Adapter(
+            "run() should not be used when live sessions are available".into(),
+        ))
+    }
+}
+
 #[async_trait]
 impl AgentSession for RecordingSession {
     async fn run_turn(&mut self, prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
@@ -1043,6 +1101,7 @@ fn make_running_task(issue: Issue, workspace_path: PathBuf) -> RunningTask {
         last_reported_tokens: TokenUsage::default(),
         turn_count: 0,
         rate_limits: None,
+        stop_tx: watch::channel(None).0,
         active_task_id: None,
         run_id: None,
         review_target: None,
@@ -1622,6 +1681,7 @@ async fn completed_pull_request_reviews_are_marked_reviewed_and_not_redispatched
         last_reported_tokens: TokenUsage::default(),
         turn_count: 0,
         rate_limits: None,
+        stop_tx: watch::channel(None).0,
         active_task_id: None,
         run_id: Some("run-review".into()),
         review_target: Some(event.review_target()),
@@ -1707,6 +1767,7 @@ async fn completed_pull_request_reviews_are_marked_reviewed_and_not_redispatched
                 last_reported_tokens: TokenUsage::default(),
                 turn_count: 0,
                 rate_limits: None,
+                stop_tx: watch::channel(None).0,
                 active_task_id: None,
                 run_id: Some("run-review".into()),
                 review_target: Some(event.review_target()),
@@ -2162,6 +2223,7 @@ async fn inline_pull_request_review_comments_are_submitted_when_requested() {
                 last_reported_tokens: TokenUsage::default(),
                 turn_count: 0,
                 rate_limits: None,
+                stop_tx: watch::channel(None).0,
                 active_task_id: None,
                 run_id: Some("run-inline".into()),
                 review_target: Some(event.review_target()),
@@ -2732,6 +2794,7 @@ Turn {{ turn_number }} of {{ max_turns }}. Continuation={{ is_continuation }}."
             ..polyphony_core::AgentDefinition::default()
         },
         None,
+        watch::channel(None).1,
         command_tx,
     )
     .await
@@ -2751,6 +2814,132 @@ Turn {{ turn_number }} of {{ max_turns }}. Continuation={{ is_continuation }}."
         prompts[1],
         "Continue FAC-TURNS in state Todo.\nTurn 2 of 4. Continuation=true."
     );
+}
+
+#[tokio::test]
+async fn run_worker_attempt_stops_live_session_when_eligibility_is_revoked() {
+    let workspace_root = unique_workspace_root("eligibility-stop");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue("issue-stop", "FAC-STOP", "Todo", "Stop");
+    let agent = Arc::new(BlockingSessionAgent::default());
+    let hooks = HooksConfig {
+        after_create: None,
+        before_run: None,
+        after_run: None,
+        after_outcome: None,
+        before_remove: None,
+        timeout_ms: 1_000,
+    };
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let started = agent.started.clone();
+    let worker_agent = agent.clone();
+    let worker = tokio::spawn(async move {
+        run_worker_attempt(
+            &workspace_manager,
+            &hooks,
+            worker_agent,
+            Arc::new(TestTracker::new(vec![issue.clone()])),
+            issue,
+            None,
+            workspace_root.join("FAC-STOP"),
+            "Initial prompt".into(),
+            vec!["Todo".into()],
+            1,
+            None,
+            polyphony_core::AgentDefinition::default(),
+            None,
+            stop_rx,
+            command_tx,
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("worker should begin its live turn");
+    stop_tx
+        .send(Some(
+            "eligibility revoked: issue state changed to Blocked".into(),
+        ))
+        .unwrap();
+
+    let result = timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("worker should stop promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, AttemptStatus::CancelledByReconciliation);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("eligibility revoked: issue state changed to Blocked")
+    );
+    assert_eq!(agent.stops(), 1, "live session stop must be invoked");
+}
+
+#[tokio::test]
+async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
+    let workspace_root = unique_workspace_root("eligibility-policy");
+    let running_issue = sample_issue("issue-policy", "FAC-POLICY", "Todo", "Policy");
+    let tracker_issue = sample_issue("issue-policy", "FAC-POLICY", "Blocked", "Policy");
+    let tracker = TestTracker::new(vec![tracker_issue]);
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n  stop_when_ineligible: true\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: mock\n  profiles:\n    mock:\n      kind: mock\n      transport: mock\n      command: mock\n---\nTest prompt\n",
+    );
+    let (_tx, workflow_rx) = watch::channel(workflow);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        workflow_rx,
+    )
+    .0;
+    service.state.running.insert(
+        running_issue.id.clone(),
+        make_running_task(running_issue.clone(), workspace_root.join("FAC-POLICY")),
+    );
+    service.schedule_retry(
+        running_issue.id.clone(),
+        running_issue.identifier.clone(),
+        1,
+        Some("fixture retry".into()),
+        false,
+        1_000,
+    );
+    let mut stop_rx = service
+        .state
+        .running
+        .get(&running_issue.id)
+        .unwrap()
+        .stop_tx
+        .subscribe();
+
+    service.reconcile_running().await;
+
+    stop_rx.changed().await.unwrap();
+    assert_eq!(
+        stop_rx.borrow().as_deref(),
+        Some("eligibility revoked: issue state changed to Blocked")
+    );
+    assert!(service.state.running.contains_key(&running_issue.id));
+    assert!(!service.state.retrying.contains_key(&running_issue.id));
 }
 
 #[tokio::test]

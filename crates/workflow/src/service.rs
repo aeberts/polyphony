@@ -68,6 +68,9 @@ pub(crate) fn apply_tracker_profile(
     {
         tracker.terminal_states = profile.terminal_states.clone();
     }
+    if profile.stop_when_ineligible {
+        tracker.stop_when_ineligible = true;
+    }
     Ok(tracker)
 }
 
@@ -134,6 +137,8 @@ impl ServiceConfig {
             .set_default("tracker.active_states", default_active_states())
             .map_err(config_error)?
             .set_default("tracker.terminal_states", default_terminal_states())
+            .map_err(config_error)?
+            .set_default("tracker.stop_when_ineligible", false)
             .map_err(config_error)?
             .set_default("polling.interval_ms", 60_000)
             .map_err(config_error)?

@@ -23,6 +23,7 @@ endpoint = "https://api.linear.app/graphql"
 # team_id = "team-id"
 active_states = ["Todo", "In Progress"]
 terminal_states = ["Closed", "Cancelled", "Canceled", "Duplicate", "Done", "Human Review"]
+# stop_when_ineligible = false
 
 # Shared tracker credential profiles. Select one with `tracker.profile = "profile_name"`
 # in `polyphony.toml` or `WORKFLOW.md`.
