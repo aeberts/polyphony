@@ -622,6 +622,36 @@ struct FailingStopSession {
 }
 
 #[derive(Clone, Default)]
+struct FailingCancellationCleanupAgent {
+    started: Arc<Notify>,
+}
+
+#[async_trait]
+impl AgentRuntime for FailingCancellationCleanupAgent {
+    fn component_key(&self) -> String {
+        "provider:failing-cancellation-cleanup-test".into()
+    }
+
+    async fn run(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<AgentRunResult, polyphony_core::Error> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+
+    async fn confirm_cancellation(
+        &self,
+        _spec: &AgentRunSpec,
+    ) -> Result<(), polyphony_core::Error> {
+        Err(polyphony_core::Error::Adapter(
+            "injected owned PTY cleanup failure".into(),
+        ))
+    }
+}
+
+#[derive(Clone, Default)]
 struct StartupBlockingProcessAgent {
     started: Arc<Notify>,
     pid: Arc<Mutex<Option<u32>>>,
@@ -3196,6 +3226,75 @@ async fn run_worker_attempt_reports_live_session_termination_failure() {
             .to_string()
             .contains("simulated process termination failure"),
         "termination failure must be surfaced instead of claiming cancellation: {error}"
+    );
+}
+
+#[tokio::test]
+async fn run_worker_attempt_does_not_report_clean_cancellation_when_owned_cleanup_fails() {
+    let workspace_root = unique_workspace_root("eligibility-stop-owned-cleanup-failure");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue(
+        "issue-stop-owned-cleanup-fail",
+        "FAC-STOP-OWNED-FAIL",
+        "Todo",
+        "Stop",
+    );
+    let agent = Arc::new(FailingCancellationCleanupAgent::default());
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let started = agent.started.clone();
+    let worker_agent = agent.clone();
+    let worker = tokio::spawn(async move {
+        run_worker_attempt(
+            &workspace_manager,
+            &HooksConfig {
+                after_create: None,
+                before_run: None,
+                after_run: None,
+                after_outcome: None,
+                before_remove: None,
+                timeout_ms: 1_000,
+            },
+            worker_agent,
+            Arc::new(TestTracker::new(vec![issue.clone()])),
+            issue,
+            None,
+            workspace_root.join("FAC-STOP-OWNED-FAIL"),
+            "Initial prompt".into(),
+            vec!["Todo".into()],
+            1,
+            None,
+            polyphony_core::AgentDefinition::default(),
+            None,
+            stop_rx,
+            command_tx,
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("provider run should begin before cancellation");
+    stop_tx.send(Some("eligibility revoked".into())).unwrap();
+    let error = timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("cleanup failure should be reported promptly")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected owned PTY cleanup failure"),
+        "failed owned cleanup must not be persisted as CancelledByReconciliation: {error}"
     );
 }
 

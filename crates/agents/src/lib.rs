@@ -91,6 +91,12 @@ impl AgentRuntime for AgentRegistryRuntime {
         self.provider_for(&spec.agent)?.run(spec, event_tx).await
     }
 
+    async fn confirm_cancellation(&self, spec: &AgentRunSpec) -> Result<(), CoreError> {
+        self.provider_for(&spec.agent)?
+            .confirm_cancellation(spec)
+            .await
+    }
+
     async fn fetch_budgets(
         &self,
         agents: &[AgentDefinition],

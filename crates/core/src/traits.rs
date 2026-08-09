@@ -84,6 +84,13 @@ pub trait AgentRuntime: Send + Sync {
         spec: AgentRunSpec,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<AgentRunResult, Error>;
+
+    /// Confirms that provider-owned cleanup completed after this run was
+    /// cancelled. Providers that do not own a cancellable subprocess can use
+    /// the default no-op implementation.
+    async fn confirm_cancellation(&self, _spec: &AgentRunSpec) -> Result<(), Error> {
+        Ok(())
+    }
     async fn fetch_budgets(&self, _agents: &[AgentDefinition]) -> Result<BudgetPollResult, Error> {
         Ok(BudgetPollResult::default())
     }
@@ -113,6 +120,11 @@ pub trait AgentProviderRuntime: Send + Sync {
         spec: AgentRunSpec,
         event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<AgentRunResult, Error>;
+
+    /// See [`AgentRuntime::confirm_cancellation`].
+    async fn confirm_cancellation(&self, _spec: &AgentRunSpec) -> Result<(), Error> {
+        Ok(())
+    }
     async fn fetch_budget(
         &self,
         _agent: &AgentDefinition,

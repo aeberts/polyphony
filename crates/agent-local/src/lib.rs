@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{Read, Write},
     path::{Path, PathBuf},
     process::Output,
@@ -17,7 +18,12 @@ use polyphony_core::{
     AgentEventKind, AgentInteractionMode, AgentPromptMode, AgentProviderRuntime, AgentRunResult,
     AgentRunSpec, BudgetSnapshot, Error as CoreError, RateLimitSignal,
 };
-use tokio::{fs, process::Command, sync::mpsc, time::Instant};
+use tokio::{
+    fs,
+    process::Command,
+    sync::{mpsc, oneshot},
+    time::Instant,
+};
 use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +71,30 @@ struct PtySession {
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     #[allow(dead_code)]
     resizer: Arc<Mutex<Box<dyn PtyResizer>>>,
+    cleanup: PtyCleanupReporter,
+}
+
+/// Reports cleanup performed after a provider run future is dropped.  A Drop
+/// implementation cannot return an error, so this bridge lets the
+/// orchestrator await the actual owned-process cleanup before recording a
+/// reconciliation cancellation.
+struct PtyCleanupReporter(Option<oneshot::Sender<Result<(), CoreError>>>);
+
+impl PtyCleanupReporter {
+    fn complete(&mut self, result: Result<(), CoreError>) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl Drop for PtyCleanupReporter {
+    fn drop(&mut self) {
+        // If startup failed before a child was owned, there is no cleanup to
+        // confirm. Avoid turning that unrelated failure into a cancellation
+        // cleanup error.
+        self.complete(Ok(()));
+    }
 }
 
 /// Owns a PTY while its blocking spawn is being awaited.
@@ -73,26 +103,36 @@ struct PtySession {
 /// dropped. If cancellation wins that race, this guard is dropped by the
 /// blocking task after it has spawned the child, so it must terminate the
 /// child rather than leave it running without an owning session.
-struct PendingPtySpawn(Option<SpawnedPty>);
+struct PendingPtySpawn {
+    spawned: Option<SpawnedPty>,
+    cleanup: PtyCleanupReporter,
+}
 
 impl PendingPtySpawn {
-    fn new(spawned: SpawnedPty) -> Self {
-        Self(Some(spawned))
+    fn new(spawned: SpawnedPty, cleanup: PtyCleanupReporter) -> Self {
+        Self {
+            spawned: Some(spawned),
+            cleanup,
+        }
     }
 
-    fn into_spawned(mut self) -> Result<SpawnedPty, CoreError> {
-        self.0
+    fn into_spawned(mut self) -> Result<(SpawnedPty, PtyCleanupReporter), CoreError> {
+        let spawned = self
+            .spawned
             .take()
-            .ok_or_else(|| CoreError::Adapter("PTY spawn completed without a child".into()))
+            .ok_or_else(|| CoreError::Adapter("PTY spawn completed without a child".into()))?;
+        Ok((spawned, PtyCleanupReporter(self.cleanup.0.take())))
     }
 }
 
 impl Drop for PendingPtySpawn {
     fn drop(&mut self) {
-        if let Some(spawned) = self.0.as_mut()
-            && let Err(error) = spawned.child.kill()
-        {
-            warn!(%error, "failed to terminate PTY child after cancelled startup");
+        if let Some(spawned) = self.spawned.as_mut() {
+            let result = spawned.child.kill();
+            if let Err(error) = &result {
+                warn!(%error, "failed to terminate PTY child after cancelled startup");
+            }
+            self.cleanup.complete(result);
         }
     }
 }
@@ -101,11 +141,15 @@ impl Drop for PtySession {
     fn drop(&mut self) {
         match self.child.lock() {
             Ok(mut child) => {
-                if let Err(error) = child.kill() {
+                let result = child.kill();
+                if let Err(error) = &result {
                     warn!(%error, "failed to terminate PTY child after cancelled run");
                 }
+                self.cleanup.complete(result);
             },
-            Err(_) => warn!("failed to acquire PTY child lock after cancelled run"),
+            Err(_) => self.cleanup.complete(Err(CoreError::Adapter(
+                "failed to acquire PTY child lock after cancelled run".into(),
+            ))),
         }
     }
 }
@@ -119,6 +163,7 @@ struct PtyCaptureState {
 pub struct LocalCliRuntime {
     supported_kinds: Vec<String>,
     fallback_transport: bool,
+    pending_cleanup: Arc<Mutex<HashMap<String, oneshot::Receiver<Result<(), CoreError>>>>>,
 }
 
 impl LocalCliRuntime {
@@ -126,6 +171,7 @@ impl LocalCliRuntime {
         Self {
             supported_kinds: supported_kinds.into_iter().map(Into::into).collect(),
             fallback_transport: false,
+            pending_cleanup: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -133,6 +179,7 @@ impl LocalCliRuntime {
         Self {
             supported_kinds: Vec::new(),
             fallback_transport: true,
+            pending_cleanup: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -166,7 +213,39 @@ impl AgentProviderRuntime for LocalCliRuntime {
         spec: AgentRunSpec,
         event_tx: mpsc::UnboundedSender<polyphony_core::AgentEvent>,
     ) -> Result<AgentRunResult, CoreError> {
-        run_local_cli(spec, event_tx).await
+        let key = cleanup_key(&spec);
+        let cleanup = if spec.agent.use_tmux {
+            PtyCleanupReporter(None)
+        } else {
+            let (cleanup_tx, cleanup_rx) = oneshot::channel();
+            self.pending_cleanup
+                .lock()
+                .map_err(|_| CoreError::Adapter("PTY cleanup registry lock poisoned".into()))?
+                .insert(key.clone(), cleanup_rx);
+            PtyCleanupReporter(Some(cleanup_tx))
+        };
+        let result = run_local_cli_with_cleanup(spec, event_tx, cleanup).await;
+        // A completed run has already returned its own success/failure, so it
+        // must not leave a stale cancellation receiver behind.
+        self.pending_cleanup
+            .lock()
+            .map_err(|_| CoreError::Adapter("PTY cleanup registry lock poisoned".into()))?
+            .remove(&key);
+        result
+    }
+
+    async fn confirm_cancellation(&self, spec: &AgentRunSpec) -> Result<(), CoreError> {
+        let receiver = self
+            .pending_cleanup
+            .lock()
+            .map_err(|_| CoreError::Adapter("PTY cleanup registry lock poisoned".into()))?
+            .remove(&cleanup_key(spec));
+        let Some(receiver) = receiver else {
+            return Ok(());
+        };
+        receiver.await.map_err(|_| {
+            CoreError::Adapter("PTY cleanup ended without reporting its result".into())
+        })?
     }
 
     async fn fetch_budget(
@@ -187,6 +266,15 @@ impl AgentProviderRuntime for LocalCliRuntime {
 pub async fn run_local_cli(
     spec: AgentRunSpec,
     event_tx: mpsc::UnboundedSender<polyphony_core::AgentEvent>,
+) -> Result<AgentRunResult, CoreError> {
+    let (cleanup_tx, _cleanup_rx) = oneshot::channel();
+    run_local_cli_with_cleanup(spec, event_tx, PtyCleanupReporter(Some(cleanup_tx))).await
+}
+
+async fn run_local_cli_with_cleanup(
+    spec: AgentRunSpec,
+    event_tx: mpsc::UnboundedSender<polyphony_core::AgentEvent>,
+    cleanup: PtyCleanupReporter,
 ) -> Result<AgentRunResult, CoreError> {
     info!(
         issue_identifier = %spec.issue.identifier,
@@ -224,11 +312,21 @@ pub async fn run_local_cli(
             &prompt_file,
             context_file.as_deref(),
             &workspace_path,
+            cleanup,
         )
         .await?
     };
 
     run_terminal_session(spec, event_tx, prompt_file, spawned).await
+}
+
+fn cleanup_key(spec: &AgentRunSpec) -> String {
+    format!(
+        "{}:{}:{}",
+        spec.issue.id,
+        spec.agent.name,
+        spec.attempt.unwrap_or(0)
+    )
 }
 
 async fn run_terminal_session(
@@ -480,6 +578,7 @@ async fn spawn_pty_session(
     prompt_file: &Path,
     context_file: Option<&Path>,
     workspace_path: &Path,
+    cleanup: PtyCleanupReporter,
 ) -> Result<SpawnedSession, CoreError> {
     let run_dir = workspace_path.join(".polyphony");
     fs::create_dir_all(&run_dir)
@@ -512,10 +611,10 @@ async fn spawn_pty_session(
         command: pty_command,
     };
     let pty_backend = spec.agent.pty_backend;
-    let spawned_pty = tokio::task::spawn_blocking(move || {
+    let (spawned_pty, cleanup) = tokio::task::spawn_blocking(move || {
         polyphony_agent_common::pty::backend_by_kind(pty_backend)?
             .spawn(&pty_config)
-            .map(PendingPtySpawn::new)
+            .map(|spawned| PendingPtySpawn::new(spawned, cleanup))
     })
     .await
     .map_err(join_error)??
@@ -559,6 +658,7 @@ async fn spawn_pty_session(
             child,
             writer: Arc::new(Mutex::new(writer)),
             resizer,
+            cleanup,
         }),
         prompt_delivery,
         startup_message: "pty session started",
@@ -705,7 +805,9 @@ impl TerminalSession for PtySession {
             guard.kill()
         })
         .await
-        .map_err(join_error)?
+        .map_err(join_error)??;
+        self.cleanup.complete(Ok(()));
+        Ok(())
     }
 }
 
@@ -1064,13 +1166,17 @@ fn diff_tail(previous: &str, current: &str) -> String {
 mod tests {
     use std::{
         collections::BTreeMap,
+        io::Cursor,
         os::unix::{fs::PermissionsExt, process::ExitStatusExt},
         process::{ExitStatus, Output},
-        sync::mpsc as std_mpsc,
+        sync::{Arc, Mutex, mpsc as std_mpsc},
         time::Duration,
     };
 
-    use polyphony_agent_common::pty::{PtyCommand, PtySpawnConfig, default_pty_backend};
+    use polyphony_agent_common::pty::{
+        PtyChild, PtyCommand, PtyExitStatus, PtyResizer, PtySpawnConfig, SpawnedPty,
+        default_pty_backend,
+    };
     use polyphony_core::{
         AgentDefinition, AgentInteractionMode, AgentPromptMode, AgentProviderRuntime, AgentRunSpec,
         AgentTransport, Error as CoreError, Issue,
@@ -1078,7 +1184,39 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
-    use super::{LocalCliRuntime, PendingPtySpawn, codex_command_uses_exec_mode, join_error};
+    use super::{
+        LocalCliRuntime, PendingPtySpawn, PtyCleanupReporter, codex_command_uses_exec_mode,
+        join_error,
+    };
+
+    struct KillFailsPtyChild;
+
+    impl PtyChild for KillFailsPtyChild {
+        fn try_wait(&mut self) -> Result<Option<PtyExitStatus>, CoreError> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> Result<PtyExitStatus, CoreError> {
+            Ok(PtyExitStatus {
+                exit_code: 0,
+                signal: None,
+            })
+        }
+
+        fn kill(&mut self) -> Result<(), CoreError> {
+            Err(CoreError::Adapter(
+                "injected pending PTY kill failure".into(),
+            ))
+        }
+    }
+
+    struct NoopResizer;
+
+    impl PtyResizer for NoopResizer {
+        fn resize(&self, _rows: u16, _cols: u16) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
 
     fn test_issue() -> Issue {
         Issue {
@@ -1162,7 +1300,7 @@ mod tests {
             // crossed the spawn_blocking handoff to its async caller yet.
             spawned_tx.send(()).expect("test should await PTY spawn");
             release_rx.recv().expect("test should release PTY startup");
-            Ok::<_, CoreError>(PendingPtySpawn::new(spawned))
+            Ok::<_, CoreError>(PendingPtySpawn::new(spawned, PtyCleanupReporter(None)))
         });
         let startup = tokio::spawn(async move {
             let pending = blocking_startup.await.map_err(join_error)??;
@@ -1208,6 +1346,59 @@ mod tests {
         })
         .await
         .expect("cancelling a PTY startup handoff must terminate its child pid");
+    }
+
+    #[tokio::test]
+    async fn failed_pending_pty_cleanup_is_reported_to_the_cancellation_caller() {
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let pending = PendingPtySpawn::new(
+            SpawnedPty {
+                reader: Box::new(Cursor::new(Vec::new())),
+                writer: Box::new(Cursor::new(Vec::new())),
+                child: Box::new(KillFailsPtyChild),
+                resizer: Box::new(NoopResizer),
+            },
+            PtyCleanupReporter(Some(cleanup_tx)),
+        );
+
+        drop(pending);
+
+        let error = cleanup_rx
+            .await
+            .expect("cleanup must report a result")
+            .expect_err("failed child termination must not be discarded");
+        assert!(
+            error
+                .to_string()
+                .contains("injected pending PTY kill failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_established_pty_cleanup_is_reported_to_the_cancellation_caller() {
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let session = super::PtySession {
+            capture_state: Arc::new(Mutex::new(super::PtyCaptureState {
+                parser: vt100::Parser::new(24, 80, 2_000),
+                transcript: String::new(),
+            })),
+            child: Arc::new(Mutex::new(Box::new(KillFailsPtyChild))),
+            writer: Arc::new(Mutex::new(None)),
+            resizer: Arc::new(Mutex::new(Box::new(NoopResizer))),
+            cleanup: PtyCleanupReporter(Some(cleanup_tx)),
+        };
+
+        drop(session);
+
+        let error = cleanup_rx
+            .await
+            .expect("cleanup must report a result")
+            .expect_err("failed child termination must not be discarded");
+        assert!(
+            error
+                .to_string()
+                .contains("injected pending PTY kill failure")
+        );
     }
 
     #[test]

@@ -233,8 +233,14 @@ pub(crate) async fn run_worker_attempt(
             "provider does not support live sessions, falling back to single run"
         );
         tokio::select! {
-            result = agent.run(run_spec, event_tx) => result,
-            reason = wait_for_stop(&mut stop_rx) => Ok(AgentRunResult::cancelled(reason)),
+            result = agent.run(run_spec.clone(), event_tx) => result,
+            reason = wait_for_stop(&mut stop_rx) => {
+                // Dropping a provider run can trigger owned subprocess cleanup.
+                // Do not persist a clean reconciliation cancellation until the
+                // provider confirms that cleanup succeeded.
+                agent.confirm_cancellation(&run_spec).await?;
+                Ok(AgentRunResult::cancelled(reason))
+            },
         }
     };
     forwarder.abort();
