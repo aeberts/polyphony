@@ -313,6 +313,23 @@ impl RuntimeService {
         if let Some(running) = self.state.running.remove(issue_id) {
             running.handle.abort();
             self.release_issue(issue_id);
+            // `finish_running` will not see a user-stopped worker because it
+            // was removed above. Persist its task/step cancellation here so a
+            // restart cannot mistake an in-progress pipeline task for work to
+            // resume.
+            if let (Some(run_id), Some(task_id)) =
+                (running.run_id.as_deref(), running.active_task_id.as_deref())
+                && let Some(tasks) = self.state.tasks.get_mut(run_id)
+                && let Some(task) = tasks.iter_mut().find(|task| task.id == task_id)
+            {
+                task.status = TaskStatus::Cancelled;
+                task.error = Some("stopped by user".into());
+                task.finished_at = Some(Utc::now());
+                task.updated_at = Utc::now();
+                if let Some(store) = &self.store {
+                    let _ = store.save_task(task).await;
+                }
+            }
             // Mark the associated run as cancelled.
             if let Some(run) = self
                 .state
@@ -322,9 +339,14 @@ impl RuntimeService {
             {
                 run.status = RunStatus::Cancelled;
                 run.cancel_reason = Some("stopped by user".into());
+                for step in &mut run.steps {
+                    if !matches!(step.status, polyphony_core::StepStatus::Succeeded) {
+                        step.mark_skipped();
+                    }
+                }
                 run.push_log(
                     polyphony_core::RunLogScope::Pipeline,
-                    "stopped by user".into(),
+                    String::from("stopped by user"),
                 );
                 run.updated_at = Utc::now();
                 if let Some(store) = &self.store {

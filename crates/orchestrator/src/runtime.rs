@@ -1646,6 +1646,23 @@ impl RuntimeService {
             // Startup normalization must never reinterpret it as a failure
             // that can be retried or replanned.
             if run_snapshot.status == RunStatus::Cancelled {
+                let cancellation_reason = run_snapshot
+                    .cancel_reason
+                    .as_deref()
+                    .unwrap_or("restored cancelled run");
+                if let Some(tasks) = self.state.tasks.get_mut(&run_id) {
+                    for task in tasks.iter_mut().filter(|task| {
+                        matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress)
+                    }) {
+                        task.status = TaskStatus::Cancelled;
+                        task.error = Some(cancellation_reason.into());
+                        task.finished_at = Some(now);
+                        task.updated_at = now;
+                        if let Some(store) = &self.store {
+                            store.save_task(task).await?;
+                        }
+                    }
+                }
                 continue;
             }
             let has_active_running =

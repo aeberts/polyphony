@@ -20,7 +20,10 @@ impl RuntimeService {
         {
             self.push_event(
                 EventScope::Dispatch,
-                format!("{} pipeline dispatch skipped: run was cancelled", issue.identifier),
+                format!(
+                    "{} pipeline dispatch skipped: run was cancelled",
+                    issue.identifier
+                ),
             );
             return Ok(());
         }
@@ -787,10 +790,13 @@ impl RuntimeService {
             if let Some(run) = self.state.runs.get_mut(run_id) {
                 run.status = RunStatus::Cancelled;
                 run.cancel_reason = outcome.error.clone();
-                if let Some(step) = run.steps.iter_mut().find(|step| {
-                    step.kind == polyphony_core::StepKind::PlannerRun
-                }) {
-                    step.mark_skipped();
+                for step in &mut run.steps {
+                    // Cancellation is terminal for the whole pipeline. Keep
+                    // no pending/running steps that restart recovery could
+                    // reinterpret as work to resume.
+                    if !matches!(step.status, polyphony_core::StepStatus::Succeeded) {
+                        step.mark_skipped();
+                    }
                 }
                 run.updated_at = Utc::now();
                 if let Some(store) = &self.store {
