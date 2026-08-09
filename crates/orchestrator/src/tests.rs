@@ -4467,6 +4467,12 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
     running.active_task_id = Some(user_task_id.clone());
     service.state.running.insert(issue.id.clone(), running);
     service.stop_running_by_user(&issue.id).await;
+
+    // Exercise the next polling tick after the user stop. The cancelled task
+    // must stay terminal rather than being resolved, continued, retried, or
+    // sent back through planner/worker dispatch.
+    service.tick().await;
+
     assert_eq!(
         service.state.runs[&user_run_id].status,
         RunStatus::Cancelled
@@ -4479,20 +4485,50 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
     assert!(service.state.retrying.is_empty());
     assert!(service.pending_manual_dispatches.is_empty());
     assert!(service.pending_webhook_dispatches.is_empty());
+    assert!(
+        service
+            .pending_manual_pull_request_inbox_dispatches
+            .is_empty()
+    );
+    assert!(service.pending_task_resolutions.is_empty());
     assert!(service.pending_task_retries.is_empty());
     assert!(service.pending_run_retries.is_empty());
     assert!(service.pending_feedback_injections.is_empty());
-    let snapshot = service.snapshot();
-    assert_eq!(
-        snapshot
-            .runs
+    assert!(service.pending_agent_stops.is_empty());
+    assert!(
+        service
+            .state
+            .recent_events
             .iter()
-            .find(|row| row.id == user_run_id)
-            .unwrap()
-            .cancel_reason
-            .as_deref(),
+            .any(|event| { event.message == format!("user stopped {}", issue.identifier) }),
+        "the user-stop audit event should remain visible after the polling tick"
+    );
+    assert!(
+        !service.state.recent_events.iter().any(|event| {
+            event.message.contains("pipeline dispatched")
+                || event.message.contains("re-running planner")
+                || event.message.contains("dispatch failed")
+        }),
+        "a user-stopped pipeline task must not produce worker, planner, or replan dispatch events"
+    );
+    let snapshot = service.snapshot();
+    let snapshot_run = snapshot
+        .runs
+        .iter()
+        .find(|row| row.id == user_run_id)
+        .unwrap();
+    assert_eq!(snapshot_run.status, RunStatus::Cancelled);
+    assert_eq!(
+        snapshot_run.cancel_reason.as_deref(),
         Some("stopped by user")
     );
+    let snapshot_task = snapshot
+        .tasks
+        .iter()
+        .find(|row| row.id == user_task_id)
+        .unwrap();
+    assert_eq!(snapshot_task.status, TaskStatus::Cancelled);
+    assert_eq!(snapshot_task.error.as_deref(), Some("stopped by user"));
     let history = snapshot.agent_run_history.first().unwrap();
     assert_eq!(history.status, AttemptStatus::CancelledByUser);
     assert_eq!(history.error.as_deref(), Some("stopped by user"));
