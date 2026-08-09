@@ -111,10 +111,17 @@ pub(crate) async fn run_worker_attempt(
         agent: selected_agent,
         prior_context: saved_context,
     };
-    let result = if let Some(mut session) = agent
-        .start_session(run_spec.clone(), event_tx.clone())
-        .await?
-    {
+    // A provider can spawn its subprocess before its session handshake finishes.
+    // Keep the handshake in the stop select so an eligibility revocation cannot
+    // leave a process starting after the run has been marked cancelled. Provider
+    // commands are configured kill-on-drop for this cancellation path.
+    let session = tokio::select! {
+        result = agent.start_session(run_spec.clone(), event_tx.clone()) => result?,
+        reason = wait_for_stop(&mut stop_rx) => {
+            return Ok(AgentRunResult::cancelled(reason));
+        }
+    };
+    let result = if let Some(mut session) = session {
         info!(
             issue_identifier = %run_spec.issue.identifier,
             agent = %run_spec.agent.name,

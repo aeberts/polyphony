@@ -171,6 +171,28 @@ pub(crate) fn project_id_from_context(
         })
 }
 
+pub(crate) fn project_issue_status_from_response(
+    data: &resolve_project_issue_status::ResponseData,
+    project_id: &str,
+) -> Option<String> {
+    let items = data
+        .repository
+        .as_ref()?
+        .issue
+        .as_ref()?
+        .project_items
+        .as_ref()?;
+    items.nodes.iter().flatten().flatten().find_map(|item| {
+        if item.project.id != project_id {
+            return None;
+        }
+        match item.field_value_by_name.as_ref()? {
+            resolve_project_issue_status::ResolveProjectIssueStatusRepositoryIssueProjectItemsNodesFieldValueByName::ProjectV2ItemFieldSingleSelectValue(value) => value.name.clone(),
+            _ => None,
+        }
+    })
+}
+
 pub(crate) fn project_field_nodes(
     data: &resolve_project_status_field::ResponseData,
 ) -> Option<

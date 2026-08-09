@@ -81,6 +81,14 @@ pub struct ResolveProjectStatusField;
     query_path = "src/project_workflow.graphql",
     response_derives = "Debug, Serialize, Deserialize"
 )]
+pub struct ResolveProjectIssueStatus;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/schema.graphql",
+    query_path = "src/project_workflow.graphql",
+    response_derives = "Debug, Serialize, Deserialize"
+)]
 pub struct AddIssueToProject;
 
 #[derive(GraphQLQuery)]
@@ -254,7 +262,12 @@ impl GithubIssueTracker {
         } else {
             Vec::new()
         };
-        Ok(to_issue(issue, comments))
+        let project_status = self.project_issue_status(&issue).await?;
+        let mut normalized = to_issue(issue, comments);
+        if let Some(status) = project_status {
+            normalized.state = status;
+        }
+        Ok(normalized)
     }
 
     fn track_request(&self) {
@@ -478,6 +491,35 @@ impl GithubIssueTracker {
             })?;
         Ok((field_id, option_id))
     }
+
+    async fn project_issue_status(&self, issue: &GithubIssue) -> Result<Option<String>, CoreError> {
+        let Some(project) = &self.project else {
+            return Ok(None);
+        };
+        let context = self
+            .project_context(&to_issue(issue.clone(), Vec::new()))
+            .await?;
+        let Some(context) = context else {
+            return Ok(None);
+        };
+        let response = self
+            .graphql::<resolve_project_issue_status::ResponseData, _>(
+                ResolveProjectIssueStatus::build_query(resolve_project_issue_status::Variables {
+                    owner: self.owner.clone(),
+                    repo: self.repo.clone(),
+                    number: issue.number as i64,
+                    field_name: project.status_field_name.clone(),
+                }),
+            )
+            .await?;
+        let data = response
+            .data
+            .ok_or_else(|| CoreError::Adapter("github project issue status missing data".into()))?;
+        Ok(project_issue_status_from_response(
+            &data,
+            &context.project_id,
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -521,8 +563,11 @@ impl IssueTracker for GithubIssueTracker {
         states: &[String],
     ) -> Result<Vec<Issue>, CoreError> {
         let mut issues_by_id = BTreeMap::new();
-        let wants_open = wants_open_states(states);
-        let wants_closed = wants_closed_states(states);
+        // Project-v2 Status is independent of GitHub's open/closed state. When
+        // configured, inspect both sets so a project "Done" item on an open
+        // issue participates in terminal reconciliation and cleanup.
+        let wants_open = self.project.is_some() || wants_open_states(states);
+        let wants_closed = self.project.is_some() || wants_closed_states(states);
         if wants_open {
             for issue in self.all_issues(octocrab::params::State::Open).await? {
                 if issue.pull_request.is_none() {
@@ -573,12 +618,14 @@ impl IssueTracker for GithubIssueTracker {
             let number = issue_id
                 .parse::<u64>()
                 .map_err(|error| CoreError::Adapter(error.to_string()))?;
-            let issue = self.issue_by_number(number).await?;
+            let issue = self
+                .normalize_issue(self.issue_by_number(number).await?)
+                .await?;
             updates.push(IssueStateUpdate {
-                id: issue.number.to_string(),
-                identifier: format!("#{}", issue.number),
-                state: normalize_issue_state(&issue),
-                updated_at: Some(issue.updated_at.with_timezone(&Utc)),
+                id: issue.id,
+                identifier: issue.identifier,
+                state: issue.state,
+                updated_at: issue.updated_at,
             });
         }
         Ok(updates)

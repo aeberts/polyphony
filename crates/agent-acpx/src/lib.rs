@@ -409,6 +409,7 @@ fn spawn_acpx_child(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .env_remove("CLAUDECODE");
     for (key, value) in &spec.agent.env {
         child.env(key, value);

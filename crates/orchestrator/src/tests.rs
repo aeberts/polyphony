@@ -536,6 +536,47 @@ struct BlockingSession {
     stops: Arc<Mutex<u32>>,
 }
 
+#[derive(Clone, Default)]
+struct StartupBlockingProcessAgent {
+    started: Arc<Notify>,
+    pid: Arc<Mutex<Option<u32>>>,
+}
+
+#[async_trait]
+impl AgentRuntime for StartupBlockingProcessAgent {
+    fn component_key(&self) -> String {
+        "provider:startup-blocking-process-test".into()
+    }
+
+    async fn start_session(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<Box<dyn AgentSession>>, polyphony_core::Error> {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .kill_on_drop(true);
+        let child = command
+            .spawn()
+            .map_err(|error| polyphony_core::Error::Adapter(error.to_string()))?;
+        *self.pid.lock().unwrap() = child.id();
+        self.started.notify_one();
+        // Simulate an app-server that spawned but never completes its startup
+        // handshake. Dropping this future must terminate `child`.
+        std::future::pending::<Result<Option<Box<dyn AgentSession>>, polyphony_core::Error>>().await
+    }
+
+    async fn run(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<AgentRunResult, polyphony_core::Error> {
+        unreachable!("run_worker_attempt starts a session first")
+    }
+}
+
 #[async_trait]
 impl AgentSession for BlockingSession {
     async fn run_turn(&mut self, _prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
@@ -2261,11 +2302,41 @@ async fn orphan_auto_dispatch_uses_loaded_issue_without_refetch_by_id() {
         .state
         .orphan_dispatch_keys
         .insert(sanitize_workspace_key(&issue.identifier));
+    service.state.dispatch_mode = polyphony_core::DispatchMode::Automatic;
 
     service.tick().await;
 
     assert_eq!(tracker_handle.fetch_by_ids_calls(), 0);
     assert!(service.state.running.contains_key(&issue.id));
+}
+
+#[tokio::test]
+async fn orphan_recovery_never_dispatches_in_manual_mode() {
+    let workspace_root = unique_workspace_root("orphan-manual-no-dispatch");
+    let issue = sample_issue("issue-orphan-manual", "FAC-ORPHAN-MANUAL", "Todo", "Paused");
+    let mut service = test_service(
+        TestTracker::new(vec![issue.clone()]),
+        RecordingProvisioner::default(),
+        &workspace_root,
+    );
+    service
+        .state
+        .orphan_dispatch_keys
+        .insert(sanitize_workspace_key(&issue.identifier));
+
+    service.tick().await;
+
+    assert_eq!(
+        service.state.dispatch_mode,
+        polyphony_core::DispatchMode::Manual
+    );
+    assert!(!service.state.running.contains_key(&issue.id));
+    assert!(
+        service
+            .state
+            .orphan_dispatch_keys
+            .contains(&sanitize_workspace_key(&issue.identifier))
+    );
 }
 
 #[tokio::test]
@@ -2884,6 +2955,89 @@ async fn run_worker_attempt_stops_live_session_when_eligibility_is_revoked() {
         Some("eligibility revoked: issue state changed to Blocked")
     );
     assert_eq!(agent.stops(), 1, "live session stop must be invoked");
+}
+
+#[tokio::test]
+async fn run_worker_attempt_cancellation_during_startup_terminates_process() {
+    let workspace_root = unique_workspace_root("eligibility-stop-startup");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue(
+        "issue-startup-stop",
+        "FAC-STARTUP-STOP",
+        "Todo",
+        "Stop startup",
+    );
+    let agent = Arc::new(StartupBlockingProcessAgent::default());
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = watch::channel(None);
+    let started = agent.started.clone();
+    let worker_agent = agent.clone();
+    let worker = tokio::spawn(async move {
+        run_worker_attempt(
+            &workspace_manager,
+            &HooksConfig {
+                after_create: None,
+                before_run: None,
+                after_run: None,
+                after_outcome: None,
+                before_remove: None,
+                timeout_ms: 1_000,
+            },
+            worker_agent,
+            Arc::new(TestTracker::new(vec![issue.clone()])),
+            issue,
+            None,
+            workspace_root.join("FAC-STARTUP-STOP"),
+            "Initial prompt".into(),
+            vec!["Todo".into()],
+            1,
+            None,
+            polyphony_core::AgentDefinition::default(),
+            None,
+            stop_rx,
+            command_tx,
+        )
+        .await
+    });
+
+    timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("fake process should start before its handshake blocks");
+    let pid = agent.pid.lock().unwrap().expect("fake process pid");
+    stop_tx.send(Some("eligibility revoked".into())).unwrap();
+    let result = timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("startup cancellation should complete promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.status, AttemptStatus::CancelledByReconciliation);
+
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !alive {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelling startup must terminate the fake process pid");
 }
 
 #[tokio::test]

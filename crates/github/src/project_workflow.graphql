@@ -51,6 +51,31 @@ query ResolveProjectStatusField($projectId: ID!) {
   }
 }
 
+query ResolveProjectIssueStatus(
+  $owner: String!
+  $repo: String!
+  $number: Int!
+  $fieldName: String!
+) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $number) {
+      projectItems(first: 100) {
+        nodes {
+          project {
+            id
+          }
+          fieldValueByName(name: $fieldName) {
+            __typename
+            ... on ProjectV2ItemFieldSingleSelectValue {
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 mutation AddIssueToProject($projectId: ID!, $contentId: ID!) {
   addProjectV2ItemById(input: {projectId: $projectId, contentId: $contentId}) {
     item {

@@ -2554,10 +2554,11 @@ impl RuntimeService {
         self.prune_discarded_inbox_items();
         self.save_cache().await;
 
-        // Auto-dispatch issues whose orphaned workspaces were found at startup.
-        // Skip in stop mode — nothing should start.
+        // Auto-dispatch is deliberately only for automatic mode.  Startup
+        // recovery must never turn a cancelled or manually operated run into a
+        // new worker merely because its workspace remains on disk.
         if !self.state.orphan_dispatch_keys.is_empty()
-            && self.state.dispatch_mode != polyphony_core::DispatchMode::Stop
+            && self.state.dispatch_mode == polyphony_core::DispatchMode::Automatic
         {
             let orphan_keys = std::mem::take(&mut self.state.orphan_dispatch_keys);
             let mut pending_orphan_keys = orphan_keys.clone();
@@ -2565,6 +2566,7 @@ impl RuntimeService {
                 let key = sanitize_workspace_key(&issue.identifier);
                 if orphan_keys.contains(&key)
                     && !self.is_claimed(&issue.id)
+                    && workflow.config.is_active_state(&issue.state)
                     && self.issue_is_approved(workflow.config.tracker.kind, issue)
                 {
                     info!(

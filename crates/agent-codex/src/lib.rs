@@ -443,7 +443,7 @@ async fn launch_codex_session(
     let prompt_file = prepare_prompt_file(&spec).await?;
     let context_file = prepare_context_file(&spec).await?;
     let model = selected_model_hint(&spec.agent);
-    let mut child = shell_command(
+    let mut command = shell_command(
         &command,
         &spec.workspace_path,
         &spec.agent.env,
@@ -451,12 +451,18 @@ async fn launch_codex_session(
         &prompt_file,
         context_file.as_deref(),
         model.as_deref(),
-    )
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .map_err(|error| CoreError::Adapter(format!("failed to start codex app-server: {error}")))?;
+    );
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // `start_session` can be cancelled while waiting for initialize/thread
+        // responses.  Tokio otherwise leaves the spawned app-server alive when
+        // its Child is dropped.
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        CoreError::Adapter(format!("failed to start codex app-server: {error}"))
+    })?;
     let codex_app_server_pid = child.id().map(|pid| pid.to_string());
     let mut stdin = child
         .stdin

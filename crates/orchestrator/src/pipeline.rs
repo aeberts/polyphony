@@ -951,10 +951,12 @@ impl RuntimeService {
         if let Some(tasks) = self.state.tasks.get_mut(run_id)
             && let Some(task) = tasks.iter_mut().find(|t| t.id == task_id)
         {
-            task.status = if matches!(outcome.status, AttemptStatus::Succeeded) {
-                TaskStatus::Completed
-            } else {
-                TaskStatus::Failed
+            task.status = match outcome.status {
+                AttemptStatus::Succeeded => TaskStatus::Completed,
+                AttemptStatus::CancelledByReconciliation | AttemptStatus::CancelledByUser => {
+                    TaskStatus::Cancelled
+                },
+                _ => TaskStatus::Failed,
             };
             task.turns_completed = outcome.turns_completed;
             task.error = outcome.error.clone();
@@ -973,6 +975,14 @@ impl RuntimeService {
             }) {
                 if matches!(outcome.status, AttemptStatus::Succeeded) {
                     step.mark_succeeded();
+                } else if matches!(
+                    outcome.status,
+                    AttemptStatus::CancelledByReconciliation | AttemptStatus::CancelledByUser
+                ) {
+                    // Step records intentionally have no cancelled state; a
+                    // skipped step preserves that it did not fail and prevents
+                    // cancellation from feeding failure/replan logic.
+                    step.mark_skipped();
                 } else {
                     step.mark_failed(outcome.error.as_deref().unwrap_or("task failed"));
                 }
@@ -993,6 +1003,19 @@ impl RuntimeService {
                 workspace_path,
             )
             .await
+        } else if matches!(
+            outcome.status,
+            AttemptStatus::CancelledByReconciliation | AttemptStatus::CancelledByUser
+        ) {
+            if let Some(run) = self.state.runs.get_mut(run_id) {
+                run.status = RunStatus::Cancelled;
+                run.cancel_reason = outcome.error.clone();
+                run.updated_at = Utc::now();
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+            Ok(())
         } else {
             let max_replan_attempts = 2;
             if workflow.config.pipeline.replan_on_failure
