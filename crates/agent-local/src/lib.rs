@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use polyphony_agent_common::{
     asciicast, base_agent_env, discover_models_from_command, emit, extract_text_rate_limit_signal,
     fetch_budget_for_agent, prepare_context_file, prepare_prompt_file,
-    pty::{PtyChild, PtyCommand, PtyResizer, PtySpawnConfig},
+    pty::{PtyChild, PtyCommand, PtyResizer, PtySpawnConfig, SpawnedPty},
     sanitize_session_fragment, selected_model_hint, shell_escape, status_to_result,
 };
 use polyphony_core::{
@@ -65,6 +65,49 @@ struct PtySession {
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     #[allow(dead_code)]
     resizer: Arc<Mutex<Box<dyn PtyResizer>>>,
+}
+
+/// Owns a PTY while its blocking spawn is being awaited.
+///
+/// Tokio does not cancel a `spawn_blocking` task when its `JoinHandle` is
+/// dropped. If cancellation wins that race, this guard is dropped by the
+/// blocking task after it has spawned the child, so it must terminate the
+/// child rather than leave it running without an owning session.
+struct PendingPtySpawn(Option<SpawnedPty>);
+
+impl PendingPtySpawn {
+    fn new(spawned: SpawnedPty) -> Self {
+        Self(Some(spawned))
+    }
+
+    fn into_spawned(mut self) -> Result<SpawnedPty, CoreError> {
+        self.0
+            .take()
+            .ok_or_else(|| CoreError::Adapter("PTY spawn completed without a child".into()))
+    }
+}
+
+impl Drop for PendingPtySpawn {
+    fn drop(&mut self) {
+        if let Some(spawned) = self.0.as_mut()
+            && let Err(error) = spawned.child.kill()
+        {
+            warn!(%error, "failed to terminate PTY child after cancelled startup");
+        }
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        match self.child.lock() {
+            Ok(mut child) => {
+                if let Err(error) = child.kill() {
+                    warn!(%error, "failed to terminate PTY child after cancelled run");
+                }
+            },
+            Err(_) => warn!("failed to acquire PTY child lock after cancelled run"),
+        }
+    }
 }
 
 struct PtyCaptureState {
@@ -470,10 +513,13 @@ async fn spawn_pty_session(
     };
     let pty_backend = spec.agent.pty_backend;
     let spawned_pty = tokio::task::spawn_blocking(move || {
-        polyphony_agent_common::pty::backend_by_kind(pty_backend)?.spawn(&pty_config)
+        polyphony_agent_common::pty::backend_by_kind(pty_backend)?
+            .spawn(&pty_config)
+            .map(PendingPtySpawn::new)
     })
     .await
-    .map_err(join_error)??;
+    .map_err(join_error)??
+    .into_spawned()?;
     let reader = spawned_pty.reader;
     let writer = spawned_pty.writer;
     let child: Arc<Mutex<Box<dyn PtyChild>>> = Arc::new(Mutex::new(spawned_pty.child));
@@ -1019,6 +1065,7 @@ mod tests {
     use std::{
         os::unix::{fs::PermissionsExt, process::ExitStatusExt},
         process::{ExitStatus, Output},
+        time::Duration,
     };
 
     use polyphony_core::{
@@ -1084,6 +1131,73 @@ mod tests {
             }
         }
         assert!(saw_terminal_output);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pty_run_terminates_spawned_child() {
+        let runtime = LocalCliRuntime::fallback_transport();
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("local-cli.pid");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let spec = AgentRunSpec {
+            issue: test_issue(),
+            attempt: None,
+            workspace_path: dir.path().to_path_buf(),
+            prompt: "hello".into(),
+            max_turns: 1,
+            prior_context: None,
+            agent: AgentDefinition {
+                name: "local-fixture".into(),
+                kind: "local".into(),
+                transport: AgentTransport::LocalCli,
+                command: Some(format!(
+                    "printf '%s' \"$$\" > {}; while :; do sleep 1; done",
+                    pid_file.display()
+                )),
+                turn_timeout_ms: 60_000,
+                read_timeout_ms: 1_000,
+                stall_timeout_ms: 60_000,
+                idle_timeout_ms: 60_000,
+                ..AgentDefinition::default()
+            },
+        };
+
+        let run = tokio::spawn(async move { runtime.run(spec, tx).await });
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("local PTY command should record its pid");
+
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output();
+                let still_running = status.ok().is_some_and(|output| {
+                    output.status.success()
+                        && !String::from_utf8_lossy(&output.stdout)
+                            .trim_start()
+                            .starts_with('Z')
+                });
+                if !still_running {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling a local PTY run must terminate its child pid");
     }
 
     #[test]

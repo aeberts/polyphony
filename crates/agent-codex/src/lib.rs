@@ -1189,7 +1189,7 @@ fn extract_message(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use async_trait::async_trait;
     use polyphony_core::{
@@ -1303,6 +1303,87 @@ done
             polyphony_core::AttemptStatus::Succeeded
         ));
         assert_eq!(result.turns_completed, 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_startup_terminates_app_server_before_handshake() {
+        let runtime = CodexRuntime::default();
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("app-server.pid");
+        let script = dir.path().join("blocking-app-server.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s' \"$$\" > '{}'\nwhile IFS= read -r _; do :; done\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let spec = AgentRunSpec {
+            issue: test_issue(),
+            attempt: None,
+            workspace_path: dir.path().to_path_buf(),
+            prompt: "hello".into(),
+            max_turns: 1,
+            prior_context: None,
+            agent: AgentDefinition {
+                name: "codex".into(),
+                kind: "codex".into(),
+                transport: AgentTransport::AppServer,
+                command: Some(script.display().to_string()),
+                turn_timeout_ms: 60_000,
+                read_timeout_ms: 60_000,
+                stall_timeout_ms: 60_000,
+                idle_timeout_ms: 60_000,
+                ..AgentDefinition::default()
+            },
+        };
+        let startup = tokio::spawn(async move { runtime.start_session(spec, tx).await });
+        let pid = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("app-server child should start before its handshake blocks");
+
+        startup.abort();
+        let startup_result = startup.await;
+        assert!(matches!(startup_result, Err(error) if error.is_cancelled()));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = std::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &pid.to_string()])
+                    .output();
+                let still_running = status.ok().is_some_and(|output| {
+                    output.status.success()
+                        && !String::from_utf8_lossy(&output.stdout)
+                            .trim_start()
+                            .starts_with('Z')
+                });
+                if !still_running {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling blocked app-server startup must terminate its child pid");
     }
 
     #[tokio::test]
