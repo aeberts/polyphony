@@ -1218,6 +1218,18 @@ impl RuntimeService {
         }
 
         for (run_id, task_id) in resolutions {
+            if self
+                .state
+                .runs
+                .get(&run_id)
+                .is_some_and(|run| run.status == RunStatus::Cancelled)
+            {
+                self.push_event(
+                    EventScope::Dispatch,
+                    format!("task resolution ignored: run {run_id} was cancelled"),
+                );
+                continue;
+            }
             // Mark the task as completed
             let task_found = if let Some(tasks) = self.state.tasks.get_mut(&run_id) {
                 if let Some(task) = tasks.iter_mut().find(|t| t.id == task_id) {
@@ -1465,6 +1477,13 @@ impl RuntimeService {
             );
             return Ok(());
         };
+        if run.status == RunStatus::Cancelled {
+            self.push_event(
+                EventScope::Dispatch,
+                format!("run retry ignored: run {run_id} was cancelled"),
+            );
+            return Ok(());
+        }
         // If run is Delivered but the workspace has unpushed commits, re-run
         // the handoff (push + PR) instead of re-dispatching the agent.
         if run.status == RunStatus::Delivered {
@@ -1622,6 +1641,13 @@ impl RuntimeService {
             let Some(run_snapshot) = self.state.runs.get(&run_id).cloned() else {
                 continue;
             };
+            // A persisted cancellation records an intentional terminal state,
+            // even if the process stopped while a task still said InProgress.
+            // Startup normalization must never reinterpret it as a failure
+            // that can be retried or replanned.
+            if run_snapshot.status == RunStatus::Cancelled {
+                continue;
+            }
             let has_active_running =
                 self.state.running.values().any(|running| {
                     running.run_id.as_deref() == Some(run_id.as_str())

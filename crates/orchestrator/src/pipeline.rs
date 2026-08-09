@@ -10,6 +10,20 @@ impl RuntimeService {
         skip_workspace_sync: bool,
         directives: Option<&str>,
     ) -> Result<(), Error> {
+        // A cancellation is terminal for a pipeline run.  In particular, do
+        // not let a continuation/retry turn a persisted cancellation back
+        // into Planning or Executing.
+        if self
+            .find_existing_run_for_issue(&issue.id)
+            .and_then(|run_id| self.state.runs.get(&run_id))
+            .is_some_and(|run| run.status == RunStatus::Cancelled)
+        {
+            self.push_event(
+                EventScope::Dispatch,
+                format!("{} pipeline dispatch skipped: run was cancelled", issue.identifier),
+            );
+            return Ok(());
+        }
         let manual_dispatch_directives = directives
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -766,6 +780,30 @@ impl RuntimeService {
         outcome: &AgentRunResult,
         attempt: Option<u32>,
     ) -> Result<(), Error> {
+        if matches!(
+            outcome.status,
+            AttemptStatus::CancelledByReconciliation | AttemptStatus::CancelledByUser
+        ) {
+            if let Some(run) = self.state.runs.get_mut(run_id) {
+                run.status = RunStatus::Cancelled;
+                run.cancel_reason = outcome.error.clone();
+                if let Some(step) = run.steps.iter_mut().find(|step| {
+                    step.kind == polyphony_core::StepKind::PlannerRun
+                }) {
+                    step.mark_skipped();
+                }
+                run.updated_at = Utc::now();
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+            self.push_event(
+                EventScope::Dispatch,
+                format!("{} pipeline planner cancelled", issue.identifier),
+            );
+            return Ok(());
+        }
+
         if !matches!(outcome.status, AttemptStatus::Succeeded) {
             warn!(
                 issue_identifier = %issue.identifier,

@@ -321,6 +321,11 @@ impl RuntimeService {
                 .find(|m| m.issue_id.as_deref() == Some(issue_id))
             {
                 run.status = RunStatus::Cancelled;
+                run.cancel_reason = Some("stopped by user".into());
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    "stopped by user".into(),
+                );
                 run.updated_at = Utc::now();
                 if let Some(store) = &self.store {
                     let _ = store.save_run(run).await;

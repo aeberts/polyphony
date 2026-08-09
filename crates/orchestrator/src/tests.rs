@@ -4238,6 +4238,62 @@ async fn pipeline_issue_event_creates_pull_request_deliverable_without_github() 
 }
 
 #[tokio::test]
+async fn cancelled_pipeline_planner_is_terminal_and_never_creates_tasks() {
+    let workspace_root = unique_workspace_root("cancelled-pipeline-planner");
+    let workflow = pipeline_workflow_with_automation(&workspace_root);
+    let issue = sample_issue("issue-cancelled-planner", "DOG-808", "Todo", "Cancel planner");
+    let mut service = test_service(
+        TestTracker::new(vec![issue.clone()]),
+        RecordingProvisioner::default(),
+        &workspace_root,
+    );
+    let now = Utc::now();
+    service.state.runs.insert(
+        "run-cancelled-planner".into(),
+        Run {
+            id: "run-cancelled-planner".into(),
+            kind: RunKind::IssueDelivery,
+            issue_id: Some(issue.id.clone()),
+            issue_identifier: Some(issue.identifier.clone()),
+            title: issue.title.clone(),
+            status: RunStatus::Planning,
+            pipeline_stage: Some(PipelineStage::Planning),
+            manual_dispatch_directives: None,
+            workspace_key: None,
+            workspace_path: Some(workspace_root.clone()),
+            review_target: None,
+            deliverable: None,
+            created_at: now,
+            activity_log: Vec::new(),
+            cancel_reason: None,
+            steps: polyphony_core::build_planner_steps(),
+            updated_at: now,
+        },
+    );
+
+    service
+        .handle_planner_finished(
+            &workflow,
+            &issue,
+            "run-cancelled-planner",
+            &workspace_root,
+            &AgentRunResult::cancelled("eligibility revoked"),
+            None,
+        )
+        .await
+        .expect("cancellation should be recorded without dispatching");
+
+    let run = service.state.runs.get("run-cancelled-planner").unwrap();
+    assert_eq!(run.status, RunStatus::Cancelled);
+    assert_eq!(run.cancel_reason.as_deref(), Some("eligibility revoked"));
+    assert!(run.steps.iter().all(|step| step.status == StepStatus::Skipped));
+    assert!(
+        !service.state.tasks.contains_key("run-cancelled-planner"),
+        "a cancelled planner must not create or dispatch pipeline tasks"
+    );
+}
+
+#[tokio::test]
 async fn pipeline_issue_event_writes_workspace_artifacts_and_runs_after_outcome_hook() {
     let workspace_root = unique_workspace_root("pipeline-issue-artifacts");
     let mut workflow = pipeline_workflow_with_automation(&workspace_root);
