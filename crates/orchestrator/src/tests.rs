@@ -2638,6 +2638,65 @@ async fn automatic_recovery_does_not_resurrect_cancelled_or_terminal_runs() {
 }
 
 #[tokio::test]
+async fn equal_timestamp_persisted_run_conflict_fails_closed_on_recovery_and_retry() {
+    let workspace_root = unique_workspace_root("orphan-equal-timestamp-conflict");
+    let issue = sample_issue(
+        "issue-orphan-equal-timestamp",
+        "FAC-ORPHAN-EQUAL-TIMESTAMP",
+        "Todo",
+        "Equal timestamp conflict",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service = test_service(tracker, RecordingProvisioner::default(), &workspace_root);
+    service.state.dispatch_mode = DispatchMode::Automatic;
+    service
+        .state
+        .orphan_dispatch_keys
+        .insert(sanitize_workspace_key(&issue.identifier));
+
+    let mut in_progress = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    in_progress.id = "run-equal-timestamp-in-progress".into();
+    let mut cancelled = persisted_issue_run(&issue, &workspace_root, RunStatus::Cancelled);
+    cancelled.id = "run-equal-timestamp-cancelled".into();
+    cancelled.cancel_reason = Some("eligibility revoked".into());
+    // These intentionally tie, as can happen with low-resolution persistence
+    // timestamps. Recovery must not let HashMap iteration select the active one.
+    cancelled.updated_at = in_progress.updated_at;
+    service
+        .state
+        .runs
+        .insert(in_progress.id.clone(), in_progress);
+    service.state.runs.insert(cancelled.id.clone(), cancelled);
+    service.schedule_retry(
+        issue.id.clone(),
+        issue.identifier.clone(),
+        1,
+        Some("stale retry".into()),
+        true,
+        60_000,
+    );
+    service.state.retrying.get_mut(&issue.id).unwrap().due_at = Instant::now();
+
+    // The retry entry point and the orphan-recovery entry point must both
+    // refuse the ambiguous persisted lifecycle.
+    service.process_due_retries().await;
+    service.tick().await;
+
+    assert!(service.has_non_resumable_persisted_run(&issue.id));
+    assert!(!service.has_resumable_persisted_run(&issue.id));
+    assert!(service.state.retrying.is_empty(), "no retry may survive");
+    assert!(
+        !service.state.running.contains_key(&issue.id),
+        "no worker may be started from ambiguous persisted runs"
+    );
+    assert!(
+        tracker_handle.acknowledged_issues().is_empty(),
+        "no dispatch acknowledgement may be emitted"
+    );
+}
+
+#[tokio::test]
 async fn automatic_recovery_skips_ineligible_persisted_run_when_configured_to_stop() {
     let workspace_root = unique_workspace_root("orphan-ineligible-no-resurrection");
     let workflow = test_workflow_with_front_matter(

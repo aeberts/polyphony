@@ -70,24 +70,38 @@ impl RuntimeService {
         true
     }
 
-    fn latest_persisted_run_for_issue(&self, issue_id: &str) -> Option<&Run> {
-        self.state
+    /// Automatic restart recovery is deliberately narrow: only an explicitly
+    /// in-progress latest run may be resumed. A workspace alone is never
+    /// authority to start a new run. Equal timestamps with conflicting
+    /// lifecycle states are deliberately treated as non-resumable: persistence
+    /// does not provide an ordering that could safely override cancellation.
+    pub(crate) fn has_resumable_persisted_run(&self, issue_id: &str) -> bool {
+        let latest_updated_at = self
+            .state
             .runs
             .values()
             .filter(|run| run.issue_id.as_deref() == Some(issue_id))
-            .max_by_key(|run| run.updated_at)
-    }
+            .map(|run| run.updated_at)
+            .max();
 
-    /// Automatic restart recovery is deliberately narrow: only an explicitly
-    /// in-progress run may be resumed.  A workspace alone is never authority
-    /// to start a new run.
-    pub(crate) fn has_resumable_persisted_run(&self, issue_id: &str) -> bool {
-        self.latest_persisted_run_for_issue(issue_id)
-            .is_some_and(|run| run.status == RunStatus::InProgress && run.cancel_reason.is_none())
+        let Some(latest_updated_at) = latest_updated_at else {
+            return false;
+        };
+
+        self.state
+            .runs
+            .values()
+            .filter(|run| {
+                run.issue_id.as_deref() == Some(issue_id) && run.updated_at == latest_updated_at
+            })
+            .all(|run| run.status == RunStatus::InProgress && run.cancel_reason.is_none())
     }
 
     pub(crate) fn has_non_resumable_persisted_run(&self, issue_id: &str) -> bool {
-        self.latest_persisted_run_for_issue(issue_id).is_some()
+        self.state
+            .runs
+            .values()
+            .any(|run| run.issue_id.as_deref() == Some(issue_id))
             && !self.has_resumable_persisted_run(issue_id)
     }
 
