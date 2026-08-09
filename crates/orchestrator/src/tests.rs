@@ -3043,12 +3043,12 @@ async fn run_worker_attempt_cancellation_during_startup_terminates_process() {
 #[tokio::test]
 async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
     let workspace_root = unique_workspace_root("eligibility-policy");
-    let running_issue = sample_issue("issue-policy", "FAC-POLICY", "Todo", "Policy");
-    let tracker_issue = sample_issue("issue-policy", "FAC-POLICY", "Blocked", "Policy");
-    let tracker = TestTracker::new(vec![tracker_issue]);
+    let running_issue = sample_issue("issue-policy", "FAC-POLICY", "Ready", "Policy");
+    let tracker_issue = sample_issue("issue-policy", "FAC-POLICY", "Backlog", "Policy");
+    let tracker = TestTracker::new(vec![tracker_issue.clone()]);
     let workflow = test_workflow_with_front_matter(
         &workspace_root,
-        "---\ntracker:\n  kind: mock\n  active_states: [Todo, In Progress]\n  terminal_states: [Done]\n  stop_when_ineligible: true\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: mock\n  profiles:\n    mock:\n      kind: mock\n      transport: mock\n      command: mock\n---\nTest prompt\n",
+        "---\ntracker:\n  kind: mock\n  active_states: [Ready]\n  terminal_states: [Done]\n  stop_when_ineligible: true\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: mock\n  profiles:\n    mock:\n      kind: mock\n      transport: mock\n      command: mock\n---\nTest prompt\n",
     );
     let (_tx, workflow_rx) = watch::channel(workflow);
     let mut service = RuntimeService::new(
@@ -3062,7 +3062,7 @@ async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
         None,
         None,
         None,
-        workflow_rx,
+        workflow_rx.clone(),
     )
     .0;
     service.state.running.insert(
@@ -3090,10 +3090,14 @@ async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
     stop_rx.changed().await.unwrap();
     assert_eq!(
         stop_rx.borrow().as_deref(),
-        Some("eligibility revoked: issue state changed to Blocked")
+        Some("eligibility revoked: issue state changed to Backlog")
     );
     assert!(service.state.running.contains_key(&running_issue.id));
     assert!(!service.state.retrying.contains_key(&running_issue.id));
+    assert!(
+        !service.should_dispatch(&workflow_rx.borrow(), &tracker_issue),
+        "an otherwise-open Backlog issue must not be dispatched when only Ready is active"
+    );
 }
 
 #[tokio::test]

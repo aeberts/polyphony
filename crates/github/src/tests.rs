@@ -37,6 +37,8 @@ use crate::{
 #[derive(Clone)]
 struct ProjectStatusMock {
     statuses: Arc<Mutex<Vec<String>>>,
+    organization_owned: bool,
+    operations: Arc<Mutex<Vec<String>>>,
 }
 
 async fn mock_github_issue() -> Json<Value> {
@@ -89,15 +91,29 @@ async fn mock_graphql(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let operation = body["operationName"].as_str().unwrap_or_default();
+    state.operations.lock().unwrap().push(operation.to_owned());
     let payload = match operation {
+        "ResolveUserProjectIssueContext" if state.organization_owned => json!({"data": {
+            "repository": {"issue": {"id": "I_42"}},
+            "user": {"projectV2": null}
+        }}),
         "ResolveUserProjectIssueContext" => json!({"data": {
             "repository": {"issue": {"id": "I_42"}},
             "user": {"projectV2": {"id": "P_USER"}}
         }}),
+        "ResolveOrganizationProjectIssueContext" if state.organization_owned => json!({"data": {
+            "repository": {"issue": {"id": "I_42"}},
+            "organization": {"projectV2": {"id": "P_ORG"}}
+        }}),
         "ResolveProjectIssueStatus" => {
             let status = state.statuses.lock().unwrap().remove(0);
+            let project_id = if state.organization_owned {
+                "P_ORG"
+            } else {
+                "P_USER"
+            };
             json!({"data": {"repository": {"issue": {"projectItems": {"nodes": [{
-                "project": {"id": "P_USER"},
+                "project": {"id": project_id},
                 "fieldValueByName": {
                     "__typename": "ProjectV2ItemFieldSingleSelectValue",
                     "name": status
@@ -114,10 +130,20 @@ async fn mock_not_found(_uri: Uri) -> impl IntoResponse {
 }
 
 async fn project_status_tracker(statuses: Vec<&str>) -> crate::GithubIssueTracker {
+    project_status_tracker_for_owner(statuses, false).await.0
+}
+
+async fn project_status_tracker_for_owner(
+    statuses: Vec<&str>,
+    organization_owned: bool,
+) -> (crate::GithubIssueTracker, Arc<Mutex<Vec<String>>>) {
+    let operations = Arc::new(Mutex::new(Vec::new()));
     let state = ProjectStatusMock {
         statuses: Arc::new(Mutex::new(
             statuses.into_iter().map(str::to_owned).collect(),
         )),
+        organization_owned,
+        operations: operations.clone(),
     };
     let app = Router::new()
         .route("/repos/{owner}/{repo}/issues", get(mock_github_issues))
@@ -133,13 +159,19 @@ async fn project_status_tracker(statuses: Vec<&str>) -> crate::GithubIssueTracke
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    crate::GithubIssueTracker::new_for_test(
+    let tracker = crate::GithubIssueTracker::new_for_test(
         "repo-owner/repo".into(),
-        "project-user".into(),
+        if organization_owned {
+            "project-org"
+        } else {
+            "project-user"
+        }
+        .into(),
         1,
         base_url,
     )
-    .unwrap()
+    .unwrap();
+    (tracker, operations)
 }
 
 #[tokio::test]
@@ -164,6 +196,36 @@ async fn tracker_uses_project_status_for_candidate_polling_and_reconciliation() 
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].state, "Backlog");
     assert_ne!(updates[0].state, "Ready");
+}
+
+#[tokio::test]
+async fn organization_owned_project_fallback_is_used_for_candidate_and_reconciliation() {
+    let (tracker, operations) =
+        project_status_tracker_for_owner(vec!["Ready", "Backlog"], true).await;
+    let candidates = tracker
+        .fetch_candidate_issues(&TrackerQuery {
+            project_slug: None,
+            repository: None,
+            active_states: vec!["Ready".into()],
+            terminal_states: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(candidates[0].state, "Ready");
+    let updates = tracker
+        .fetch_issue_states_by_ids(&["42".into()])
+        .await
+        .unwrap();
+    assert_eq!(updates[0].state, "Backlog");
+    let operations = operations.lock().unwrap();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| operation.as_str() == "ResolveOrganizationProjectIssueContext")
+            .count(),
+        2,
+        "both tracker paths must use the user-empty to organization fallback"
+    );
 }
 
 #[tokio::test]
