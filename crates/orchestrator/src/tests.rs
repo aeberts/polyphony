@@ -3732,10 +3732,27 @@ async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
         workflow_rx.clone(),
     )
     .0;
-    service.state.running.insert(
-        running_issue.id.clone(),
-        make_running_task(running_issue.clone(), workspace_root.join("FAC-POLICY")),
-    );
+    let run_id = "run-eligibility-policy".to_string();
+    let mut run = persisted_issue_run(&running_issue, &workspace_root, RunStatus::InProgress);
+    run.id = run_id.clone();
+    run.pipeline_stage = Some(PipelineStage::Executing);
+    service.state.runs.insert(run_id.clone(), run);
+    let task = polyphony_core::PlannedTask {
+        title: "Stop on eligibility revocation".into(),
+        category: "coding".into(),
+        description: None,
+        agent: None,
+    }
+    .to_task(&run_id, 0);
+    let task_id = task.id.clone();
+    service.state.tasks.insert(run_id.clone(), vec![task]);
+    let mut running = make_running_task(running_issue.clone(), workspace_root.join("FAC-POLICY"));
+    running.run_id = Some(run_id.clone());
+    running.active_task_id = Some(task_id.clone());
+    service
+        .state
+        .running
+        .insert(running_issue.id.clone(), running);
     service.schedule_retry(
         running_issue.id.clone(),
         running_issue.identifier.clone(),
@@ -3764,6 +3781,43 @@ async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
     assert!(
         !service.should_dispatch(&workflow_rx.borrow(), &tracker_issue),
         "an otherwise-open Backlog issue must not be dispatched when only Ready is active"
+    );
+
+    // The normal worker-completion path consumes the policy stop signal.  It
+    // must terminalize this pipeline without putting any work back on a
+    // planner, dispatch, retry, task, or continuation queue.
+    service.state.running.remove(&running_issue.id);
+    service
+        .handle_task_finished(
+            &workflow_rx.borrow(),
+            &running_issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &AgentRunResult::cancelled("eligibility revoked: issue state changed to Backlog"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Cancelled);
+    assert_eq!(
+        service.state.tasks[&run_id][0].status,
+        TaskStatus::Cancelled
+    );
+    assert!(service.state.running.is_empty());
+    assert!(service.state.retrying.is_empty());
+    assert!(service.pending_manual_dispatches.is_empty());
+    assert!(service.pending_webhook_dispatches.is_empty());
+    assert!(service.pending_task_resolutions.is_empty());
+    assert!(service.pending_task_retries.is_empty());
+    assert!(service.pending_run_retries.is_empty());
+    assert!(service.pending_feedback_injections.is_empty());
+    assert!(
+        !service.state.recent_events.iter().any(|event| {
+            event.message.contains("pipeline dispatched")
+                || event.message.contains("re-running planner")
+        }),
+        "eligibility policy cancellation must not enqueue new pipeline work"
     );
 }
 
@@ -4348,6 +4402,20 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
     );
     assert!(service.state.running.is_empty());
     assert!(service.state.retrying.is_empty());
+    assert!(service.pending_manual_dispatches.is_empty());
+    assert!(service.pending_webhook_dispatches.is_empty());
+    assert!(service.pending_task_retries.is_empty());
+    assert!(service.pending_run_retries.is_empty());
+    assert!(service.pending_feedback_injections.is_empty());
+    assert!(
+        !service
+            .state
+            .recent_events
+            .iter()
+            .any(|event| event.message.contains("pipeline dispatched")
+                || event.message.contains("re-running planner")),
+        "a reconciliation cancellation must not queue dispatch or planner work"
+    );
     let snapshot = service.snapshot();
     assert_eq!(
         snapshot
@@ -4409,6 +4477,11 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
     );
     assert!(service.state.running.is_empty());
     assert!(service.state.retrying.is_empty());
+    assert!(service.pending_manual_dispatches.is_empty());
+    assert!(service.pending_webhook_dispatches.is_empty());
+    assert!(service.pending_task_retries.is_empty());
+    assert!(service.pending_run_retries.is_empty());
+    assert!(service.pending_feedback_injections.is_empty());
     let snapshot = service.snapshot();
     assert_eq!(
         snapshot
@@ -4423,6 +4496,57 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
     let history = snapshot.agent_run_history.first().unwrap();
     assert_eq!(history.status, AttemptStatus::CancelledByUser);
     assert_eq!(history.error.as_deref(), Some("stopped by user"));
+}
+
+#[tokio::test]
+async fn failed_pipeline_task_replans_when_configured() {
+    let workspace_root = unique_workspace_root("pipeline-replan-after-failure");
+    let mut workflow = pipeline_workflow_with_automation(&workspace_root);
+    workflow.config.pipeline.replan_on_failure = true;
+    let issue = sample_issue("issue-replan", "DOG-810", "Todo", "Replan after failure");
+    let mut service = test_service_for_workflow(
+        workflow.clone(),
+        TestTracker::new(vec![issue.clone()]),
+        RecordingProvisioner::default(),
+    );
+    let run_id = "run-replan-after-failure".to_string();
+    let mut run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    run.id = run_id.clone();
+    run.pipeline_stage = Some(PipelineStage::Executing);
+    service.state.runs.insert(run_id.clone(), run);
+    let task = polyphony_core::PlannedTask {
+        title: "Fail then replan".into(),
+        category: "coding".into(),
+        description: None,
+        agent: None,
+    }
+    .to_task(&run_id, 0);
+    let task_id = task.id.clone();
+    service.state.tasks.insert(run_id.clone(), vec![task]);
+
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &AgentRunResult::failed("ordinary worker failure"),
+            Some(0),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Planning);
+    assert!(service.state.running.contains_key(&issue.id));
+    assert_eq!(
+        service.state.running[&issue.id].agent_name, "router",
+        "ordinary task failure must redispatch the planner when replan_on_failure is enabled"
+    );
+    assert!(service.state.recent_events.iter().any(|event| {
+        event.message.contains("task failed, re-running planner")
+            && event.message.contains(&issue.identifier)
+    }));
 }
 
 #[tokio::test]
@@ -6031,9 +6155,17 @@ fn restore_bootstrap_preserves_persisted_dispatch_mode() {
 #[tokio::test]
 async fn normalize_restored_cancelled_run_keeps_task_terminal() {
     let workspace_root = unique_workspace_root("normalize-stale-running-task");
-    let tracker = TestTracker::new(Vec::new());
+    let issue = sample_issue(
+        "issue-restored-cancelled",
+        "DOG-811",
+        "Todo",
+        "Cancelled pipeline",
+    );
+    let workflow = pipeline_workflow_with_automation(&workspace_root);
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
     let provisioner = RecordingProvisioner::default();
-    let mut service = test_service(tracker, provisioner, &workspace_root);
+    let mut service = test_service_for_workflow(workflow, tracker, provisioner);
     let now = Utc::now();
     let run_id = "run-stale-running".to_string();
     let task_id = "task-stale-running".to_string();
@@ -6047,15 +6179,15 @@ async fn normalize_restored_cancelled_run_keeps_task_terminal() {
         recent_events: Vec::new(),
         runs: std::collections::HashMap::from([(run_id.clone(), polyphony_core::Run {
             id: run_id.clone(),
-            kind: polyphony_core::RunKind::PullRequestReview,
-            issue_id: Some("issue-89".into()),
-            issue_identifier: Some("penso/arbor#89".into()),
-            title: "Review PR".into(),
+            kind: polyphony_core::RunKind::IssueDelivery,
+            issue_id: Some(issue.id.clone()),
+            issue_identifier: Some(issue.identifier.clone()),
+            title: issue.title.clone(),
             status: polyphony_core::RunStatus::Cancelled,
-            pipeline_stage: None,
+            pipeline_stage: Some(polyphony_core::PipelineStage::Executing),
             manual_dispatch_directives: None,
-            workspace_key: Some("penso_arbor_89".into()),
-            workspace_path: Some(workspace_root.join("penso_arbor_89")),
+            workspace_key: Some(sanitize_workspace_key(&issue.identifier)),
+            workspace_path: Some(workspace_root.join(sanitize_workspace_key(&issue.identifier))),
             review_target: None,
             deliverable: None,
             created_at: now,
@@ -6067,7 +6199,7 @@ async fn normalize_restored_cancelled_run_keeps_task_terminal() {
         tasks: std::collections::HashMap::from([(task_id.clone(), polyphony_core::Task {
             id: task_id.clone(),
             run_id: run_id.clone(),
-            title: "Run PR review".into(),
+            title: "Interrupted pipeline task".into(),
             description: None,
             activity_log: Vec::new(),
             category: polyphony_core::TaskCategory::Review,
@@ -6090,6 +6222,10 @@ async fn normalize_restored_cancelled_run_keeps_task_terminal() {
     });
 
     service.normalize_restored_in_progress_runs().await.unwrap();
+    // Exercise a real post-restart poll tick after bootstrap normalization.
+    // Manual dispatch mode keeps the fixture deterministic while proving that
+    // the restored pipeline run does not enter planner or worker dispatch.
+    service.tick().await;
 
     let run = service.state.runs.get(&run_id).unwrap();
     assert_eq!(run.status, polyphony_core::RunStatus::Cancelled);
@@ -6097,6 +6233,21 @@ async fn normalize_restored_cancelled_run_keeps_task_terminal() {
     assert_eq!(task.status, polyphony_core::TaskStatus::Cancelled);
     assert_eq!(task.error.as_deref(), Some("eligibility revoked"));
     assert!(task.finished_at.is_some());
+    assert!(service.state.running.is_empty());
+    assert!(service.state.retrying.is_empty());
+    assert!(service.pending_manual_dispatches.is_empty());
+    assert!(service.pending_webhook_dispatches.is_empty());
+    assert!(service.pending_task_retries.is_empty());
+    assert!(service.pending_run_retries.is_empty());
+    assert!(service.pending_feedback_injections.is_empty());
+    assert!(tracker_handle.acknowledged_issues().is_empty());
+    assert!(
+        !service.state.recent_events.iter().any(|event| {
+            event.message.contains("pipeline dispatched")
+                || event.message.contains("re-running planner")
+        }),
+        "a restored cancelled pipeline must not plan or dispatch on restart"
+    );
 }
 
 #[tokio::test]
