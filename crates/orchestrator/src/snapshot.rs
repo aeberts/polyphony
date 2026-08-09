@@ -43,6 +43,12 @@ impl RuntimeService {
         if self.state.running.contains_key(&issue.id) || self.is_claimed(&issue.id) {
             return false;
         }
+        // A persisted run is durable intent.  In particular, do not turn a
+        // cancelled, failed, or delivered run back into work merely because
+        // the tracker still reports an active state after a restart.
+        if self.has_non_resumable_persisted_run(&issue.id) {
+            return false;
+        }
         let state = issue.normalized_state();
         if !workflow.config.is_active_state(&issue.state)
             || workflow.config.is_terminal_state(&issue.state)
@@ -62,6 +68,27 @@ impl RuntimeService {
             }
         }
         true
+    }
+
+    fn latest_persisted_run_for_issue(&self, issue_id: &str) -> Option<&Run> {
+        self.state
+            .runs
+            .values()
+            .filter(|run| run.issue_id.as_deref() == Some(issue_id))
+            .max_by_key(|run| run.updated_at)
+    }
+
+    /// Automatic restart recovery is deliberately narrow: only an explicitly
+    /// in-progress run may be resumed.  A workspace alone is never authority
+    /// to start a new run.
+    pub(crate) fn has_resumable_persisted_run(&self, issue_id: &str) -> bool {
+        self.latest_persisted_run_for_issue(issue_id)
+            .is_some_and(|run| run.status == RunStatus::InProgress && run.cancel_reason.is_none())
+    }
+
+    pub(crate) fn has_non_resumable_persisted_run(&self, issue_id: &str) -> bool {
+        self.latest_persisted_run_for_issue(issue_id).is_some()
+            && !self.has_resumable_persisted_run(issue_id)
     }
 
     /// Find an existing run for the given issue, preferring active ones.
@@ -622,6 +649,20 @@ impl RuntimeService {
                 .insert(issue_id, RetryEntry { row, due_at });
         }
         self.state.runs = bootstrap.runs;
+        // A stale persisted retry must not bypass a cancellation or terminal
+        // run after process restart.  Release its startup claim at the same
+        // time so it cannot keep the issue artificially actionable.
+        let stale_retry_ids = self
+            .state
+            .retrying
+            .keys()
+            .filter(|issue_id| self.has_non_resumable_persisted_run(issue_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for issue_id in stale_retry_ids {
+            self.state.retrying.remove(&issue_id);
+            self.release_issue(&issue_id);
+        }
         for (_task_id, task) in bootstrap.tasks {
             self.state
                 .tasks

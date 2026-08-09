@@ -33,6 +33,20 @@ impl RuntimeService {
         let Some(retry) = self.state.retrying.remove(&issue_id) else {
             return;
         };
+        // Retry is another restart entry point.  It must not resurrect a run
+        // whose persisted lifecycle says it was cancelled or is otherwise
+        // final.
+        if self.has_non_resumable_persisted_run(&issue_id) {
+            self.release_issue(&issue_id);
+            self.push_event(
+                EventScope::Retry,
+                format!(
+                    "{} retry skipped: persisted run is not resumable",
+                    retry.row.issue_identifier
+                ),
+            );
+            return;
+        }
         let workflow = self.workflow_for_issue(&issue_id);
         if !workflow.config.has_dispatch_agents() {
             return;

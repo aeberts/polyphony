@@ -2566,6 +2566,7 @@ impl RuntimeService {
                 let key = sanitize_workspace_key(&issue.identifier);
                 if orphan_keys.contains(&key)
                     && !self.is_claimed(&issue.id)
+                    && self.has_resumable_persisted_run(&issue.id)
                     && workflow.config.is_active_state(&issue.state)
                     && self.issue_is_approved(workflow.config.tracker.kind, issue)
                 {

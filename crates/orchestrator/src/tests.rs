@@ -1185,6 +1185,51 @@ fn test_service(
     .0
 }
 
+fn test_service_for_workflow(
+    workflow: LoadedWorkflow,
+    tracker: TestTracker,
+    provisioner: RecordingProvisioner,
+) -> RuntimeService {
+    let (_tx, rx) = watch::channel(workflow);
+    RuntimeService::new(
+        Arc::new(tracker),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(provisioner),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0
+}
+
+fn persisted_issue_run(issue: &Issue, workspace_root: &Path, status: RunStatus) -> Run {
+    let now = Utc::now();
+    Run {
+        id: format!("run-{}", issue.id),
+        kind: RunKind::IssueDelivery,
+        issue_id: Some(issue.id.clone()),
+        issue_identifier: Some(issue.identifier.clone()),
+        title: issue.title.clone(),
+        status,
+        pipeline_stage: None,
+        manual_dispatch_directives: None,
+        workspace_key: Some(sanitize_workspace_key(&issue.identifier)),
+        workspace_path: Some(workspace_root.join(sanitize_workspace_key(&issue.identifier))),
+        review_target: None,
+        deliverable: None,
+        created_at: now,
+        updated_at: now,
+        activity_log: Vec::new(),
+        cancel_reason: None,
+        steps: Vec::new(),
+    }
+}
+
 fn test_service_with_reload(
     workflow: LoadedWorkflow,
     tracker: Arc<dyn IssueTracker>,
@@ -2456,6 +2501,8 @@ async fn orphan_auto_dispatch_uses_loaded_issue_without_refetch_by_id() {
         .state
         .orphan_dispatch_keys
         .insert(sanitize_workspace_key(&issue.identifier));
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    service.state.runs.insert(run.id.clone(), run);
     service.state.dispatch_mode = polyphony_core::DispatchMode::Automatic;
 
     service.tick().await;
@@ -2490,6 +2537,227 @@ async fn orphan_recovery_never_dispatches_in_manual_mode() {
             .state
             .orphan_dispatch_keys
             .contains(&sanitize_workspace_key(&issue.identifier))
+    );
+}
+
+#[tokio::test]
+async fn orphan_recovery_never_dispatches_in_stop_mode() {
+    let workspace_root = unique_workspace_root("orphan-stop-no-dispatch");
+    let issue = sample_issue("issue-orphan-stop", "FAC-ORPHAN-STOP", "Todo", "Stopped");
+    let mut service = test_service(
+        TestTracker::new(vec![issue.clone()]),
+        RecordingProvisioner::default(),
+        &workspace_root,
+    );
+    service.state.dispatch_mode = DispatchMode::Stop;
+    service
+        .state
+        .orphan_dispatch_keys
+        .insert(sanitize_workspace_key(&issue.identifier));
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    service.state.runs.insert(run.id.clone(), run);
+
+    service.tick().await;
+
+    assert!(!service.state.running.contains_key(&issue.id));
+    assert!(
+        service
+            .state
+            .orphan_dispatch_keys
+            .contains(&sanitize_workspace_key(&issue.identifier))
+    );
+}
+
+#[tokio::test]
+async fn automatic_recovery_does_not_resurrect_cancelled_or_terminal_runs() {
+    let workspace_root = unique_workspace_root("orphan-cancelled-no-resurrection");
+    let issue = sample_issue(
+        "issue-orphan-cancelled",
+        "FAC-ORPHAN-CANCELLED",
+        "Todo",
+        "Cancelled",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service = test_service(tracker, RecordingProvisioner::default(), &workspace_root);
+    service.state.dispatch_mode = DispatchMode::Automatic;
+    service
+        .state
+        .orphan_dispatch_keys
+        .insert(sanitize_workspace_key(&issue.identifier));
+    let mut run = persisted_issue_run(&issue, &workspace_root, RunStatus::Cancelled);
+    run.cancel_reason = Some("eligibility revoked: issue moved to Paused".into());
+    run.push_log(
+        polyphony_core::RunLogScope::Reconciliation,
+        "stopped: eligibility revoked: issue moved to Paused",
+    );
+    service.state.runs.insert(run.id.clone(), run);
+
+    service.tick().await;
+
+    assert!(!service.state.running.contains_key(&issue.id));
+    assert!(service.state.retrying.is_empty());
+    assert!(tracker_handle.acknowledged_issues().is_empty());
+    let run = service.state.runs.values().next().unwrap();
+    assert_eq!(
+        run.cancel_reason.as_deref(),
+        Some("eligibility revoked: issue moved to Paused")
+    );
+    assert!(
+        run.activity_log
+            .iter()
+            .any(|entry| entry.message.contains("eligibility revoked"))
+    );
+    let snapshot = service.snapshot();
+    let snapshot_run = snapshot.runs.iter().find(|row| row.id == run.id).unwrap();
+    assert_eq!(
+        snapshot_run.cancel_reason.as_deref(),
+        run.cancel_reason.as_deref()
+    );
+
+    // Terminal and failed-final runs receive the same restart safety gate.
+    for status in [RunStatus::Delivered, RunStatus::Failed] {
+        let mut service = test_service(
+            TestTracker::new(vec![issue.clone()]),
+            RecordingProvisioner::default(),
+            &workspace_root,
+        );
+        service.state.dispatch_mode = DispatchMode::Automatic;
+        service
+            .state
+            .orphan_dispatch_keys
+            .insert(sanitize_workspace_key(&issue.identifier));
+        let run = persisted_issue_run(&issue, &workspace_root, status);
+        service.state.runs.insert(run.id.clone(), run);
+        service.tick().await;
+        assert!(
+            !service.state.running.contains_key(&issue.id),
+            "{status:?} run was resurrected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn automatic_recovery_skips_ineligible_persisted_run_when_configured_to_stop() {
+    let workspace_root = unique_workspace_root("orphan-ineligible-no-resurrection");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\n  active_states: [Ready]\n  terminal_states: [Done]\n  stop_when_ineligible: true\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: automatic\nagents:\n  default: mock\n  profiles:\n    mock:\n      kind: mock\n      transport: mock\n      command: mock\n---\nTest prompt\n",
+    );
+    let issue = sample_issue(
+        "issue-orphan-ineligible",
+        "FAC-ORPHAN-INELIGIBLE",
+        "Todo",
+        "Ineligible",
+    );
+    let mut service = test_service_for_workflow(
+        workflow,
+        TestTracker::new(vec![issue.clone()]),
+        RecordingProvisioner::default(),
+    );
+    service.state.dispatch_mode = DispatchMode::Automatic;
+    service
+        .state
+        .orphan_dispatch_keys
+        .insert(sanitize_workspace_key(&issue.identifier));
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    service.state.runs.insert(run.id.clone(), run);
+
+    service.tick().await;
+
+    assert!(!service.state.running.contains_key(&issue.id));
+    assert!(service.state.retrying.is_empty());
+}
+
+#[tokio::test]
+async fn retry_queue_cannot_bypass_cancelled_run_recovery_gate() {
+    let workspace_root = unique_workspace_root("retry-cancelled-no-resurrection");
+    let issue = sample_issue(
+        "issue-retry-cancelled",
+        "FAC-RETRY-CANCELLED",
+        "Todo",
+        "Cancelled",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service = test_service(tracker, RecordingProvisioner::default(), &workspace_root);
+    service.state.dispatch_mode = DispatchMode::Automatic;
+    let mut run = persisted_issue_run(&issue, &workspace_root, RunStatus::Cancelled);
+    run.cancel_reason = Some("cancelled by user".into());
+    service.state.runs.insert(run.id.clone(), run);
+    service.schedule_retry(
+        issue.id.clone(),
+        issue.identifier.clone(),
+        1,
+        Some("stale persisted retry".into()),
+        true,
+        60_000,
+    );
+    service.state.retrying.get_mut(&issue.id).unwrap().due_at = Instant::now();
+
+    service.process_due_retries().await;
+
+    assert!(service.state.retrying.is_empty());
+    assert!(!service.is_claimed(&issue.id));
+    assert!(!service.state.running.contains_key(&issue.id));
+    assert!(tracker_handle.acknowledged_issues().is_empty());
+}
+
+#[test]
+fn restart_preserves_cancellation_history_and_drops_stale_retry() {
+    let workspace_root = unique_workspace_root("restart-cancellation-history");
+    let issue = sample_issue(
+        "issue-restart-cancelled",
+        "FAC-RESTART-CANCELLED",
+        "Todo",
+        "Cancelled",
+    );
+    let mut service = test_service(
+        TestTracker::new(vec![issue.clone()]),
+        RecordingProvisioner::default(),
+        &workspace_root,
+    );
+    let mut run = persisted_issue_run(&issue, &workspace_root, RunStatus::Cancelled);
+    run.cancel_reason = Some("cancelled by reconciliation after eligibility revocation".into());
+    run.push_log(
+        polyphony_core::RunLogScope::Reconciliation,
+        "stopped: cancelled by reconciliation after eligibility revocation",
+    );
+    let run_id = run.id.clone();
+    let retry = RetryRow {
+        repo_id: String::new(),
+        issue_id: issue.id.clone(),
+        issue_identifier: issue.identifier.clone(),
+        attempt: 2,
+        due_at: Utc::now(),
+        error: Some("stale retry from before cancellation".into()),
+    };
+
+    service.restore_bootstrap(StoreBootstrap {
+        snapshot: None,
+        retrying: HashMap::from([(issue.id.clone(), retry)]),
+        throttles: HashMap::new(),
+        budgets: HashMap::new(),
+        saved_contexts: HashMap::new(),
+        recent_events: Vec::new(),
+        runs: HashMap::from([(run_id.clone(), run)]),
+        tasks: HashMap::new(),
+        reviewed_pull_request_heads: HashMap::new(),
+        agent_run_history: Vec::new(),
+    });
+
+    assert!(service.state.retrying.is_empty());
+    assert!(!service.is_claimed(&issue.id));
+    let restored = service.state.runs.get(&run_id).unwrap();
+    assert_eq!(
+        restored.cancel_reason.as_deref(),
+        Some("cancelled by reconciliation after eligibility revocation")
+    );
+    assert!(
+        restored
+            .activity_log
+            .iter()
+            .any(|entry| entry.message.contains("eligibility revocation"))
     );
 }
 
