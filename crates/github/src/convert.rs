@@ -156,19 +156,22 @@ pub(crate) fn split_repo(repository: &str) -> Result<(String, String), CoreError
     Ok((owner.to_string(), repo.to_string()))
 }
 
-pub(crate) fn project_id_from_context(
-    data: &resolve_project_issue_context::ResponseData,
+pub(crate) fn user_project_id_from_context(
+    data: &resolve_user_project_issue_context::ResponseData,
+) -> Option<String> {
+    data.user
+        .as_ref()
+        .and_then(|user| user.project_v2.as_ref())
+        .map(|project| project.id.clone())
+}
+
+pub(crate) fn organization_project_id_from_context(
+    data: &resolve_organization_project_issue_context::ResponseData,
 ) -> Option<String> {
     data.organization
         .as_ref()
-        .and_then(|org| org.project_v2.as_ref())
+        .and_then(|organization| organization.project_v2.as_ref())
         .map(|project| project.id.clone())
-        .or_else(|| {
-            data.user
-                .as_ref()
-                .and_then(|user| user.project_v2.as_ref())
-                .map(|project| project.id.clone())
-        })
 }
 
 pub(crate) fn project_issue_status_from_response(
@@ -190,6 +193,22 @@ pub(crate) fn project_issue_status_from_response(
             resolve_project_issue_status::ResolveProjectIssueStatusRepositoryIssueProjectItemsNodesFieldValueByName::ProjectV2ItemFieldSingleSelectValue(value) => value.name.clone(),
             _ => None,
         }
+    })
+}
+
+/// A configured Project-v2 is authoritative for eligibility.  Returning an
+/// error here, instead of falling back to the REST issue state, prevents an
+/// open issue whose Project item was removed (or has no Status) from being
+/// accidentally dispatched.
+pub(crate) fn required_project_issue_status(
+    status: Option<String>,
+    field_name: &str,
+    issue_number: u64,
+) -> Result<String, CoreError> {
+    status.ok_or_else(|| {
+        CoreError::Adapter(format!(
+            "github project item or `{field_name}` status is missing for issue #{issue_number}; refusing to use GitHub open/closed state"
+        ))
     })
 }
 

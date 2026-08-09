@@ -1,27 +1,3 @@
-query ResolveProjectIssueContext(
-  $owner: String!
-  $repo: String!
-  $number: Int!
-  $projectOwner: String!
-  $projectNumber: Int!
-) {
-  repository(owner: $owner, name: $repo) {
-    issue(number: $number) {
-      id
-    }
-  }
-  organization(login: $projectOwner) {
-    projectV2(number: $projectNumber) {
-      id
-    }
-  }
-  user(login: $projectOwner) {
-    projectV2(number: $projectNumber) {
-      id
-    }
-  }
-}
-
 query ResolveProjectStatusField($projectId: ID!) {
   node(id: $projectId) {
     __typename

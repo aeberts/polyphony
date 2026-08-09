@@ -1,4 +1,5 @@
 use chrono::{TimeZone, Utc};
+use graphql_client::GraphQLQuery;
 use octocrab::models::AuthorAssociation;
 use polyphony_core::DispatchApprovalState;
 use reqwest::{
@@ -9,11 +10,13 @@ use reqwest::{
 use crate::{
     convert::{
         find_status_field_option, github_issue_approval_state, github_rate_limit_signal,
-        parse_rate_limit_reset, parse_retry_after_ms, project_id_from_context,
+        organization_project_id_from_context, parse_rate_limit_reset, parse_retry_after_ms,
+        required_project_issue_status, user_project_id_from_context,
     },
     fetch_pull_request_events,
     pull_requests::{GithubIssueCommentResponse, find_issue_comment_id_with_marker},
-    resolve_project_issue_context, resolve_project_status_field,
+    resolve_organization_project_issue_context, resolve_project_status_field,
+    resolve_user_project_issue_context,
     review_events::{
         GithubReviewBranchRef, GithubReviewHeadRef, GithubReviewLabel,
         GithubReviewPullRequestResponse, GithubReviewUser,
@@ -22,23 +25,103 @@ use crate::{
 };
 
 #[test]
-fn project_id_prefers_org_then_user() {
-    let data = resolve_project_issue_context::ResponseData {
+fn user_owned_project_query_never_requests_an_organization() {
+    let body = crate::ResolveUserProjectIssueContext::build_query(
+        resolve_user_project_issue_context::Variables {
+            owner: "repo-owner".into(),
+            repo: "repo".into(),
+            number: 42,
+            project_owner: "aeberts".into(),
+            project_number: 1,
+        },
+    );
+    let query = serde_json::to_value(body).unwrap()["query"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(query.contains("user(login: $projectOwner)"));
+    assert!(!query.contains("organization(login: $projectOwner)"));
+}
+
+#[test]
+fn organization_fallback_query_never_requests_a_user() {
+    let body = crate::ResolveOrganizationProjectIssueContext::build_query(
+        resolve_organization_project_issue_context::Variables {
+            owner: "repo-owner".into(),
+            repo: "repo".into(),
+            number: 42,
+            project_owner: "acme".into(),
+            project_number: 1,
+        },
+    );
+    let query = serde_json::to_value(body).unwrap()["query"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(query.contains("organization(login: $projectOwner)"));
+    assert!(!query.contains("user(login: $projectOwner)"));
+}
+
+#[test]
+fn user_owned_project_context_resolves_without_an_organization_lookup() {
+    let data = resolve_user_project_issue_context::ResponseData {
             repository: None,
-            organization: Some(resolve_project_issue_context::ResolveProjectIssueContextOrganization {
-                project_v2: Some(resolve_project_issue_context::ResolveProjectIssueContextOrganizationProjectV2 {
-                    id: "ORG_PROJECT".into(),
-                }),
-            }),
-            user: Some(resolve_project_issue_context::ResolveProjectIssueContextUser {
-                project_v2: Some(resolve_project_issue_context::ResolveProjectIssueContextUserProjectV2 {
+            user: Some(resolve_user_project_issue_context::ResolveUserProjectIssueContextUser {
+                project_v2: Some(resolve_user_project_issue_context::ResolveUserProjectIssueContextUserProjectV2 {
                     id: "USER_PROJECT".into(),
                 }),
             }),
         };
     assert_eq!(
-        project_id_from_context(&data).as_deref(),
+        user_project_id_from_context(&data).as_deref(),
+        Some("USER_PROJECT")
+    );
+}
+
+#[test]
+fn organization_owned_project_context_resolves_after_user_lookup_is_empty() {
+    let data = resolve_organization_project_issue_context::ResponseData {
+        repository: None,
+        organization: Some(
+            resolve_organization_project_issue_context::ResolveOrganizationProjectIssueContextOrganization {
+                project_v2: Some(
+                    resolve_organization_project_issue_context::ResolveOrganizationProjectIssueContextOrganizationProjectV2 {
+                        id: "ORG_PROJECT".into(),
+                    },
+                ),
+            },
+        ),
+    };
+
+    assert_eq!(
+        organization_project_id_from_context(&data).as_deref(),
         Some("ORG_PROJECT")
+    );
+}
+
+#[test]
+fn missing_project_item_or_status_is_an_error_not_a_todo_fallback() {
+    let error = required_project_issue_status(None, "Status", 42).unwrap_err();
+    assert!(error.to_string().contains("missing"));
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to use GitHub open/closed state")
+    );
+}
+
+#[test]
+fn configured_project_status_is_the_state_used_for_ready_and_backlog_transitions() {
+    let ready = required_project_issue_status(Some("Ready".into()), "Status", 42).unwrap();
+    let backlog = required_project_issue_status(Some("Backlog".into()), "Status", 42).unwrap();
+
+    assert_eq!(ready, "Ready");
+    assert_eq!(backlog, "Backlog");
+    assert_ne!(
+        backlog, "Ready",
+        "an open GitHub issue in Backlog is ineligible for Ready"
     );
 }
 

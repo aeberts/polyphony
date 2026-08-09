@@ -62,10 +62,18 @@ pub struct AddCommentToPullRequest;
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "src/schema.graphql",
-    query_path = "src/project_workflow.graphql",
+    query_path = "src/resolve_user_project_context.graphql",
     response_derives = "Debug, Serialize, Deserialize"
 )]
-pub struct ResolveProjectIssueContext;
+pub struct ResolveUserProjectIssueContext;
+
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/schema.graphql",
+    query_path = "src/resolve_organization_project_context.graphql",
+    response_derives = "Debug, Serialize, Deserialize"
+)]
+pub struct ResolveOrganizationProjectIssueContext;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -415,15 +423,21 @@ impl GithubIssueTracker {
             .id
             .parse::<u64>()
             .map_err(|error| CoreError::Adapter(error.to_string()))?;
+        // GitHub returns a GraphQL error for `organization(login:)` when the
+        // configured owner is a user. Resolve the user form first (which is
+        // null-safe for an organization) and only query the organization form
+        // when no user-owned project exists.
         let response = self
-            .graphql::<resolve_project_issue_context::ResponseData, _>(
-                ResolveProjectIssueContext::build_query(resolve_project_issue_context::Variables {
-                    owner: self.owner.clone(),
-                    repo: self.repo.clone(),
-                    number: issue_number as i64,
-                    project_owner: project.owner.clone(),
-                    project_number: project.number as i64,
-                }),
+            .graphql::<resolve_user_project_issue_context::ResponseData, _>(
+                ResolveUserProjectIssueContext::build_query(
+                    resolve_user_project_issue_context::Variables {
+                        owner: self.owner.clone(),
+                        repo: self.repo.clone(),
+                        number: issue_number as i64,
+                        project_owner: project.owner.clone(),
+                        project_number: project.number as i64,
+                    },
+                ),
             )
             .await?;
         let data = response
@@ -435,8 +449,32 @@ impl GithubIssueTracker {
             .and_then(|repo| repo.issue.as_ref())
             .map(|issue| issue.id.clone())
             .ok_or_else(|| CoreError::Adapter("github issue node id not found".into()))?;
-        let project_id = project_id_from_context(&data)
-            .ok_or_else(|| CoreError::Adapter("github project id not found".into()))?;
+        let project_id = if let Some(project_id) = user_project_id_from_context(&data) {
+            project_id
+        } else {
+            let response = self
+                .graphql::<resolve_organization_project_issue_context::ResponseData, _>(
+                    ResolveOrganizationProjectIssueContext::build_query(
+                        resolve_organization_project_issue_context::Variables {
+                            owner: self.owner.clone(),
+                            repo: self.repo.clone(),
+                            number: issue_number as i64,
+                            project_owner: project.owner.clone(),
+                            project_number: project.number as i64,
+                        },
+                    ),
+                )
+                .await?;
+            let data = response.data.ok_or_else(|| {
+                CoreError::Adapter("github organization project context missing data".into())
+            })?;
+            organization_project_id_from_context(&data).ok_or_else(|| {
+                CoreError::Adapter(format!(
+                    "github project {}/{} not found as a user-owned or organization-owned project",
+                    project.owner, project.number
+                ))
+            })?
+        };
         Ok(Some(ProjectContext {
             issue_node_id,
             project_id,
@@ -515,10 +553,12 @@ impl GithubIssueTracker {
         let data = response
             .data
             .ok_or_else(|| CoreError::Adapter("github project issue status missing data".into()))?;
-        Ok(project_issue_status_from_response(
-            &data,
-            &context.project_id,
-        ))
+        required_project_issue_status(
+            project_issue_status_from_response(&data, &context.project_id),
+            &project.status_field_name,
+            issue.number,
+        )
+        .map(Some)
     }
 }
 
