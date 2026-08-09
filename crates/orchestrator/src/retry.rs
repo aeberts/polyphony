@@ -91,6 +91,19 @@ impl RuntimeService {
             self.release_issue(&issue_id);
             return;
         };
+        if workflow.config.tracker.stop_when_ineligible
+            && !workflow.config.is_active_state(&issue.state)
+        {
+            self.release_issue(&issue_id);
+            self.push_event(
+                EventScope::Retry,
+                format!(
+                    "{} retry skipped: eligibility revoked (state: {})",
+                    issue.identifier, issue.state
+                ),
+            );
+            return;
+        }
         if !self.has_available_slot(&workflow, &issue.state) {
             self.schedule_retry(
                 issue.id.clone(),

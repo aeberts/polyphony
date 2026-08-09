@@ -649,6 +649,7 @@ impl RuntimeService {
         let active_states = workflow.config.tracker.active_states.clone();
         let max_turns = workflow.config.agent.max_turns;
         let started_at = Utc::now();
+        let (stop_tx, stop_rx) = watch::channel(None);
         let selected_agent_for_task = selected_agent.clone();
         let workspace_path_for_running = workspace_path.clone();
 
@@ -691,6 +692,7 @@ impl RuntimeService {
                     workflow.config.agent.continuation_prompt.clone(),
                     selected_agent_for_task,
                     prior_context,
+                    stop_rx,
                     command_tx.clone(),
                 )
                 .await;
@@ -740,6 +742,7 @@ impl RuntimeService {
             last_reported_tokens: TokenUsage::default(),
             turn_count: 0,
             rate_limits: None,
+            stop_tx,
             handle,
             active_task_id,
             run_id,

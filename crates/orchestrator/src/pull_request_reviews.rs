@@ -392,6 +392,7 @@ impl RuntimeService {
         let issue_identifier_for_task = issue.identifier.clone();
         let issue_id_for_task = issue.id.clone();
         let workspace_path_for_task = workspace_path.clone();
+        let (stop_tx, stop_rx) = watch::channel(None);
         let review_agent_for_task = review_agent.clone();
         let worker_span = info_span!(
             "pull_request_review_worker",
@@ -426,6 +427,7 @@ impl RuntimeService {
                     workflow.config.agent.continuation_prompt.clone(),
                     review_agent_for_task,
                     None,
+                    stop_rx,
                     command_tx.clone(),
                 )
                 .await;
@@ -469,6 +471,7 @@ impl RuntimeService {
             last_reported_tokens: TokenUsage::default(),
             turn_count: 0,
             rate_limits: None,
+            stop_tx,
             handle,
             active_task_id: Some(review_task_id.to_string()),
             run_id: Some(run_id.to_string()),

@@ -295,6 +295,7 @@ struct RunningTask {
     last_reported_tokens: TokenUsage,
     turn_count: u32,
     rate_limits: Option<Value>,
+    stop_tx: watch::Sender<Option<String>>,
     handle: JoinHandle<()>,
     /// Set when this running task is part of a pipeline.
     active_task_id: Option<TaskId>,

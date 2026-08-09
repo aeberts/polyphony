@@ -149,6 +149,42 @@ impl RuntimeService {
         }
     }
 
+    pub(crate) async fn request_eligibility_stop(&mut self, issue_id: &str, reason: String) {
+        let Some(running) = self.state.running.get(issue_id) else {
+            return;
+        };
+        if running.stop_tx.borrow().is_some() {
+            return;
+        }
+        if running.stop_tx.send(Some(reason.clone())).is_err() {
+            warn!(%issue_id, "worker stop requested after worker task exited");
+        }
+        self.state.retrying.remove(issue_id);
+        self.state.pull_request_retry_events.remove(issue_id);
+
+        if let Some(run) = self
+            .state
+            .runs
+            .values_mut()
+            .find(|run| run.issue_id.as_deref() == Some(issue_id))
+        {
+            run.status = RunStatus::Cancelled;
+            run.cancel_reason = Some(reason.clone());
+            run.push_log(
+                polyphony_core::RunLogScope::Reconciliation,
+                format!("stop requested: {reason}"),
+            );
+            run.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                let _ = store.save_run(run).await;
+            }
+        }
+        self.push_event(
+            EventScope::Reconcile,
+            format!("stop requested {issue_id}: {reason}"),
+        );
+    }
+
     pub(crate) async fn stop_running(
         &mut self,
         issue_id: &str,

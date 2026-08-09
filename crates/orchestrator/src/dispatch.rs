@@ -93,6 +93,14 @@ impl RuntimeService {
                         format!("stopped: issue reached terminal state: {}", issue.state),
                     );
                 }
+            } else if workflow.config.tracker.stop_when_ineligible
+                && !workflow.config.is_active_state(&issue.state)
+            {
+                let reason = format!(
+                    "eligibility revoked: issue state changed to {}",
+                    issue.state
+                );
+                self.request_eligibility_stop(&issue.id, reason).await;
             } else {
                 // Non-terminal state: always refresh the issue snapshot. We
                 // intentionally do NOT cancel sessions for unrecognized states
@@ -287,6 +295,7 @@ impl RuntimeService {
         );
         let workspace_path = workspace.path.clone();
         let started_at = Utc::now();
+        let (stop_tx, stop_rx) = watch::channel(None);
         let selected_agent_for_task = selected_agent.clone();
         if saved_context
             .as_ref()
@@ -356,6 +365,7 @@ impl RuntimeService {
                     workflow.config.agent.continuation_prompt.clone(),
                     selected_agent_for_task,
                     saved_context,
+                    stop_rx,
                     command_tx.clone(),
                 )
                 .await;
@@ -405,6 +415,7 @@ impl RuntimeService {
             last_reported_tokens: TokenUsage::default(),
             turn_count: 0,
             rate_limits: None,
+            stop_tx,
             handle,
             active_task_id: None,
             run_id: None,

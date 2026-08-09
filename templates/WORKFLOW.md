@@ -36,6 +36,11 @@ tracker:
   #   - Done
   #   - Cancelled
 
+  # When true, moving a running issue out of active_states stops its current
+  # worker as well as preventing future dispatch. Disabled by default to
+  # preserve Polyphony's upstream reconciliation behavior.
+  # stop_when_ineligible: false
+
   # API key for the tracker. Prefer setting this in polyphony.toml or
   # as an environment variable (GITHUB_TOKEN / LINEAR_API_KEY) to avoid
   # checking secrets into the repository.
