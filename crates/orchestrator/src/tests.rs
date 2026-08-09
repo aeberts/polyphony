@@ -128,6 +128,82 @@ impl TestTracker {
     }
 }
 
+/// Models the error emitted by the GitHub Project-v2 adapter when its configured
+/// Status field is blank.  The orchestrator must treat this tracker-poll error
+/// as a hard dispatch boundary.
+#[derive(Clone)]
+struct GithubBlankProjectStatusTracker {
+    project_status: String,
+    candidate_polls: Arc<Mutex<u32>>,
+    acknowledgements: Arc<Mutex<Vec<String>>>,
+}
+
+impl GithubBlankProjectStatusTracker {
+    fn with_project_status(project_status: impl Into<String>) -> Self {
+        Self {
+            project_status: project_status.into(),
+            candidate_polls: Arc::new(Mutex::new(0)),
+            acknowledgements: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn candidate_polls(&self) -> u32 {
+        *self.candidate_polls.lock().unwrap()
+    }
+
+    fn acknowledgements(&self) -> Vec<String> {
+        self.acknowledgements.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl IssueTracker for GithubBlankProjectStatusTracker {
+    fn component_key(&self) -> String {
+        "tracker:github-project-status-mock".into()
+    }
+
+    async fn fetch_candidate_issues(
+        &self,
+        _query: &polyphony_core::TrackerQuery,
+    ) -> Result<Vec<Issue>, polyphony_core::Error> {
+        *self.candidate_polls.lock().unwrap() += 1;
+        if self.project_status.trim().is_empty() {
+            return Err(polyphony_core::Error::Adapter(
+                "GitHub Project Status is missing or empty; refusing to use GitHub open/closed state"
+                    .into(),
+            ));
+        }
+        Ok(Vec::new())
+    }
+
+    async fn fetch_issues_by_states(
+        &self,
+        _project_slug: Option<&str>,
+        _states: &[String],
+    ) -> Result<Vec<Issue>, polyphony_core::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_issues_by_ids(
+        &self,
+        _issue_ids: &[String],
+    ) -> Result<Vec<Issue>, polyphony_core::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn fetch_issue_states_by_ids(
+        &self,
+        _issue_ids: &[String],
+    ) -> Result<Vec<polyphony_core::IssueStateUpdate>, polyphony_core::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn acknowledge_issue(&self, issue: &Issue) -> Result<(), polyphony_core::Error> {
+        self.acknowledgements.lock().unwrap().push(issue.id.clone());
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl IssueTracker for TestTracker {
     fn component_key(&self) -> String {
@@ -3097,6 +3173,86 @@ async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
     assert!(
         !service.should_dispatch(&workflow_rx.borrow(), &tracker_issue),
         "an otherwise-open Backlog issue must not be dispatched when only Ready is active"
+    );
+}
+
+#[tokio::test]
+async fn github_blank_project_status_poll_error_never_dispatches_or_acknowledges_retry() {
+    let workspace_root = unique_workspace_root("github-blank-project-status");
+    let issue = sample_issue("42", "POLY-42", "Ready", "Project status fixture");
+    let tracker = GithubBlankProjectStatusTracker::with_project_status("  ");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: github\n  repository: repo-owner/repo\n  api_key: test-token\n  active_states: [Ready]\n  stop_when_ineligible: true\nworkspace:\n  root: __ROOT__\nagents:\n  default: mock\n  profiles:\n    mock:\n      kind: mock\n      transport: mock\n      command: mock\n---\nTest prompt\n",
+    );
+    let (_tx, workflow_rx) = watch::channel(workflow);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        workflow_rx,
+    )
+    .0;
+    service.schedule_retry(
+        issue.id.clone(),
+        issue.identifier.clone(),
+        1,
+        Some("fixture retry".into()),
+        false,
+        1_000,
+    );
+
+    service.handle_retry(issue.id.clone()).await;
+
+    assert_eq!(
+        tracker.candidate_polls(),
+        1,
+        "retry must poll the GitHub tracker"
+    );
+    assert!(
+        service.state.running.is_empty(),
+        "poll failure must not start a task"
+    );
+    assert!(
+        service.state.runs.is_empty(),
+        "poll failure must not create a run"
+    );
+    assert!(
+        service.state.tasks.is_empty(),
+        "poll failure must not create tasks"
+    );
+    assert!(
+        service
+            .state
+            .recent_events
+            .iter()
+            .all(|event| event.scope != EventScope::Dispatch),
+        "poll failure must not emit a dispatch event"
+    );
+    assert!(
+        tracker.acknowledgements().is_empty(),
+        "poll failure must not acknowledge the GitHub issue"
+    );
+    let retry = service
+        .state
+        .retrying
+        .get(&issue.id)
+        .expect("poll failure should safely reschedule the retry");
+    assert!(
+        retry
+            .row
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing or empty"),
+        "the retry must retain the GitHub Project Status diagnostic"
     );
 }
 
