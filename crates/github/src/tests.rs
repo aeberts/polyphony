@@ -1,11 +1,21 @@
+use std::sync::{Arc, Mutex};
+
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode as HttpStatusCode, Uri},
+    response::IntoResponse,
+    routing::{get, post},
+};
 use chrono::{TimeZone, Utc};
 use graphql_client::GraphQLQuery;
 use octocrab::models::AuthorAssociation;
-use polyphony_core::DispatchApprovalState;
+use polyphony_core::{DispatchApprovalState, IssueTracker, TrackerQuery};
 use reqwest::{
     StatusCode,
     header::{HeaderMap, HeaderValue, RETRY_AFTER},
 };
+use serde_json::{Value, json};
 
 use crate::{
     convert::{
@@ -23,6 +33,168 @@ use crate::{
         pull_request_review_events_from_responses, should_emit_conflict_event,
     },
 };
+
+#[derive(Clone)]
+struct ProjectStatusMock {
+    statuses: Arc<Mutex<Vec<String>>>,
+}
+
+async fn mock_github_issue() -> Json<Value> {
+    Json(json!({
+        "id": 42,
+        "node_id": "I_42",
+        "url": "http://example.test/issues/42",
+        "repository_url": "http://example.test/repos/repo-owner/repo",
+        "labels_url": "http://example.test/issues/42/labels",
+        "comments_url": "http://example.test/issues/42/comments",
+        "events_url": "http://example.test/issues/42/events",
+        "html_url": "http://example.test/issues/42",
+        "number": 42,
+        "state": "open",
+        "state_reason": null,
+        "title": "Project-status fixture",
+        "body": null,
+        "user": {
+            "login": "repo-owner", "id": 1, "node_id": "U_1",
+            "avatar_url": "http://example.test/avatar", "gravatar_id": "",
+            "url": "http://example.test/users/repo-owner",
+            "html_url": "http://example.test/repo-owner",
+            "followers_url": "http://example.test/followers",
+            "following_url": "http://example.test/following",
+            "gists_url": "http://example.test/gists",
+            "starred_url": "http://example.test/starred",
+            "subscriptions_url": "http://example.test/subscriptions",
+            "organizations_url": "http://example.test/organizations",
+            "repos_url": "http://example.test/repos",
+            "events_url": "http://example.test/events",
+            "received_events_url": "http://example.test/received-events",
+            "type": "User", "site_admin": false, "name": null, "patch_url": null,
+            "email": null
+        },
+        "labels": [], "assignee": null, "assignees": [],
+        "author_association": "OWNER", "milestone": null, "locked": false,
+        "active_lock_reason": null, "comments": 0, "pull_request": null,
+        "closed_at": null, "closed_by": null,
+        "created_at": "2025-01-01T00:00:00Z",
+        "updated_at": "2025-01-01T00:00:00Z"
+    }))
+}
+
+async fn mock_github_issues() -> Json<Value> {
+    Json(json!([mock_github_issue().await.0]))
+}
+
+async fn mock_graphql(
+    State(state): State<ProjectStatusMock>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let operation = body["operationName"].as_str().unwrap_or_default();
+    let payload = match operation {
+        "ResolveUserProjectIssueContext" => json!({"data": {
+            "repository": {"issue": {"id": "I_42"}},
+            "user": {"projectV2": {"id": "P_USER"}}
+        }}),
+        "ResolveProjectIssueStatus" => {
+            let status = state.statuses.lock().unwrap().remove(0);
+            json!({"data": {"repository": {"issue": {"projectItems": {"nodes": [{
+                "project": {"id": "P_USER"},
+                "fieldValueByName": {
+                    "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                    "name": status
+                }
+            }]}}}}})
+        },
+        unexpected => panic!("unexpected GraphQL operation: {unexpected}"),
+    };
+    Json(payload)
+}
+
+async fn mock_not_found(_uri: Uri) -> impl IntoResponse {
+    (HttpStatusCode::NOT_FOUND, "unexpected GitHub mock request")
+}
+
+async fn project_status_tracker(statuses: Vec<&str>) -> crate::GithubIssueTracker {
+    let state = ProjectStatusMock {
+        statuses: Arc::new(Mutex::new(
+            statuses.into_iter().map(str::to_owned).collect(),
+        )),
+    };
+    let app = Router::new()
+        .route("/repos/{owner}/{repo}/issues", get(mock_github_issues))
+        .route(
+            "/repos/{owner}/{repo}/issues/{number}",
+            get(mock_github_issue),
+        )
+        .route("/graphql", post(mock_graphql))
+        .fallback(mock_not_found)
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    crate::GithubIssueTracker::new_for_test(
+        "repo-owner/repo".into(),
+        "project-user".into(),
+        1,
+        base_url,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn tracker_uses_project_status_for_candidate_polling_and_reconciliation() {
+    let tracker = project_status_tracker(vec!["Ready", "Backlog"]).await;
+    let candidates = tracker
+        .fetch_candidate_issues(&TrackerQuery {
+            project_slug: None,
+            repository: None,
+            active_states: vec!["Ready".into()],
+            terminal_states: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].state, "Ready");
+
+    let updates = tracker
+        .fetch_issue_states_by_ids(&["42".into()])
+        .await
+        .unwrap();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].state, "Backlog");
+    assert_ne!(updates[0].state, "Ready");
+}
+
+#[tokio::test]
+async fn tracker_rejects_empty_project_status_for_candidates_and_reconciliation() {
+    let tracker = project_status_tracker(vec!["  ", "\t"]).await;
+    let candidate_error = tracker
+        .fetch_candidate_issues(&TrackerQuery {
+            project_slug: None,
+            repository: None,
+            active_states: vec!["Ready".into()],
+            terminal_states: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(candidate_error.to_string().contains("missing or empty"));
+    assert!(
+        candidate_error
+            .to_string()
+            .contains("refusing to use GitHub open/closed state")
+    );
+
+    let reconciliation_error = tracker
+        .fetch_issue_states_by_ids(&["42".into()])
+        .await
+        .unwrap_err();
+    assert!(
+        reconciliation_error
+            .to_string()
+            .contains("missing or empty")
+    );
+}
 
 #[test]
 fn user_owned_project_query_never_requests_an_organization() {

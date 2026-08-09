@@ -205,9 +205,9 @@ pub(crate) fn required_project_issue_status(
     field_name: &str,
     issue_number: u64,
 ) -> Result<String, CoreError> {
-    status.ok_or_else(|| {
+    status.filter(|status| !status.trim().is_empty()).ok_or_else(|| {
         CoreError::Adapter(format!(
-            "github project item or `{field_name}` status is missing for issue #{issue_number}; refusing to use GitHub open/closed state"
+            "github project item or `{field_name}` status is missing or empty for issue #{issue_number}; refusing to use GitHub open/closed state"
         ))
     })
 }

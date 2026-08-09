@@ -127,6 +127,7 @@ pub struct FetchPullRequestEvents;
 pub struct GithubIssueTracker {
     crab: Octocrab,
     http: reqwest::Client,
+    api_base_url: String,
     token: Option<String>,
     owner: String,
     repo: String,
@@ -193,10 +194,43 @@ impl GithubIssueTracker {
         Ok(Self {
             crab,
             http: reqwest::Client::new(),
+            api_base_url: "https://api.github.com".into(),
             token,
             owner,
             repo,
             project,
+            request_count: AtomicU64::new(0),
+            last_rate_limit: Mutex::new(None),
+            viewer_login: Mutex::new(ViewerLoginCache::Unknown),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        repository: String,
+        project_owner: String,
+        project_number: u32,
+        api_base_url: String,
+    ) -> Result<Self, CoreError> {
+        let (owner, repo) = split_repo(&repository)?;
+        let crab = Octocrab::builder()
+            .personal_token("test-token")
+            .base_uri(api_base_url.as_str())
+            .map_err(|error| CoreError::Adapter(error.to_string()))?
+            .build()
+            .map_err(|error| CoreError::Adapter(error.to_string()))?;
+        Ok(Self {
+            crab,
+            http: reqwest::Client::new(),
+            api_base_url,
+            token: Some("test-token".into()),
+            owner,
+            repo,
+            project: Some(GithubProjectConfig {
+                owner: project_owner,
+                number: project_number,
+                status_field_name: "Status".into(),
+            }),
             request_count: AtomicU64::new(0),
             last_rate_limit: Mutex::new(None),
             viewer_login: Mutex::new(ViewerLoginCache::Unknown),
@@ -384,7 +418,10 @@ impl GithubIssueTracker {
             .ok_or_else(|| CoreError::Adapter("github token is required".into()))?;
         let response = self
             .http
-            .post("https://api.github.com/graphql")
+            .post(format!(
+                "{}/graphql",
+                self.api_base_url.trim_end_matches('/')
+            ))
             .bearer_auth(token)
             .header("User-Agent", "polyphony")
             .json(&body)
