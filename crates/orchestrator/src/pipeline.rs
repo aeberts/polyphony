@@ -2164,6 +2164,58 @@ impl RuntimeService {
             return Ok(());
         }
 
+        if is_qa && matches!(qa_result.as_ref(), Some(Ok((true, _)))) {
+            let passed_qa_ordinal = task_snapshot
+                .as_ref()
+                .map(|task| task.ordinal)
+                .unwrap_or(u32::MAX);
+            if let Some(tasks) = self.state.tasks.get_mut(run_id) {
+                for task in tasks.iter_mut().filter(|task| {
+                    task.status == TaskStatus::Pending
+                        && task.ordinal > passed_qa_ordinal
+                        && matches!(
+                            task.role,
+                            polyphony_core::PipelineTaskRole::Qa
+                                | polyphony_core::PipelineTaskRole::Repair
+                        )
+                }) {
+                    task.status = TaskStatus::Cancelled;
+                    task.error = Some("QA PASS completed the closed-loop delivery".into());
+                    task.finished_at = Some(now);
+                    task.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_task(task).await?;
+                    }
+                }
+            }
+            if let Some(run) = self.state.runs.get_mut(run_id) {
+                for step in &mut run.steps {
+                    if step.kind == polyphony_core::StepKind::AgentRun
+                        && step.task_id.as_deref().is_some_and(|task_id| {
+                            self.state.tasks.get(run_id).is_some_and(|tasks| {
+                                tasks.iter().any(|task| {
+                                    task.id == task_id && task.status == TaskStatus::Cancelled
+                                })
+                            })
+                        })
+                    {
+                        step.mark_skipped();
+                    }
+                }
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    "closed-loop QA PASS completed delivery; remaining repair and QA stages were cancelled",
+                );
+                run.updated_at = now;
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+            return self
+                .complete_pipeline(&self.workflow(), issue, run_id)
+                .await;
+        }
+
         if matches!(outcome.status, AttemptStatus::Succeeded) {
             self.dispatch_next_task(
                 self.workflow(),

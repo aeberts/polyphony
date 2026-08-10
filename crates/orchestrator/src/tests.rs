@@ -1097,6 +1097,19 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
     ) -> Result<AgentRunResult, polyphony_core::Error> {
         self.calls.lock().unwrap().push(spec.agent.name.clone());
         let final_issue_state = if spec.agent.name == "qa" {
+            if spec.issue.identifier == "QA-DIRECT" {
+                return Ok(AgentRunResult {
+                    status: AttemptStatus::Succeeded,
+                    turns_completed: 1,
+                    error: None,
+                    final_issue_state: Some(
+                        "QA PASS: fixture confirmed the direct implementation\n\
+                         tests run: focused fixture\n\
+                         checks: 1, 2, 3, 4, 5"
+                            .into(),
+                    ),
+                });
+            }
             let mut attempts = self.qa_attempts.lock().unwrap();
             *attempts += 1;
             Some(if *attempts < self.qa_pass_after {
@@ -6621,6 +6634,102 @@ async fn closed_loop_pack_stops_after_two_repairs_and_a_third_qa_failure() {
         "limit state must not re-dispatch"
     );
     assert!(!service.state.running.contains_key("issue-repair-limit"));
+}
+
+#[tokio::test]
+async fn two_approved_issues_isolate_direct_pass_and_repaired_pass_across_restart() {
+    let workspace_root = unique_workspace_root("two-issue-closed-loop");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\nagent:\n  max_concurrent_agents: 2\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n---\nTwo-issue fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let mut direct = sample_issue("issue-direct", "QA-DIRECT", "Todo", "Direct pass");
+    let mut repaired = sample_issue("issue-repaired", "QA-REPAIRED", "Todo", "Repair pass");
+    let checks = "Acceptance checks\n1. implementation\n2. qa\n3. repair\n4. restart\n5. isolation";
+    direct.description = Some(checks.into());
+    repaired.description = Some(checks.into());
+    let tracker = TestTracker::new(vec![direct.clone(), repaired.clone()]);
+    let agent = ClosedLoopQaFixtureAgent::default();
+    let agent_handle = agent.clone();
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+    service
+        .dispatch_pipeline(workflow.clone(), direct.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    service
+        .dispatch_pipeline(workflow.clone(), repaired.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.state.running.len(),
+        2,
+        "configured limit permits both approved issues"
+    );
+    for _ in 0..6 {
+        handle_next_worker_message(&mut service).await;
+    }
+    let direct_run = service
+        .state
+        .runs
+        .values()
+        .find(|run| run.issue_id.as_deref() == Some(&direct.id))
+        .unwrap();
+    let repaired_run = service
+        .state
+        .runs
+        .values()
+        .find(|run| run.issue_id.as_deref() == Some(&repaired.id))
+        .unwrap();
+    assert_eq!(direct_run.status, RunStatus::Delivered);
+    assert_eq!(repaired_run.status, RunStatus::Delivered);
+    assert!(
+        service.state.tasks[&direct_run.id]
+            .iter()
+            .skip(2)
+            .all(|task| task.status == TaskStatus::Cancelled)
+    );
+    assert_eq!(
+        service.state.tasks[&repaired_run.id]
+            .iter()
+            .filter(|task| task.role == polyphony_core::PipelineTaskRole::Repair
+                && task.status == TaskStatus::Completed)
+            .count(),
+        1
+    );
+    let restored_runs: Vec<Run> = serde_json::from_value(
+        serde_json::to_value(service.state.runs.values().cloned().collect::<Vec<_>>()).unwrap(),
+    )
+    .unwrap();
+    let restored_tasks: Vec<Vec<Task>> = serde_json::from_value(
+        serde_json::to_value(service.state.tasks.values().cloned().collect::<Vec<_>>()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored_runs.len(), 2);
+    assert!(restored_tasks.iter().flatten().any(|task| {
+        task.activity_log
+            .iter()
+            .any(|entry| entry.contains("QA PASS"))
+    }));
+    assert_eq!(
+        agent_handle.calls().len(),
+        6,
+        "restart record contains no duplicate dispatch"
+    );
+    assert_eq!(tracker.recorded_comments().len(), 6);
 }
 
 #[tokio::test]

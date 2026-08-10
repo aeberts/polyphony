@@ -1147,6 +1147,11 @@ impl RuntimeService {
             // After all tasks complete, run success handoff
             let pipeline_done = self.state.runs.get(&run_id).is_some_and(|run| {
                 run.status == RunStatus::Delivered
+                    && !run.activity_log.iter().any(|entry| {
+                        entry
+                            .message
+                            .contains("closed-loop QA PASS completed delivery")
+                    })
                     || (run.status == RunStatus::Review
                         && !run.activity_log.iter().any(|entry| {
                             entry.message.contains("closed-loop repair limit reached")
