@@ -9,10 +9,10 @@ use std::{
 
 use async_trait::async_trait;
 use polyphony_core::{
-    AddIssueCommentRequest, AgentSession, CreateIssueRequest, Deliverable, DeliverableDecision, DeliverableKind,
-    DeliverableStatus, DispatchMode, IssueAuthor, IssueComment, IssueStateUpdate, PullRequestRef,
-    StepStatus, StoreBootstrap, UpdateIssueRequest, Workspace, WorkspaceCommitResult,
-    WorkspaceRequest,
+    AddIssueCommentRequest, AgentSession, CreateIssueRequest, Deliverable, DeliverableDecision,
+    DeliverableKind, DeliverableStatus, DispatchMode, IssueAuthor, IssueComment, IssueStateUpdate,
+    PullRequestRef, StepStatus, StoreBootstrap, UpdateIssueRequest, Workspace,
+    WorkspaceCommitResult, WorkspaceRequest,
 };
 use polyphony_workflow::load_workflow;
 use serde_json::json;
@@ -329,7 +329,11 @@ impl IssueTracker for TestTracker {
             id: format!("comment-{}", self.comments.lock().unwrap().len()),
             body: request.body.clone(),
             author: None,
-            url: Some(format!("https://tracker.test/issues/{}/comments/{}", request.id, self.comments.lock().unwrap().len())),
+            url: Some(format!(
+                "https://tracker.test/issues/{}/comments/{}",
+                request.id,
+                self.comments.lock().unwrap().len()
+            )),
             created_at: Some(Utc::now()),
             updated_at: None,
         })
@@ -1052,14 +1056,35 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
             let mut attempts = self.qa_attempts.lock().unwrap();
             *attempts += 1;
             Some(if *attempts == 1 {
-                "QA FAIL: fixture found the implementation marker is incomplete".into()
+                "QA FAIL: fixture found the implementation marker is incomplete\n\
+                 tests run: focused fixture\n\
+                 checks: 1, 2, 3, 4, 5"
+                    .into()
             } else {
-                "QA PASS: checks: 1, 2, 3, 4, 5; fixture confirmed the repair marker and focused checks".into()
+                "QA PASS: fixture confirmed the repair marker and focused checks\n\
+                 tests run: focused fixture\n\
+                 checks: 1, 2, 3, 4, 5"
+                    .into()
             })
         } else if spec.agent.name == "repair" {
-            Some("REPAIR NOTE: commit: fixture-repair; checks: 3, 4; tests: focused fixture".into())
+            Some(
+                "REPAIR NOTE:\n\
+                  what fixed: completed the missing fixture marker\n\
+                  commit: fixture-repair\n\
+                  tests run: focused fixture\n\
+                  recheck: independent QA checks 1 through 5\n\
+                  checks: 3, 4"
+                    .into(),
+            )
         } else {
-            Some("IMPLEMENTATION NOTE: commit: fixture-implementation; checks: 1, 2; tests: focused fixture".into())
+            Some(
+                "IMPLEMENTATION NOTE:\n\
+                  what changed: added the fixture implementation marker\n\
+                  commit: fixture-implementation\n\
+                  tests run: focused fixture\n\
+                  checks: 1, 2"
+                    .into(),
+            )
         };
         Ok(AgentRunResult {
             status: AttemptStatus::Succeeded,
@@ -6051,10 +6076,37 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
             .all(|task| task.status != TaskStatus::Pending)
     );
     let comments = tracker.recorded_comments();
-    assert_eq!(comments.len(), 4, "restart must retain rather than duplicate evidence notes");
-    assert!(comments.iter().any(|note| note.body.contains("implementation note")));
-    assert!(comments.iter().any(|note| note.body.contains("repair note")));
-    assert_eq!(comments.iter().filter(|note| note.body.contains("QA note")).count(), 2);
+    assert_eq!(
+        comments.len(),
+        4,
+        "restart must retain rather than duplicate evidence notes"
+    );
+    assert!(
+        comments
+            .iter()
+            .any(|note| note.body.contains("implementation note"))
+    );
+    assert!(
+        comments
+            .iter()
+            .any(|note| note.body.contains("repair note"))
+    );
+    assert_eq!(
+        comments
+            .iter()
+            .filter(|note| note.body.contains("QA note"))
+            .count(),
+        2
+    );
+    assert!(
+        comments.iter().all(|note| {
+            note.body.contains("tests run:")
+                && note.body.contains("checks:")
+                && note.body.contains("Role:")
+                && note.body.contains("Task:")
+        }),
+        "tracker comments must retain a readable evidence checklist and role context"
+    );
 }
 
 #[tokio::test]
@@ -6065,15 +6117,33 @@ async fn qa_failure_does_not_dispatch_repair_when_tracker_cannot_record_repair_n
         "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n---\nFail-closed QA fixture\n",
     );
     let (_tx, rx) = watch::channel(workflow.clone());
-    let issue = sample_issue("issue-qa-fail-closed", "QA-FAIL-CLOSED", "Todo", "QA failure");
+    let issue = sample_issue(
+        "issue-qa-fail-closed",
+        "QA-FAIL-CLOSED",
+        "Todo",
+        "QA failure",
+    );
     let tracker = TestTracker::new(vec![issue.clone()])
         .fail_workflow_status_updates("simulated tracker status outage");
     let mut service = RuntimeService::new(
-        Arc::new(tracker.clone()), None, Arc::new(NoopAgent),
-        Arc::new(RecordingProvisioner::default()), None, None, None, None, None, None, rx,
-    ).0;
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
 
-    service.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None).await.unwrap();
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
     let run_id = service.state.runs.keys().next().unwrap().clone();
     let task_id = service.state.tasks[&run_id][0].id.clone();
     service.state.running.remove(&issue.id);
@@ -6081,16 +6151,41 @@ async fn qa_failure_does_not_dispatch_repair_when_tracker_cannot_record_repair_n
         status: AttemptStatus::Succeeded,
         turns_completed: 1,
         error: None,
-        final_issue_state: Some("QA FAIL: tracker status mutation must be durable".into()),
+        final_issue_state: Some(
+            "QA FAIL: tracker status mutation must be durable\n\
+            tests run: focused fixture\n\
+            checks: 1"
+                .into(),
+        ),
     };
-    service.handle_task_finished(&workflow, &issue, &run_id, &task_id, &workspace_root, &failed_qa, None).await.unwrap();
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &failed_qa,
+            None,
+        )
+        .await
+        .unwrap();
 
     assert_eq!(service.state.runs[&run_id].status, RunStatus::Failed);
     assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
     assert_eq!(service.state.tasks[&run_id][1].status, TaskStatus::Pending);
-    assert!(!service.state.running.contains_key(&issue.id), "repair must not be dispatched after an unrecorded QA failure");
+    assert!(
+        !service.state.running.contains_key(&issue.id),
+        "repair must not be dispatched after an unrecorded QA failure"
+    );
     assert!(tracker.recorded_workflow_updates().is_empty());
-    assert!(service.state.runs[&run_id].activity_log.iter().any(|log| log.message.contains("Repair Needed failed") && log.message.contains("not dispatched")));
+    assert!(
+        service.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|log| log.message.contains("Repair Needed failed")
+                && log.message.contains("not dispatched"))
+    );
 }
 
 #[tokio::test]
@@ -6101,14 +6196,32 @@ async fn restart_crash_window_reconciles_existing_evidence_marker_without_duplic
         "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n---\nEvidence reconciliation fixture\n",
     );
     let (_tx, rx) = watch::channel(workflow.clone());
-    let issue = sample_issue("issue-evidence-reconcile", "EVIDENCE-RECONCILE", "Todo", "Publication recovery");
+    let issue = sample_issue(
+        "issue-evidence-reconcile",
+        "EVIDENCE-RECONCILE",
+        "Todo",
+        "Publication recovery",
+    );
     let tracker = TestTracker::new(vec![issue.clone()]);
     let mut service = RuntimeService::new(
-        Arc::new(tracker.clone()), None, Arc::new(NoopAgent),
-        Arc::new(RecordingProvisioner::default()), None, None, None, None, None, None, rx,
-    ).0;
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
 
-    service.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None).await.unwrap();
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
     let run_id = service.state.runs.keys().next().unwrap().clone();
     let task_id = service.state.tasks[&run_id][0].id.clone();
     service.state.running.remove(&issue.id);
@@ -6125,13 +6238,42 @@ async fn restart_crash_window_reconciles_existing_evidence_marker_without_duplic
         status: AttemptStatus::Succeeded,
         turns_completed: 1,
         error: None,
-        final_issue_state: Some("IMPLEMENTATION NOTE: tracker note survived crash".into()),
+        final_issue_state: Some(
+            "IMPLEMENTATION NOTE: tracker note survived crash\n\
+            what changed: verified the crash-window tracker marker\n\
+            commit: none — no code change\n\
+            tests run: focused fixture\n\
+            checks: 1"
+                .into(),
+        ),
     };
-    service.handle_task_finished(&workflow, &restarted_issue, &run_id, &task_id, &workspace_root, &completed, None).await.unwrap();
+    service
+        .handle_task_finished(
+            &workflow,
+            &restarted_issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &completed,
+            None,
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Completed);
-    assert!(tracker.recorded_comments().is_empty(), "existing marker must prevent a duplicate evidence comment");
-    assert!(service.state.runs[&run_id].activity_log.iter().any(|log| log.message.contains("not posting a duplicate")));
+    assert_eq!(
+        service.state.tasks[&run_id][0].status,
+        TaskStatus::Completed
+    );
+    assert!(
+        tracker.recorded_comments().is_empty(),
+        "existing marker must prevent a duplicate evidence comment"
+    );
+    assert!(
+        service.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|log| log.message.contains("not posting a duplicate"))
+    );
 }
 
 #[tokio::test]
@@ -6142,22 +6284,141 @@ async fn closed_loop_implementation_cannot_complete_without_an_implementation_no
         "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n---\nEvidence fixture\n",
     );
     let (_tx, rx) = watch::channel(workflow.clone());
-    let issue = sample_issue("issue-implementation-note", "EV-1", "Todo", "Evidence required");
+    let issue = sample_issue(
+        "issue-implementation-note",
+        "EV-1",
+        "Todo",
+        "Evidence required",
+    );
     let mut service = RuntimeService::new(
         Arc::new(TestTracker::new(vec![issue.clone()])),
         None,
         Arc::new(NoopAgent),
         Arc::new(RecordingProvisioner::default()),
-        None, None, None, None, None, None, rx,
-    ).0;
-    service.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None).await.unwrap();
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
     let run_id = service.state.runs.keys().next().unwrap().clone();
     let task_id = service.state.tasks[&run_id][0].id.clone();
     service.state.running.remove(&issue.id);
-    service.handle_task_finished(&workflow, &issue, &run_id, &task_id, &workspace_root, &AgentRunResult::succeeded(1), None).await.unwrap();
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &AgentRunResult::succeeded(1),
+            None,
+        )
+        .await
+        .unwrap();
     assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
     assert_eq!(service.state.runs[&run_id].status, RunStatus::Failed);
-    assert!(service.state.tasks[&run_id][0].error.as_deref().unwrap().contains("IMPLEMENTATION NOTE"));
+    assert!(
+        service.state.tasks[&run_id][0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("IMPLEMENTATION NOTE")
+    );
+}
+
+#[test]
+fn delivery_evidence_rejects_fake_workers_that_omit_each_required_checklist_field() {
+    let issue = Issue {
+        description: Some("Acceptance checks\n1. first\n2. second".into()),
+        ..sample_issue(
+            "issue-checklist-fields",
+            "EV-FIELDS",
+            "Todo",
+            "Checklist fields",
+        )
+    };
+    let now = Utc::now();
+    let task = |role| Task {
+        id: "task-checklist-fields".into(),
+        run_id: "run-checklist-fields".into(),
+        title: "Checklist evidence".into(),
+        description: None,
+        activity_log: Vec::new(),
+        category: polyphony_core::TaskCategory::Coding,
+        role,
+        status: TaskStatus::InProgress,
+        ordinal: 1,
+        parent_id: None,
+        agent_name: None,
+        session_id: None,
+        thread_id: None,
+        turns_completed: 0,
+        tokens: TokenUsage::default(),
+        started_at: None,
+        finished_at: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let outcome = |note: &str| AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(note.into()),
+    };
+    let cases = [
+        (
+            polyphony_core::PipelineTaskRole::Implementation,
+            "IMPLEMENTATION NOTE:\nwhat changed: added a guard\ncommit: abc123\ntests run: cargo test\nchecks: 1, 2",
+            &["what changed", "commit", "tests run", "checks"][..],
+        ),
+        (
+            polyphony_core::PipelineTaskRole::Repair,
+            "REPAIR NOTE:\nwhat fixed: corrected the guard\ncommit: def456\ntests run: cargo test\nrecheck: QA checks 1 and 2\nchecks: 1, 2",
+            &["what fixed", "commit", "tests run", "recheck", "checks"][..],
+        ),
+        (
+            polyphony_core::PipelineTaskRole::Qa,
+            "QA PASS: all checks pass\ntests run: cargo test\nchecks: 1, 2",
+            &["tests run", "checks"][..],
+        ),
+    ];
+
+    for (role, complete_note, fields) in cases {
+        assert!(
+            RuntimeService::delivery_note(&task(role), &issue, &outcome(complete_note)).is_ok()
+        );
+        for field in fields {
+            let incomplete = complete_note
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{field}:")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = RuntimeService::delivery_note(&task(role), &issue, &outcome(&incomplete))
+                .expect_err("fake worker omission must fail closed");
+            assert!(error.contains(field), "expected {field} in {error}");
+        }
+    }
+
+    // A legitimate non-code result remains possible, but has to say so in
+    // the durable record rather than silently omitting its commit evidence.
+    let no_commit = "IMPLEMENTATION NOTE:\nwhat changed: documented the decision\ncommit: none — no code change\ntests run: not applicable\nchecks: 1";
+    assert!(
+        RuntimeService::delivery_note(
+            &task(polyphony_core::PipelineTaskRole::Implementation),
+            &issue,
+            &outcome(no_commit)
+        )
+        .is_ok()
+    );
 }
 
 #[tokio::test]

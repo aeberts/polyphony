@@ -20,8 +20,18 @@ impl RuntimeService {
             .collect()
     }
 
+    fn evidence_field<'a>(report: &'a str, field: &str) -> Option<&'a str> {
+        report.lines().find_map(|line| {
+            line.trim_start()
+                .strip_prefix(field)
+                .and_then(|value| value.strip_prefix(':'))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+    }
+
     fn evidence_checks(report: &str) -> Vec<String> {
-        let Some((_, values)) = report.split_once("checks:") else {
+        let Some(values) = Self::evidence_field(report, "checks") else {
             return Vec::new();
         };
         values
@@ -33,25 +43,75 @@ impl RuntimeService {
             .collect()
     }
 
-    fn delivery_note(task: &Task, issue: &Issue, outcome: &AgentRunResult) -> Result<String, String> {
+    fn require_evidence_fields(
+        report: &str,
+        fields: &[&str],
+        role: polyphony_core::PipelineTaskRole,
+    ) -> Result<(), String> {
+        let missing = fields
+            .iter()
+            .filter(|field| Self::evidence_field(report, field).is_none())
+            .copied()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} evidence is missing required checklist fields: {}",
+                role,
+                missing.join(", ")
+            ))
+        }
+    }
+
+    pub(crate) fn delivery_note(
+        task: &Task,
+        issue: &Issue,
+        outcome: &AgentRunResult,
+    ) -> Result<String, String> {
         let report = outcome.final_issue_state.as_deref().unwrap_or("").trim();
         let prefix = match task.role {
             polyphony_core::PipelineTaskRole::Implementation => "IMPLEMENTATION NOTE:",
             polyphony_core::PipelineTaskRole::Repair => "REPAIR NOTE:",
-            polyphony_core::PipelineTaskRole::Qa => {
+            polyphony_core::PipelineTaskRole::Qa => match Self::qa_verdict(outcome)? {
                 // qa_verdict validates the PASS/FAIL prefix and non-empty evidence.
-                let (passed, _) = Self::qa_verdict(outcome)?;
-                if !passed {
-                    return Ok(report.to_string());
-                }
-                "QA PASS:"
-            }
+                (true, _) => "QA PASS:",
+                (false, _) => "QA FAIL:",
+            },
         };
         let Some(body) = report.strip_prefix(prefix).map(str::trim) else {
-            return Err(format!("{} completed without required {prefix} evidence", task.role));
+            return Err(format!(
+                "{} completed without required {prefix} evidence",
+                task.role
+            ));
         };
         if body.is_empty() {
-            return Err(format!("{} completed with an empty {prefix} evidence note", task.role));
+            return Err(format!(
+                "{} completed with an empty {prefix} evidence note",
+                task.role
+            ));
+        }
+        match task.role {
+            polyphony_core::PipelineTaskRole::Implementation => {
+                // `commit: none — <reason>` is valid for a non-code outcome;
+                // requiring the field makes that decision auditable without
+                // assuming every delivery necessarily creates a commit.
+                Self::require_evidence_fields(
+                    body,
+                    &["what changed", "commit", "tests run", "checks"],
+                    task.role,
+                )?;
+            },
+            polyphony_core::PipelineTaskRole::Repair => {
+                Self::require_evidence_fields(
+                    body,
+                    &["what fixed", "commit", "tests run", "recheck", "checks"],
+                    task.role,
+                )?;
+            },
+            polyphony_core::PipelineTaskRole::Qa => {
+                Self::require_evidence_fields(body, &["tests run", "checks"], task.role)?;
+            },
         }
         let required = Self::required_acceptance_checks(issue);
         if !required.is_empty() {
@@ -72,7 +132,7 @@ impl RuntimeService {
                 .collect::<Vec<_>>();
             if !missing.is_empty() {
                 return Err(format!(
-                    "QA PASS evidence is incomplete; missing acceptance checks: {}",
+                    "QA evidence is incomplete; missing acceptance checks: {}",
                     missing.join(", ")
                 ));
             }
@@ -87,16 +147,26 @@ impl RuntimeService {
         task: &Task,
         note: &str,
     ) -> Result<(), Error> {
-        let marker = format!("<!-- polyphony:delivery-evidence run={run_id} task={} -->", task.id);
+        let marker = format!(
+            "<!-- polyphony:delivery-evidence run={run_id} task={} -->",
+            task.id
+        );
         // A worker can finish after the tracker accepted its comment but before
         // the run/task state is persisted.  On recovery the task is retried,
         // so the tracker-provided issue snapshot is the durable source of
         // truth for whether that publication already happened.
-        if issue.comments.iter().any(|comment| comment.body.contains(&marker)) {
+        if issue
+            .comments
+            .iter()
+            .any(|comment| comment.body.contains(&marker))
+        {
             if let Some(run) = self.state.runs.get_mut(run_id) {
                 run.push_log(
                     polyphony_core::RunLogScope::Pipeline,
-                    format!("evidence already recorded for {} task {}; not posting a duplicate", task.role, task.id),
+                    format!(
+                        "evidence already recorded for {} task {}; not posting a duplicate",
+                        task.role, task.id
+                    ),
                 );
                 run.updated_at = Utc::now();
                 if let Some(store) = &self.store {
@@ -125,7 +195,12 @@ impl RuntimeService {
         if let Some(run) = self.state.runs.get_mut(run_id) {
             run.push_log(
                 polyphony_core::RunLogScope::Pipeline,
-                format!("evidence recorded for {} task {}: {}", task.role, task.id, comment.url.unwrap_or(comment.id)),
+                format!(
+                    "evidence recorded for {} task {}: {}",
+                    task.role,
+                    task.id,
+                    comment.url.unwrap_or(comment.id)
+                ),
             );
             run.updated_at = Utc::now();
             if let Some(store) = &self.store {
@@ -776,7 +851,21 @@ impl RuntimeService {
             prompt.push_str(
                 "\nYou are the independent QA role. Do not modify the workspace, run git mutation, \
                  commit, push, create a pull request, or dispatch repair work. Inspect and test only; \
-                 publish a durable PASS or FAIL verdict with evidence through the tracker evidence tool.\n",
+                 publish a durable PASS or FAIL verdict with evidence through the tracker evidence tool. \
+                 Your final evidence must use `QA PASS:` or `QA FAIL:` followed by nonempty `tests run:` \
+                 and `checks:` lines. The checks line must identify every acceptance check.\n",
+            );
+        } else if task.role == polyphony_core::PipelineTaskRole::Implementation {
+            prompt.push_str(
+                "\nBefore completing, publish `IMPLEMENTATION NOTE:` with nonempty checklist lines: \
+                 `what changed:`, `commit:` (use `none — <reason>` if no commit exists), `tests run:`, \
+                 and `checks:`.\n",
+            );
+        } else if task.role == polyphony_core::PipelineTaskRole::Repair {
+            prompt.push_str(
+                "\nBefore completing, publish `REPAIR NOTE:` with nonempty checklist lines: \
+                 `what fixed:`, `commit:` (use `none — <reason>` if no commit exists), `tests run:`, \
+                 `recheck:`, and `checks:`.\n",
             );
         }
         if let Some(desc) = &task.description {
@@ -1173,7 +1262,10 @@ impl RuntimeService {
             (evidence_required && matches!(outcome.status, AttemptStatus::Succeeded))
                 .then(|| Self::delivery_note(task, issue, outcome))
         });
-        let evidence_error = delivery_note.as_ref().and_then(|result| result.as_ref().err()).cloned();
+        let evidence_error = delivery_note
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned();
         let qa_failed = is_qa
             && (!matches!(outcome.status, AttemptStatus::Succeeded)
                 || qa_result
@@ -1183,7 +1275,8 @@ impl RuntimeService {
                 || evidence_error.is_some());
 
         if let (Some(task), Some(Ok(note))) = (task_snapshot.as_ref(), delivery_note.as_ref()) {
-            self.publish_delivery_note(issue, run_id, task, note).await?;
+            self.publish_delivery_note(issue, run_id, task, note)
+                .await?;
         }
 
         if let Some(tasks) = self.state.tasks.get_mut(run_id)
@@ -1242,7 +1335,10 @@ impl RuntimeService {
                 s.kind == polyphony_core::StepKind::AgentRun
                     && s.task_id.as_deref() == Some(task_id)
             }) {
-                if matches!(outcome.status, AttemptStatus::Succeeded) && !qa_failed && evidence_error.is_none() {
+                if matches!(outcome.status, AttemptStatus::Succeeded)
+                    && !qa_failed
+                    && evidence_error.is_none()
+                {
                     step.mark_succeeded();
                 } else if matches!(
                     outcome.status,
