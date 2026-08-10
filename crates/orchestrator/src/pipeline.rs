@@ -1,3 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use sha2::{Digest, Sha256};
+
 use crate::{prelude::*, *};
 
 impl RuntimeService {
@@ -5,55 +9,115 @@ impl RuntimeService {
     /// than free-form agent prose.  The tracker comment is the durable human
     /// record; the matching task log survives a restart and prevents a later
     /// stage from treating an unrecorded worker success as delivery evidence.
-    fn required_acceptance_checks(issue: &Issue) -> Vec<String> {
-        issue
-            .description
-            .as_deref()
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| {
-                let trimmed = line.trim_start();
-                let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
-                (digits > 0 && trimmed[digits..].starts_with('.'))
-                    .then(|| trimmed[..digits].to_string())
-            })
-            .collect()
-    }
+    const EVIDENCE_FIELDS: [&str; 5] = [
+        "what changed",
+        "what fixed",
+        "commit",
+        "tests run",
+        "recheck",
+    ];
 
-    fn evidence_field<'a>(report: &'a str, field: &str) -> Result<Option<&'a str>, String> {
-        let mut value = None;
+    /// Evidence keys are deliberately a narrow, ASCII-only line grammar:
+    /// `key: value`, at column zero, using one of the canonical lower-case
+    /// keys.  A case or whitespace variant is rejected rather than silently
+    /// being treated as prose beside a canonical (possibly contradictory) key.
+    fn evidence_fields<'a>(report: &'a str) -> Result<BTreeMap<&'a str, &'a str>, String> {
+        let mut values = BTreeMap::new();
         for line in report.lines() {
-            let Some(candidate) = line
-                .trim_start()
-                .strip_prefix(field)
-                .and_then(|candidate| candidate.strip_prefix(':'))
-            else {
+            let Some((label, candidate)) = line.split_once(':') else {
                 continue;
             };
-
-            // Structured checklist fields are single-valued.  Selecting the
-            // first matching line would let a worker append conflicting or
-            // malformed evidence that still looks valid to the parser and a
-            // human reading the durable tracker note.
-            if value.is_some() {
+            let normalized = label
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            let canonical = Self::EVIDENCE_FIELDS
+                .iter()
+                .copied()
+                .chain(std::iter::once("checks"))
+                .find(|field| {
+                    field
+                        .chars()
+                        .filter(|character| !character.is_whitespace())
+                        .eq(normalized.chars())
+                });
+            let Some(field) = canonical else {
+                continue;
+            };
+            if label != field {
+                return Err(format!(
+                    "evidence field `{field}` must use canonical ASCII grammar `{field}: <value>`"
+                ));
+            }
+            let candidate = candidate.trim_matches([' ', '\t']);
+            if candidate.is_empty() {
+                return Err(format!(
+                    "evidence field `{field}` must have a nonempty value"
+                ));
+            }
+            if values.insert(field, candidate).is_some() {
                 return Err(format!("evidence field `{field}` must appear exactly once"));
             }
-            value = Some(candidate.trim());
         }
-        Ok(value.filter(|candidate| !candidate.is_empty()))
+        Ok(values)
     }
 
-    fn evidence_checks(report: &str) -> Result<Vec<String>, String> {
-        let Some(values) = Self::evidence_field(report, "checks")? else {
+    fn required_acceptance_checks(issue: &Issue) -> Result<Vec<String>, String> {
+        let mut checks = Vec::new();
+        let mut seen = BTreeSet::new();
+        for line in issue.description.as_deref().unwrap_or_default().lines() {
+            let trimmed = line.trim();
+            let digits = trimmed
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .count();
+            if digits == 0 || !trimmed[digits..].starts_with('.') {
+                continue;
+            }
+            let number = &trimmed[..digits];
+            let description = &trimmed[digits + 1..];
+            if number.starts_with('0')
+                || description.trim_matches([' ', '\t']).is_empty()
+                || !description.starts_with([' ', '\t'])
+            {
+                return Err(format!(
+                    "acceptance check `{trimmed}` must use canonical `N. <nonempty description>` grammar"
+                ));
+            }
+            if !seen.insert(number.to_string()) {
+                return Err(format!("acceptance check `{number}` is duplicated"));
+            }
+            checks.push(number.to_string());
+        }
+        Ok(checks)
+    }
+
+    fn evidence_checks(fields: &BTreeMap<&str, &str>) -> Result<Vec<String>, String> {
+        let Some(values) = fields.get("checks") else {
             return Ok(Vec::new());
         };
-        Ok(values
-            .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
-            .filter_map(|value| {
-                let value = value.trim_matches(|ch: char| !ch.is_ascii_digit());
-                (!value.is_empty()).then(|| value.to_string())
-            })
-            .collect())
+        let mut checks = Vec::new();
+        let mut seen = BTreeSet::new();
+        for token in values.split(',') {
+            let token = token.trim_matches([' ', '\t']);
+            if token.is_empty()
+                || token.starts_with('0')
+                || !token.chars().all(|character| character.is_ascii_digit())
+            {
+                return Err(
+                    "`checks:` must be a comma-separated list of canonical positive integers"
+                        .into(),
+                );
+            }
+            if !seen.insert(token) {
+                return Err(format!(
+                    "`checks:` contains duplicate acceptance check `{token}`"
+                ));
+            }
+            checks.push(token.to_string());
+        }
+        Ok(checks)
     }
 
     fn require_evidence_fields(
@@ -62,10 +126,10 @@ impl RuntimeService {
         role: polyphony_core::PipelineTaskRole,
     ) -> Result<(), String> {
         let mut missing = Vec::new();
+        let parsed = Self::evidence_fields(report)?;
         for field in fields {
-            match Self::evidence_field(report, field)? {
-                Some(_) => {},
-                None => missing.push(*field),
+            if !parsed.contains_key(field) {
+                missing.push(*field);
             }
         }
         if missing.is_empty() {
@@ -83,7 +147,10 @@ impl RuntimeService {
         report: &str,
         role: polyphony_core::PipelineTaskRole,
     ) -> Result<(), String> {
-        let commit = Self::evidence_field(report, "commit")?
+        let parsed = Self::evidence_fields(report)?;
+        let commit = parsed
+            .get("commit")
+            .copied()
             .expect("commit field is required before its value is validated");
         // Six hexadecimal characters is the shortest abbreviated SHA accepted
         // by Git's revision parser; full hashes remain valid as well.
@@ -155,53 +222,76 @@ impl RuntimeService {
                 Self::require_evidence_fields(body, &["tests run", "checks"], task.role)?;
             },
         }
-        let required = Self::required_acceptance_checks(issue);
+        let fields = Self::evidence_fields(body)?;
+        let required = Self::required_acceptance_checks(issue)?;
         if !required.is_empty() {
-            let covered = Self::evidence_checks(body)?;
+            let covered = Self::evidence_checks(&fields)?;
             if covered.is_empty() {
                 return Err(format!(
                     "{} evidence must link to at least one acceptance check using `checks: ...`",
                     task.role
                 ));
             }
-            if task.role != polyphony_core::PipelineTaskRole::Qa {
-                return Ok(report.to_string());
-            }
-            let missing = required
+            let required_set = required.iter().collect::<BTreeSet<_>>();
+            let out_of_range = covered
                 .iter()
-                .filter(|check| !covered.contains(check))
+                .filter(|check| !required_set.contains(check))
                 .cloned()
                 .collect::<Vec<_>>();
-            if !missing.is_empty() {
+            if !out_of_range.is_empty() {
                 return Err(format!(
-                    "QA evidence is incomplete; missing acceptance checks: {}",
-                    missing.join(", ")
+                    "evidence references acceptance checks outside the issue: {}",
+                    out_of_range.join(", ")
                 ));
+            }
+            if task.role == polyphony_core::PipelineTaskRole::Qa {
+                let missing = required
+                    .iter()
+                    .filter(|check| !covered.contains(check))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "QA evidence is incomplete; missing acceptance checks: {}",
+                        missing.join(", ")
+                    ));
+                }
             }
         }
         Ok(report.to_string())
     }
 
-    async fn publish_delivery_note(
+    pub(crate) async fn publish_delivery_note(
         &mut self,
         issue: &Issue,
         run_id: &str,
         task: &Task,
         note: &str,
     ) -> Result<(), Error> {
-        let marker = format!(
-            "<!-- polyphony:delivery-evidence run={run_id} task={} -->",
-            task.id
-        );
+        let body = Self::delivery_comment_body(run_id, task, note);
+        let marker = Self::delivery_marker(run_id, task, note);
         // A worker can finish after the tracker accepted its comment but before
         // the run/task state is persisted.  On recovery the task is retried,
         // so the tracker-provided issue snapshot is the durable source of
         // truth for whether that publication already happened.
-        if issue
+        let marker_matches = issue
             .comments
             .iter()
-            .any(|comment| comment.body.contains(&marker))
-        {
+            .filter(|comment| comment.body.lines().any(|line| line == marker))
+            .collect::<Vec<_>>();
+        if marker_matches.len() > 1 {
+            return Err(Error::Core(polyphony_core::Error::Adapter(format!(
+                "delivery evidence marker for {} task {} is duplicated; refusing ambiguous reconciliation",
+                task.role, task.id
+            ))));
+        }
+        if let Some(comment) = marker_matches.first() {
+            if comment.body != body {
+                return Err(Error::Core(polyphony_core::Error::Adapter(format!(
+                    "delivery evidence marker for {} task {} does not identify a complete matching note",
+                    task.role, task.id
+                ))));
+            }
             if let Some(run) = self.state.runs.get_mut(run_id) {
                 run.push_log(
                     polyphony_core::RunLogScope::Pipeline,
@@ -217,16 +307,6 @@ impl RuntimeService {
             }
             return Ok(());
         }
-        let body = format!(
-            "{marker}\n## Polyphony {}\n\n{note}\n\nRole: `{}`\nTask: `{}`",
-            match task.role {
-                polyphony_core::PipelineTaskRole::Implementation => "implementation note",
-                polyphony_core::PipelineTaskRole::Qa => "QA note",
-                polyphony_core::PipelineTaskRole::Repair => "repair note",
-            },
-            task.role,
-            task.id,
-        );
         let comment = self
             .tracker_for_issue(&issue.id)
             .comment_on_issue(&polyphony_core::AddIssueCommentRequest {
@@ -250,6 +330,28 @@ impl RuntimeService {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn delivery_marker(run_id: &str, task: &Task, note: &str) -> String {
+        let digest = Sha256::digest(note.as_bytes());
+        format!(
+            "<!-- polyphony:delivery-evidence-v2 run={run_id} task={} role={} sha256={digest:x} -->",
+            task.id, task.role
+        )
+    }
+
+    pub(crate) fn delivery_comment_body(run_id: &str, task: &Task, note: &str) -> String {
+        let marker = Self::delivery_marker(run_id, task, note);
+        format!(
+            "{marker}\n## Polyphony {}\n\n{note}\n\nRole: `{}`\nTask: `{}`",
+            match task.role {
+                polyphony_core::PipelineTaskRole::Implementation => "implementation note",
+                polyphony_core::PipelineTaskRole::Qa => "QA note",
+                polyphony_core::PipelineTaskRole::Repair => "repair note",
+            },
+            task.role,
+            task.id,
+        )
     }
 
     /// QA is not allowed to silently succeed.  Its terminal state must carry a

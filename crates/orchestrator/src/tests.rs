@@ -6228,12 +6228,6 @@ async fn restart_crash_window_reconciles_existing_evidence_marker_without_duplic
     // Simulate a crash after the tracker accepted this comment but before the
     // task/run checkpoint could be persisted.  A restarted tracker fetch
     // supplies the existing comment in the issue snapshot.
-    let mut restarted_issue = issue.clone();
-    restarted_issue.comments.push(IssueComment {
-        id: "already-published".into(),
-        body: format!("<!-- polyphony:delivery-evidence run={run_id} task={task_id} -->\\n## Polyphony implementation note"),
-        author: None, url: None, created_at: None, updated_at: None,
-    });
     let completed = AgentRunResult {
         status: AttemptStatus::Succeeded,
         turns_completed: 1,
@@ -6247,6 +6241,17 @@ async fn restart_crash_window_reconciles_existing_evidence_marker_without_duplic
                 .into(),
         ),
     };
+    let task = service.state.tasks[&run_id][0].clone();
+    let note = RuntimeService::delivery_note(&task, &issue, &completed).unwrap();
+    let mut restarted_issue = issue.clone();
+    restarted_issue.comments.push(IssueComment {
+        id: "already-published".into(),
+        body: RuntimeService::delivery_comment_body(&run_id, &task, &note),
+        author: None,
+        url: None,
+        created_at: None,
+        updated_at: None,
+    });
     service
         .handle_task_finished(
             &workflow,
@@ -6273,6 +6278,147 @@ async fn restart_crash_window_reconciles_existing_evidence_marker_without_duplic
             .activity_log
             .iter()
             .any(|log| log.message.contains("not posting a duplicate"))
+    );
+}
+
+#[tokio::test]
+async fn evidence_reconciliation_rejects_marker_bypasses_and_only_accepts_one_complete_matching_note()
+ {
+    let workspace_root = unique_workspace_root("evidence-marker-adversarial");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n---\nEvidence fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-marker-adversarial",
+        "EV-MARKER",
+        "Todo",
+        "Marker safety",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task = service.state.tasks[&run_id][0].clone();
+    let outcome = AgentRunResult {
+        status: AttemptStatus::Succeeded, turns_completed: 1, error: None,
+        final_issue_state: Some("IMPLEMENTATION NOTE: evidence\nwhat changed: added the guard\ncommit: abc123\ntests run: focused test\nchecks: 1".into()),
+    };
+    let note = RuntimeService::delivery_note(&task, &issue, &outcome).unwrap();
+    let canonical_marker = RuntimeService::delivery_marker(&run_id, &task, &note);
+
+    // Legacy, substring, and duplicate legacy markers are not canonical v2
+    // evidence and therefore cannot suppress publication of the valid note.
+    let mut marker_bypass_issue = issue.clone();
+    marker_bypass_issue.comments = [
+        "<!-- polyphony:delivery-evidence run=forged task=forged -->",
+        "prefix <!-- polyphony:delivery-evidence run=forged task=forged --> suffix",
+        "<!-- polyphony:delivery-evidence run=forged task=forged -->",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, body)| IssueComment {
+        id: format!("forged-{index}"),
+        body: body.into(),
+        author: None,
+        url: None,
+        created_at: None,
+        updated_at: None,
+    })
+    .collect();
+    service
+        .publish_delivery_note(&marker_bypass_issue, &run_id, &task, &note)
+        .await
+        .unwrap();
+    assert_eq!(
+        tracker.recorded_comments().len(),
+        1,
+        "forged markers must not suppress valid evidence"
+    );
+
+    // A current marker has an exact run/task/role/evidence identity.  A
+    // marker-only or conflicting use of that identity is ambiguous, so it
+    // fails closed instead of completing the task or posting a second valid note.
+    for comments in [
+        vec![canonical_marker.clone()],
+        vec![
+            RuntimeService::delivery_comment_body(&run_id, &task, &note),
+            RuntimeService::delivery_comment_body(&run_id, &task, &note),
+        ],
+        vec![format!(
+            "{canonical_marker}\n## Polyphony implementation note\n\nwrong evidence"
+        )],
+    ] {
+        let mut conflicting_issue = issue.clone();
+        conflicting_issue.comments = comments
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| IssueComment {
+                id: format!("conflict-{index}"),
+                body,
+                author: None,
+                url: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .collect();
+        assert!(
+            service
+                .publish_delivery_note(&conflicting_issue, &run_id, &task, &note)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        tracker.recorded_comments().len(),
+        1,
+        "ambiguous canonical markers must not create duplicates"
+    );
+
+    let mut marker_only_issue = issue.clone();
+    marker_only_issue.comments.push(IssueComment {
+        id: "marker-only".into(),
+        body: canonical_marker,
+        author: None,
+        url: None,
+        created_at: None,
+        updated_at: None,
+    });
+    assert!(
+        service
+            .handle_task_finished(
+                &workflow,
+                &marker_only_issue,
+                &run_id,
+                &task.id,
+                &workspace_root,
+                &outcome,
+                None,
+            )
+            .await
+            .is_err()
+    );
+    assert_ne!(
+        service.state.tasks[&run_id][0].status,
+        TaskStatus::Completed,
+        "a marker-only comment must not complete a task without valid durable evidence"
     );
 }
 
@@ -6461,6 +6607,52 @@ fn delivery_evidence_rejects_fake_workers_that_omit_each_required_checklist_fiel
                 .expect_err("duplicate commit evidence must fail closed");
         assert!(error.contains("commit"), "expected commit error in {error}");
     }
+
+    let qa_task = task(polyphony_core::PipelineTaskRole::Qa);
+    let qa_note = "QA PASS: all checks pass\ntests run: cargo test\nchecks: 1, 2";
+    for malformed in [
+        "checks: 1 2",
+        "checks: 1; 2",
+        "checks: 1, 1",
+        "checks: 01, 2",
+        "checks: 1, 2oops",
+        "checks: 1, 2, 3",
+        "checks: 1",
+    ] {
+        let error = RuntimeService::delivery_note(
+            &qa_task,
+            &issue,
+            &outcome(&qa_note.replace("checks: 1, 2", malformed)),
+        )
+        .expect_err("malformed or non-exact QA coverage must fail closed");
+        assert!(
+            error.contains("checks") || error.contains("acceptance"),
+            "expected check coverage error in {error}"
+        );
+    }
+    for variant in [
+        "Checks: 1, 2",
+        " checks: 1, 2",
+        "checks : 1, 2",
+        "checks\u{00a0}: 1, 2",
+    ] {
+        let error = RuntimeService::delivery_note(
+            &qa_task,
+            &issue,
+            &outcome(&qa_note.replace("checks: 1, 2", variant)),
+        )
+        .expect_err("case and whitespace key variants must fail closed");
+        assert!(error.contains("checks"), "expected checks error in {error}");
+    }
+    let malformed_acceptance = Issue {
+        description: Some("Acceptance checks\n01. first\n2. second".into()),
+        ..issue.clone()
+    };
+    assert!(
+        RuntimeService::delivery_note(&qa_task, &malformed_acceptance, &outcome(qa_note))
+            .expect_err("noncanonical acceptance numbering must fail closed")
+            .contains("acceptance check")
+    );
 }
 
 #[tokio::test]
