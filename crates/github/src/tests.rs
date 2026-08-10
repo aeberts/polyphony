@@ -20,13 +20,11 @@ use serde_json::{Value, json};
 use crate::{
     convert::{
         find_status_field_option, github_issue_approval_state, github_rate_limit_signal,
-        organization_project_id_from_context, parse_rate_limit_reset, parse_retry_after_ms,
-        required_project_issue_status, user_project_id_from_context,
+        parse_rate_limit_reset, parse_retry_after_ms, required_project_issue_status,
     },
     fetch_pull_request_events,
     pull_requests::{GithubIssueCommentResponse, find_issue_comment_id_with_marker},
-    resolve_organization_project_issue_context, resolve_project_status_field,
-    resolve_user_project_issue_context,
+    resolve_project_owner_issue_context, resolve_project_status_field,
     review_events::{
         GithubReviewBranchRef, GithubReviewHeadRef, GithubReviewLabel,
         GithubReviewPullRequestResponse, GithubReviewUser,
@@ -38,6 +36,7 @@ use crate::{
 struct ProjectStatusMock {
     statuses: Arc<Mutex<Vec<String>>>,
     organization_owned: bool,
+    reject_invalid_owner_lookup: bool,
     operations: Arc<Mutex<Vec<String>>>,
 }
 
@@ -92,18 +91,41 @@ async fn mock_graphql(
 ) -> impl IntoResponse {
     let operation = body["operationName"].as_str().unwrap_or_default();
     state.operations.lock().unwrap().push(operation.to_owned());
+    let query = body["query"].as_str().unwrap_or_default();
     let payload = match operation {
-        "ResolveUserProjectIssueContext" if state.organization_owned => json!({"data": {
+        // GitHub returns a partial response with an error when a query asks
+        // `organization(login:)` for a user login (and vice versa). Keep that
+        // realistic failure shape in the mock so any opposite-owner probe
+        // cannot silently regress this path.
+        "ResolveProjectOwnerIssueContext"
+            if state.reject_invalid_owner_lookup
+                && (query.contains("organization(login: $projectOwner)")
+                    || query.contains("user(login: $projectOwner)")) =>
+        {
+            json!({
+                "data": {
+                    "repository": {"issue": {"id": "I_42"}},
+                    "repositoryOwner": {
+                        "__typename": if state.organization_owned { "Organization" } else { "User" },
+                        "projectV2": {"id": if state.organization_owned { "P_ORG" } else { "P_USER" }}
+                    }
+                },
+                "errors": [{
+                    "message": if state.organization_owned {
+                        "Could not resolve to a User with the login of 'project-org'."
+                    } else {
+                        "Could not resolve to an Organization with the login of 'project-user'."
+                    },
+                    "path": [if state.organization_owned { "user" } else { "organization" }]
+                }]
+            })
+        },
+        "ResolveProjectOwnerIssueContext" => json!({"data": {
             "repository": {"issue": {"id": "I_42"}},
-            "user": {"projectV2": null}
-        }}),
-        "ResolveUserProjectIssueContext" => json!({"data": {
-            "repository": {"issue": {"id": "I_42"}},
-            "user": {"projectV2": {"id": "P_USER"}}
-        }}),
-        "ResolveOrganizationProjectIssueContext" if state.organization_owned => json!({"data": {
-            "repository": {"issue": {"id": "I_42"}},
-            "organization": {"projectV2": {"id": "P_ORG"}}
+            "repositoryOwner": {
+                "__typename": if state.organization_owned { "Organization" } else { "User" },
+                "projectV2": {"id": if state.organization_owned { "P_ORG" } else { "P_USER" }}
+            }
         }}),
         "ResolveProjectIssueStatus" => {
             let status = state.statuses.lock().unwrap().remove(0);
@@ -143,6 +165,7 @@ async fn project_status_tracker_for_owner(
             statuses.into_iter().map(str::to_owned).collect(),
         )),
         organization_owned,
+        reject_invalid_owner_lookup: true,
         operations: operations.clone(),
     };
     let app = Router::new()
@@ -176,7 +199,8 @@ async fn project_status_tracker_for_owner(
 
 #[tokio::test]
 async fn tracker_uses_project_status_for_candidate_polling_and_reconciliation() {
-    let tracker = project_status_tracker(vec!["Ready", "Backlog"]).await;
+    let (tracker, operations) =
+        project_status_tracker_for_owner(vec!["Ready", "Backlog"], false).await;
     let candidates = tracker
         .fetch_candidate_issues(&TrackerQuery {
             project_slug: None,
@@ -196,10 +220,26 @@ async fn tracker_uses_project_status_for_candidate_polling_and_reconciliation() 
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].state, "Backlog");
     assert_ne!(updates[0].state, "Ready");
+
+    let operations = operations.lock().unwrap();
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|operation| operation.as_str() == "ResolveProjectOwnerIssueContext")
+            .count(),
+        2,
+        "candidate polling and reconciliation must each use the owner-type-safe lookup"
+    );
+    assert!(
+        !operations
+            .iter()
+            .any(|operation| operation == "ResolveOrganizationProjectIssueContext"),
+        "a user Project must not need a second organization lookup"
+    );
 }
 
 #[tokio::test]
-async fn organization_owned_project_fallback_is_used_for_candidate_and_reconciliation() {
+async fn organization_owned_project_resolution_is_used_for_candidate_and_reconciliation() {
     let (tracker, operations) =
         project_status_tracker_for_owner(vec!["Ready", "Backlog"], true).await;
     let candidates = tracker
@@ -221,10 +261,10 @@ async fn organization_owned_project_fallback_is_used_for_candidate_and_reconcili
     assert_eq!(
         operations
             .iter()
-            .filter(|operation| operation.as_str() == "ResolveOrganizationProjectIssueContext")
+            .filter(|operation| operation.as_str() == "ResolveProjectOwnerIssueContext")
             .count(),
         2,
-        "both tracker paths must use the user-empty to organization fallback"
+        "both tracker paths must resolve an organization through repositoryOwner"
     );
 }
 
@@ -259,9 +299,9 @@ async fn tracker_rejects_empty_project_status_for_candidates_and_reconciliation(
 }
 
 #[test]
-fn user_owned_project_query_never_requests_an_organization() {
-    let body = crate::ResolveUserProjectIssueContext::build_query(
-        resolve_user_project_issue_context::Variables {
+fn project_owner_query_avoids_invalid_user_and_organization_lookups() {
+    let body = crate::ResolveProjectOwnerIssueContext::build_query(
+        resolve_project_owner_issue_context::Variables {
             owner: "repo-owner".into(),
             repo: "repo".into(),
             number: 42,
@@ -274,65 +314,9 @@ fn user_owned_project_query_never_requests_an_organization() {
         .unwrap()
         .to_string();
 
-    assert!(query.contains("user(login: $projectOwner)"));
+    assert!(query.contains("repositoryOwner(login: $projectOwner)"));
     assert!(!query.contains("organization(login: $projectOwner)"));
-}
-
-#[test]
-fn organization_fallback_query_never_requests_a_user() {
-    let body = crate::ResolveOrganizationProjectIssueContext::build_query(
-        resolve_organization_project_issue_context::Variables {
-            owner: "repo-owner".into(),
-            repo: "repo".into(),
-            number: 42,
-            project_owner: "acme".into(),
-            project_number: 1,
-        },
-    );
-    let query = serde_json::to_value(body).unwrap()["query"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    assert!(query.contains("organization(login: $projectOwner)"));
     assert!(!query.contains("user(login: $projectOwner)"));
-}
-
-#[test]
-fn user_owned_project_context_resolves_without_an_organization_lookup() {
-    let data = resolve_user_project_issue_context::ResponseData {
-            repository: None,
-            user: Some(resolve_user_project_issue_context::ResolveUserProjectIssueContextUser {
-                project_v2: Some(resolve_user_project_issue_context::ResolveUserProjectIssueContextUserProjectV2 {
-                    id: "USER_PROJECT".into(),
-                }),
-            }),
-        };
-    assert_eq!(
-        user_project_id_from_context(&data).as_deref(),
-        Some("USER_PROJECT")
-    );
-}
-
-#[test]
-fn organization_owned_project_context_resolves_after_user_lookup_is_empty() {
-    let data = resolve_organization_project_issue_context::ResponseData {
-        repository: None,
-        organization: Some(
-            resolve_organization_project_issue_context::ResolveOrganizationProjectIssueContextOrganization {
-                project_v2: Some(
-                    resolve_organization_project_issue_context::ResolveOrganizationProjectIssueContextOrganizationProjectV2 {
-                        id: "ORG_PROJECT".into(),
-                    },
-                ),
-            },
-        ),
-    };
-
-    assert_eq!(
-        organization_project_id_from_context(&data).as_deref(),
-        Some("ORG_PROJECT")
-    );
 }
 
 #[test]

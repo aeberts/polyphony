@@ -156,22 +156,18 @@ pub(crate) fn split_repo(repository: &str) -> Result<(String, String), CoreError
     Ok((owner.to_string(), repo.to_string()))
 }
 
-pub(crate) fn user_project_id_from_context(
-    data: &resolve_user_project_issue_context::ResponseData,
+pub(crate) fn project_id_from_owner_context(
+    data: &resolve_project_owner_issue_context::ResponseData,
 ) -> Option<String> {
-    data.user
-        .as_ref()
-        .and_then(|user| user.project_v2.as_ref())
-        .map(|project| project.id.clone())
-}
-
-pub(crate) fn organization_project_id_from_context(
-    data: &resolve_organization_project_issue_context::ResponseData,
-) -> Option<String> {
-    data.organization
-        .as_ref()
-        .and_then(|organization| organization.project_v2.as_ref())
-        .map(|project| project.id.clone())
+    let owner = data.repository_owner.as_ref()?;
+    match owner {
+        resolve_project_owner_issue_context::ResolveProjectOwnerIssueContextRepositoryOwner::User(
+            user,
+        ) => user.project_v2.as_ref().map(|project| project.id.clone()),
+        resolve_project_owner_issue_context::ResolveProjectOwnerIssueContextRepositoryOwner::Organization(
+            organization,
+        ) => organization.project_v2.as_ref().map(|project| project.id.clone()),
+    }
 }
 
 pub(crate) fn project_issue_status_from_response(
