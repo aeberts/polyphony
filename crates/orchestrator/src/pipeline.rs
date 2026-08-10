@@ -20,27 +20,40 @@ impl RuntimeService {
             .collect()
     }
 
-    fn evidence_field<'a>(report: &'a str, field: &str) -> Option<&'a str> {
-        report.lines().find_map(|line| {
-            line.trim_start()
+    fn evidence_field<'a>(report: &'a str, field: &str) -> Result<Option<&'a str>, String> {
+        let mut value = None;
+        for line in report.lines() {
+            let Some(candidate) = line
+                .trim_start()
                 .strip_prefix(field)
-                .and_then(|value| value.strip_prefix(':'))
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
+                .and_then(|candidate| candidate.strip_prefix(':'))
+            else {
+                continue;
+            };
+
+            // Structured checklist fields are single-valued.  Selecting the
+            // first matching line would let a worker append conflicting or
+            // malformed evidence that still looks valid to the parser and a
+            // human reading the durable tracker note.
+            if value.is_some() {
+                return Err(format!("evidence field `{field}` must appear exactly once"));
+            }
+            value = Some(candidate.trim());
+        }
+        Ok(value.filter(|candidate| !candidate.is_empty()))
     }
 
-    fn evidence_checks(report: &str) -> Vec<String> {
-        let Some(values) = Self::evidence_field(report, "checks") else {
-            return Vec::new();
+    fn evidence_checks(report: &str) -> Result<Vec<String>, String> {
+        let Some(values) = Self::evidence_field(report, "checks")? else {
+            return Ok(Vec::new());
         };
-        values
+        Ok(values
             .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
             .filter_map(|value| {
                 let value = value.trim_matches(|ch: char| !ch.is_ascii_digit());
                 (!value.is_empty()).then(|| value.to_string())
             })
-            .collect()
+            .collect())
     }
 
     fn require_evidence_fields(
@@ -48,11 +61,13 @@ impl RuntimeService {
         fields: &[&str],
         role: polyphony_core::PipelineTaskRole,
     ) -> Result<(), String> {
-        let missing = fields
-            .iter()
-            .filter(|field| Self::evidence_field(report, field).is_none())
-            .copied()
-            .collect::<Vec<_>>();
+        let mut missing = Vec::new();
+        for field in fields {
+            match Self::evidence_field(report, field)? {
+                Some(_) => {},
+                None => missing.push(*field),
+            }
+        }
         if missing.is_empty() {
             Ok(())
         } else {
@@ -68,7 +83,7 @@ impl RuntimeService {
         report: &str,
         role: polyphony_core::PipelineTaskRole,
     ) -> Result<(), String> {
-        let commit = Self::evidence_field(report, "commit")
+        let commit = Self::evidence_field(report, "commit")?
             .expect("commit field is required before its value is validated");
         // Six hexadecimal characters is the shortest abbreviated SHA accepted
         // by Git's revision parser; full hashes remain valid as well.
@@ -142,7 +157,7 @@ impl RuntimeService {
         }
         let required = Self::required_acceptance_checks(issue);
         if !required.is_empty() {
-            let covered = Self::evidence_checks(body);
+            let covered = Self::evidence_checks(body)?;
             if covered.is_empty() {
                 return Err(format!(
                     "{} evidence must link to at least one acceptance check using `checks: ...`",
@@ -884,13 +899,13 @@ impl RuntimeService {
             );
         } else if task.role == polyphony_core::PipelineTaskRole::Implementation {
             prompt.push_str(
-                "\nBefore completing, publish `IMPLEMENTATION NOTE:` with nonempty checklist lines: \
+                "\nBefore completing, publish `IMPLEMENTATION NOTE:` with exactly one nonempty checklist line for each: \
                  `what changed:`, `commit:` (use `none — <reason>` if no commit exists), `tests run:`, \
                  and `checks:`.\n",
             );
         } else if task.role == polyphony_core::PipelineTaskRole::Repair {
             prompt.push_str(
-                "\nBefore completing, publish `REPAIR NOTE:` with nonempty checklist lines: \
+                "\nBefore completing, publish `REPAIR NOTE:` with exactly one nonempty checklist line for each: \
                  `what fixed:`, `commit:` (use `none — <reason>` if no commit exists), `tests run:`, \
                  `recheck:`, and `checks:`.\n",
             );

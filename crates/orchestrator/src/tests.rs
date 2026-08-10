@@ -6405,6 +6405,11 @@ fn delivery_evidence_rejects_fake_workers_that_omit_each_required_checklist_fiel
             let error = RuntimeService::delivery_note(&task(role), &issue, &outcome(&incomplete))
                 .expect_err("fake worker omission must fail closed");
             assert!(error.contains(field), "expected {field} in {error}");
+
+            let duplicated = format!("{complete_note}\n{field}: conflicting duplicate");
+            let error = RuntimeService::delivery_note(&task(role), &issue, &outcome(&duplicated))
+                .expect_err("duplicate structured evidence must fail closed");
+            assert!(error.contains(field), "expected {field} in {error}");
         }
     }
 
@@ -6432,20 +6437,28 @@ fn delivery_evidence_rejects_fake_workers_that_omit_each_required_checklist_fiel
         )
         .is_ok()
     );
-    for invalid_commit in [
-        "none",
-        "none —",
-        "none —    ",
-        "none - no code change",
-        "not-a-commit",
+    for (role, valid_no_commit) in [
+        (polyphony_core::PipelineTaskRole::Implementation, no_commit),
+        (polyphony_core::PipelineTaskRole::Repair, repair_no_commit),
     ] {
-        let invalid_note = no_commit.replace("none — no code change", invalid_commit);
-        let error = RuntimeService::delivery_note(
-            &task(polyphony_core::PipelineTaskRole::Implementation),
-            &issue,
-            &outcome(&invalid_note),
-        )
-        .expect_err("invalid no-commit evidence must fail closed");
+        for invalid_commit in [
+            "none",
+            "none —",
+            "none —    ",
+            "none - no code change",
+            "not-a-commit",
+        ] {
+            let invalid_note = valid_no_commit.replace("none — no code change", invalid_commit);
+            let error = RuntimeService::delivery_note(&task(role), &issue, &outcome(&invalid_note))
+                .expect_err("invalid no-commit evidence must fail closed");
+            assert!(error.contains("commit"), "expected commit error in {error}");
+        }
+
+        let conflicting_duplicate =
+            valid_no_commit.replace("none — no code change", "abc123\ncommit: none");
+        let error =
+            RuntimeService::delivery_note(&task(role), &issue, &outcome(&conflicting_duplicate))
+                .expect_err("duplicate commit evidence must fail closed");
         assert!(error.contains("commit"), "expected commit error in {error}");
     }
 }
