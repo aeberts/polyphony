@@ -54,6 +54,7 @@ polyphony init --list-packs
 polyphony init --pack codex
 polyphony init --pack multi-agent
 polyphony init --pack pipeline-static --tracker github --repository owner/repo
+polyphony init --pack closed-loop-delivery --tracker github --repository owner/repo
 polyphony init --pack codex --tracker linear --project-slug ENG
 ```
 

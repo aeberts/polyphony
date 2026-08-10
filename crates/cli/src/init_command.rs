@@ -16,14 +16,17 @@ const PIPELINE_STATIC_TEMPLATE: &str =
     include_str!("../../../templates/examples/WORKFLOW.pipeline-static.md");
 const PIPELINE_PLANNER_TEMPLATE: &str =
     include_str!("../../../templates/examples/WORKFLOW.pipeline-planner.md");
+const CLOSED_LOOP_DELIVERY_TEMPLATE: &str =
+    include_str!("../../../templates/examples/WORKFLOW.closed-loop-delivery.md");
 const AUTOMATION_FEEDBACK_TEMPLATE: &str =
     include_str!("../../../templates/examples/WORKFLOW.automation-feedback.md");
-const ALL_INIT_TEMPLATES: [InitTemplate; 6] = [
+const ALL_INIT_TEMPLATES: [InitTemplate; 7] = [
     InitTemplate::Default,
     InitTemplate::Codex,
     InitTemplate::MultiAgent,
     InitTemplate::PipelineStatic,
     InitTemplate::PipelinePlanner,
+    InitTemplate::ClosedLoopDelivery,
     InitTemplate::AutomationFeedback,
 ];
 
@@ -35,6 +38,7 @@ pub(crate) enum InitTemplate {
     MultiAgent,
     PipelineStatic,
     PipelinePlanner,
+    ClosedLoopDelivery,
     AutomationFeedback,
 }
 
@@ -46,6 +50,7 @@ impl InitTemplate {
             Self::MultiAgent => "multi-agent",
             Self::PipelineStatic => "pipeline-static",
             Self::PipelinePlanner => "pipeline-planner",
+            Self::ClosedLoopDelivery => "closed-loop-delivery",
             Self::AutomationFeedback => "automation-feedback",
         }
     }
@@ -57,6 +62,7 @@ impl InitTemplate {
             Self::MultiAgent => MULTI_AGENT_TEMPLATE,
             Self::PipelineStatic => PIPELINE_STATIC_TEMPLATE,
             Self::PipelinePlanner => PIPELINE_PLANNER_TEMPLATE,
+            Self::ClosedLoopDelivery => CLOSED_LOOP_DELIVERY_TEMPLATE,
             Self::AutomationFeedback => AUTOMATION_FEEDBACK_TEMPLATE,
         }
     }
@@ -73,6 +79,9 @@ impl InitTemplate {
             Self::PipelineStatic => "Fixed research -> coding -> review pipeline for every issue.",
             Self::PipelinePlanner => {
                 "Planner-driven pipeline that decomposes work before execution."
+            },
+            Self::ClosedLoopDelivery => {
+                "Bounded implementation -> independent QA -> repair delivery loop."
             },
             Self::AutomationFeedback => {
                 "Automation-first workflow with feedback channels and PR handoff."
@@ -95,6 +104,9 @@ impl InitTemplate {
             Self::PipelinePlanner => {
                 "Use when issues vary a lot and you want a planner to decide the task breakdown."
             },
+            Self::ClosedLoopDelivery => {
+                "Use for explicitly approved issues that need independent QA and at most two repairs."
+            },
             Self::AutomationFeedback => {
                 "Use when Polyphony should open PRs, notify humans, and hand off automatically."
             },
@@ -105,6 +117,9 @@ impl InitTemplate {
         match self {
             Self::PipelineStatic | Self::PipelinePlanner | Self::AutomationFeedback => Some(
                 "This starter enables automation. You will need to wire a real tracker before validation fully passes.",
+            ),
+            Self::ClosedLoopDelivery => Some(
+                "This starter requires a real tracker because implementation, QA, and repair evidence are tracker comments.",
             ),
             _ => None,
         }

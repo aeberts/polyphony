@@ -1054,15 +1054,33 @@ struct ScriptedPipelineAgent {
 /// Disposable fake worker for the independent-QA delivery contract.  It never
 /// calls a provider or repository automation: role names alone determine the
 /// scripted lifecycle and the QA reports are returned as durable evidence.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ClosedLoopQaFixtureAgent {
     calls: Arc<Mutex<Vec<String>>>,
     qa_attempts: Arc<Mutex<u32>>,
+    qa_pass_after: u32,
+}
+
+impl Default for ClosedLoopQaFixtureAgent {
+    fn default() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            qa_attempts: Arc::new(Mutex::new(0)),
+            qa_pass_after: 2,
+        }
+    }
 }
 
 impl ClosedLoopQaFixtureAgent {
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn with_qa_pass_after(qa_pass_after: u32) -> Self {
+        Self {
+            qa_pass_after,
+            ..Self::default()
+        }
     }
 }
 
@@ -1081,7 +1099,7 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
         let final_issue_state = if spec.agent.name == "qa" {
             let mut attempts = self.qa_attempts.lock().unwrap();
             *attempts += 1;
-            Some(if *attempts == 1 {
+            Some(if *attempts < self.qa_pass_after {
                 "QA FAIL: fixture found the implementation marker is incomplete\n\
                  tests run: focused fixture\n\
                  checks: 1, 2, 3, 4, 5\n\
@@ -6524,6 +6542,153 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
                 && note.body.contains("Task:")
         }),
         "tracker comments must retain a readable evidence checklist and role context"
+    );
+}
+
+#[tokio::test]
+async fn closed_loop_pack_stops_after_two_repairs_and_a_third_qa_failure() {
+    let workspace_root = unique_workspace_root("closed-loop-repair-limit");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n---\nClosed-loop repair-limit fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let mut issue = sample_issue(
+        "issue-repair-limit",
+        "QA-LIMIT",
+        "Todo",
+        "Closed-loop repair limit",
+    );
+    issue.description = Some(
+        "Acceptance checks\n1. implementation evidence\n2. qa evidence\n3. repair routing\n4. restart retention\n5. bounded repair limit".into(),
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let agent = ClosedLoopQaFixtureAgent::with_qa_pass_after(4);
+    let agent_handle = agent.clone();
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        handle_next_worker_message(&mut service).await;
+    }
+
+    let run = service.state.runs.values().next().unwrap();
+    assert_eq!(run.status, RunStatus::Review);
+    assert!(run.activity_log.iter().any(|entry| {
+        entry
+            .message
+            .contains("closed-loop repair limit reached after 2 repairs")
+    }));
+    assert_eq!(
+        service.state.tasks[&run.id]
+            .iter()
+            .filter(|task| task.role == polyphony_core::PipelineTaskRole::Repair
+                && task.status == TaskStatus::Completed)
+            .count(),
+        2
+    );
+    assert_eq!(agent_handle.calls().len(), 6);
+    assert!(
+        tracker
+            .recorded_workflow_updates()
+            .iter()
+            .any(|status| status == "Needs Human Decision")
+    );
+
+    service
+        .dispatch_pipeline(workflow, issue, None, false, false, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        agent_handle.calls().len(),
+        6,
+        "limit state must not re-dispatch"
+    );
+    assert!(!service.state.running.contains_key("issue-repair-limit"));
+}
+
+#[tokio::test]
+async fn normal_implementation_failure_skips_stale_qa_and_dispatches_repair() {
+    let workspace_root = unique_workspace_root("implementation-failure-repair");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n---\nImplementation-failure fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-implementation-failure",
+        "QA-IMPLEMENTATION-FAILURE",
+        "Todo",
+        "Implementation failure repair",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    let failed_implementation = AgentRunResult {
+        status: AttemptStatus::Failed,
+        turns_completed: 1,
+        error: Some("ordinary fixture failure".into()),
+        final_issue_state: None,
+    };
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &failed_implementation,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let tasks = &service.state.tasks[&run_id];
+    assert_eq!(tasks[0].status, TaskStatus::Failed);
+    assert_eq!(tasks[1].status, TaskStatus::Cancelled);
+    assert_eq!(tasks[2].status, TaskStatus::InProgress);
+    assert_eq!(service.state.running[&issue.id].agent_name, "repair");
+    assert!(
+        tracker
+            .recorded_workflow_updates()
+            .iter()
+            .any(|status| status == "Repair Needed")
     );
 }
 

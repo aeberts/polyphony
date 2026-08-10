@@ -832,7 +832,13 @@ impl RuntimeService {
         if self
             .find_existing_run_for_issue(&issue.id)
             .and_then(|run_id| self.state.runs.get(&run_id))
-            .is_some_and(|run| matches!(run.status, RunStatus::Cancelled | RunStatus::Blocked))
+            .is_some_and(|run| {
+                matches!(run.status, RunStatus::Cancelled | RunStatus::Blocked)
+                    || (run.status == RunStatus::Review
+                        && run.activity_log.iter().any(|entry| {
+                            entry.message.contains("closed-loop repair limit reached")
+                        }))
+            })
             || self.issue_is_in_blocked_state(&workflow, &issue.state)
         {
             self.push_event(
@@ -2088,7 +2094,51 @@ impl RuntimeService {
                     )
                     .await;
             }
-            if let Some(run) = self.state.runs.get_mut(run_id) {
+            let completed_repairs = self
+                .state
+                .tasks
+                .get(run_id)
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|task| {
+                            task.role == polyphony_core::PipelineTaskRole::Repair
+                                && task.status == TaskStatus::Completed
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            if completed_repairs >= 2 {
+                if let Err(error) = self
+                    .tracker_for_issue(&issue.id)
+                    .update_issue_workflow_status(issue, "Needs Human Decision")
+                    .await
+                {
+                    if let Some(run) = self.state.runs.get_mut(run_id) {
+                        run.status = RunStatus::Failed;
+                        run.push_log(
+                            polyphony_core::RunLogScope::Pipeline,
+                            format!("QA failed after {completed_repairs} repairs, but tracker transition to Needs Human Decision failed: {error}"),
+                        );
+                        run.updated_at = now;
+                        if let Some(store) = &self.store {
+                            store.save_run(run).await?;
+                        }
+                    }
+                    return Ok(());
+                }
+                if let Some(run) = self.state.runs.get_mut(run_id) {
+                    run.status = RunStatus::Review;
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        format!("closed-loop repair limit reached after {completed_repairs} repairs; QA evidence is durable and needs human decision"),
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+            } else if let Some(run) = self.state.runs.get_mut(run_id) {
                 run.status = RunStatus::Failed;
                 run.push_log(
                     polyphony_core::RunLogScope::Pipeline,
@@ -2169,6 +2219,77 @@ impl RuntimeService {
                 }
                 return self
                     .dispatch_planner_task(workflow, issue, attempt, false, run_id, workspace_path)
+                    .await;
+            }
+            let repair_ordinal = task_snapshot
+                .as_ref()
+                .filter(|task| task.role == polyphony_core::PipelineTaskRole::Implementation)
+                .and_then(|_| {
+                    self.state.tasks.get(run_id).and_then(|tasks| {
+                        tasks
+                            .iter()
+                            .filter(|task| {
+                                task.role == polyphony_core::PipelineTaskRole::Repair
+                                    && task.status == TaskStatus::Pending
+                            })
+                            .min_by_key(|task| task.ordinal)
+                            .map(|task| task.ordinal)
+                    })
+                });
+            if let Some(repair_ordinal) = repair_ordinal {
+                if let Err(error) = self
+                    .tracker_for_issue(&issue.id)
+                    .update_issue_workflow_status(issue, "Repair Needed")
+                    .await
+                {
+                    if let Some(run) = self.state.runs.get_mut(run_id) {
+                        run.status = RunStatus::Failed;
+                        run.push_log(
+                            polyphony_core::RunLogScope::Pipeline,
+                            format!("implementation failed, but tracker transition to Repair Needed failed; repair was not dispatched: {error}"),
+                        );
+                        run.updated_at = now;
+                        if let Some(store) = &self.store {
+                            store.save_run(run).await?;
+                        }
+                    }
+                    return Ok(());
+                }
+                if let Some(tasks) = self.state.tasks.get_mut(run_id) {
+                    for task in tasks.iter_mut().filter(|task| {
+                        task.status == TaskStatus::Pending
+                            && task.ordinal < repair_ordinal
+                            && task.role == polyphony_core::PipelineTaskRole::Qa
+                    }) {
+                        task.status = TaskStatus::Cancelled;
+                        task.error = Some("implementation failed; superseded by repair".into());
+                        task.finished_at = Some(now);
+                        task.updated_at = now;
+                        if let Some(store) = &self.store {
+                            store.save_task(task).await?;
+                        }
+                    }
+                }
+                if let Some(run) = self.state.runs.get_mut(run_id) {
+                    run.status = RunStatus::InProgress;
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        "implementation failed; skipping stale QA and dispatching the distinct repair role",
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                return self
+                    .dispatch_next_task(
+                        self.workflow(),
+                        issue.clone(),
+                        attempt,
+                        false,
+                        run_id,
+                        workspace_path,
+                    )
                     .await;
             }
             // Mark run as failed

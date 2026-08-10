@@ -569,6 +569,35 @@ mod init_command_tests {
     }
 
     #[test]
+    fn init_creates_closed_loop_delivery_pack_with_independent_qa() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        let config_root = dir.path().join("user");
+        fs::create_dir_all(&repo_root).unwrap();
+        init_git_repo(&repo_root);
+
+        let workflow_path = repo_root.join("WORKFLOW.md");
+        let user_config_path = config_root.join("config.toml");
+        let report = run_init_command_with_user_config_path(
+            &workflow_path,
+            &user_config_path,
+            &InitOptions {
+                pack: InitTemplate::ClosedLoopDelivery,
+                ..InitOptions::default()
+            },
+        )
+        .unwrap();
+
+        let workflow_contents = fs::read_to_string(workflow_path).unwrap();
+        assert_eq!(report.pack, "closed-loop-delivery");
+        assert!(workflow_contents.contains("role: implementation"));
+        assert_eq!(workflow_contents.matches("role: repair").count(), 2);
+        assert_eq!(workflow_contents.matches("role: qa").count(), 3);
+        assert!(workflow_contents.contains("thread_sandbox: read-only"));
+        assert!(workflow_contents.contains("# Bounded Closed-Loop Delivery"));
+    }
+
+    #[test]
     fn init_keeps_existing_workflow_without_force() {
         let dir = tempfile::tempdir().unwrap();
         let repo_root = dir.path().join("repo");
@@ -637,6 +666,7 @@ mod init_command_tests {
         assert!(catalog.contains("multi-agent:"));
         assert!(catalog.contains("pipeline-static:"));
         assert!(catalog.contains("pipeline-planner:"));
+        assert!(catalog.contains("closed-loop-delivery:"));
         assert!(catalog.contains("automation-feedback:"));
         assert!(catalog.contains("Use it when:"));
         assert!(catalog.contains("--tracker"));

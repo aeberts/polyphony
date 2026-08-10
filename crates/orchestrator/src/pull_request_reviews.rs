@@ -1145,11 +1145,13 @@ impl RuntimeService {
             }
 
             // After all tasks complete, run success handoff
-            let pipeline_done = self
-                .state
-                .runs
-                .get(&run_id)
-                .is_some_and(|m| matches!(m.status, RunStatus::Review | RunStatus::Delivered));
+            let pipeline_done = self.state.runs.get(&run_id).is_some_and(|run| {
+                run.status == RunStatus::Delivered
+                    || (run.status == RunStatus::Review
+                        && !run.activity_log.iter().any(|entry| {
+                            entry.message.contains("closed-loop repair limit reached")
+                        }))
+            });
             if pipeline_done {
                 let workflow_status = outcome
                     .final_issue_state

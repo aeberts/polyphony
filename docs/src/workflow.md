@@ -301,6 +301,8 @@ Stage fields:
   planner-driven pipeline with research, coding, and review agents
 - [`templates/examples/WORKFLOW.pipeline-static.md`](../../templates/examples/WORKFLOW.pipeline-static.md) —
   static three-stage pipeline without a planner
+- [`templates/examples/WORKFLOW.closed-loop-delivery.md`](../../templates/examples/WORKFLOW.closed-loop-delivery.md) —
+  bounded implementation, independent QA, and two-repair delivery loop
 
 ## Prompt Rendering
 
