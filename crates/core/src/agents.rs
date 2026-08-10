@@ -112,7 +112,7 @@ impl AgentRunResult {
     /// BLOCKED:
     /// reason: <non-empty>
     /// evidence: <non-empty>
-    /// prerequisite: <non-empty linked work reference>
+    /// prerequisite: <linked work reference, such as FAC-42, #42, or owner/repo#42>
     /// ```
     ///
     /// This prevents prose that merely mentions a block from becoming a
@@ -160,12 +160,59 @@ impl AgentRunResult {
             evidence.ok_or_else(|| "blocked outcome is missing `evidence`".to_string())?;
         let prerequisite = prerequisite
             .ok_or_else(|| "blocked outcome is missing `prerequisite`".to_string())?;
+        if !is_linked_work_reference(&prerequisite) {
+            return Err(
+                "blocked outcome `prerequisite` must be a linked work reference (for example `FAC-42`, `#42`, or `owner/repo#42`)"
+                    .into(),
+            );
+        }
         Ok(Some(BlockedOutcome {
             reason,
             evidence,
             prerequisite,
         }))
     }
+}
+
+/// Returns true only for the ordinary tracker work-reference forms Polyphony
+/// can preserve as a durable prerequisite link. Free-form prose is not enough
+/// authority to terminally block a run.
+fn is_linked_work_reference(reference: &str) -> bool {
+    fn is_issue_number(value: &str) -> bool {
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    if let Some(number) = reference.strip_prefix('#') {
+        return is_issue_number(number);
+    }
+
+    if let Some((repository, number)) = reference.rsplit_once('#') {
+        return !repository.is_empty()
+            && repository.split('/').count() == 2
+            && repository.split('/').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'-' | b'_' | b'.')
+                        })
+            })
+            && is_issue_number(number);
+    }
+
+    let Some((project, number)) = reference.rsplit_once('-') else {
+        return false;
+    };
+    !project.is_empty()
+        && project
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && project
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        && is_issue_number(number)
 }
 
 #[cfg(test)]
@@ -195,11 +242,32 @@ mod tests {
     }
 
     #[test]
+    fn accepts_linked_prerequisite_work_references() {
+        for prerequisite in ["POL-42", "#42", "aeberts/polyphony#42"] {
+            let result = AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some(format!(
+                    "BLOCKED:\nreason: waiting\nevidence: fixture trace\nprerequisite: {prerequisite}"
+                )),
+            };
+            assert!(
+                matches!(result.blocked_outcome(), Ok(Some(_))),
+                "{prerequisite}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_incomplete_or_duplicated_blocked_outcome() {
         for report in [
             "BLOCKED:\nreason: waiting\nevidence: trace",
             "BLOCKED:\nreason: waiting\nevidence: trace\nprerequisite: POL-42\nreason: again",
             "BLOCKED:\nreason: waiting\nevidence:\nprerequisite: POL-42",
+            "BLOCKED:\nreason: waiting\nevidence: trace\nprerequisite: arbitrary text",
+            "BLOCKED:\nreason: waiting\nevidence: trace\nprerequisite: POL-",
+            "BLOCKED:\nreason: waiting\nevidence: trace\nprerequisite: polyphony#not-a-number",
         ] {
             let result = AgentRunResult {
                 status: AttemptStatus::Succeeded,

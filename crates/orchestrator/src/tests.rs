@@ -3402,7 +3402,7 @@ async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
     let workspace_root = unique_workspace_root("blocked-outcome");
     let workflow = test_workflow_with_front_matter(
         &workspace_root,
-        "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
+        "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: automatic\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
     );
     let issue = sample_issue("issue-blocked", "FAC-BLOCKED", "Todo", "Blocked work");
     let tracker = TestTracker::new(vec![issue.clone()]);
@@ -3472,11 +3472,52 @@ async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
         .unwrap_err();
     assert!(error.to_string().contains("blocked"));
 
-    // A restored blocked record stays terminal before automatic recovery can
-    // reinterpret its incomplete task state as retryable work.
-    service.normalize_restored_in_progress_runs().await.unwrap();
-    assert_eq!(service.state.runs[&run_id].status, RunStatus::Blocked);
-    assert!(!service.should_dispatch(&workflow, &issue));
+    // Persist the run, construct a new service, and restore the durable
+    // bootstrap. Automatic poll ticks must leave the terminal block intact
+    // and must not acknowledge, dispatch, or add tracker evidence again.
+    let persisted_bootstrap: StoreBootstrap = serde_json::from_value(
+        serde_json::to_value(StoreBootstrap {
+            snapshot: None,
+            retrying: std::collections::HashMap::new(),
+            throttles: std::collections::HashMap::new(),
+            budgets: std::collections::HashMap::new(),
+            saved_contexts: std::collections::HashMap::new(),
+            recent_events: Vec::new(),
+            runs: std::collections::HashMap::from([(
+                run_id.clone(),
+                service.state.runs[&run_id].clone(),
+            )]),
+            tasks: std::collections::HashMap::new(),
+            reviewed_pull_request_heads: std::collections::HashMap::new(),
+            agent_run_history: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut restarted = test_service_for_workflow(
+        workflow.clone(),
+        tracker_handle.clone(),
+        RecordingProvisioner::default(),
+    );
+    restarted.restore_bootstrap(persisted_bootstrap);
+    restarted.normalize_restored_in_progress_runs().await.unwrap();
+    restarted.tick().await;
+    restarted.tick().await;
+
+    assert_eq!(restarted.state.runs[&run_id].status, RunStatus::Blocked);
+    assert_eq!(
+        restarted.state.runs[&run_id]
+            .blocked_outcome
+            .as_ref()
+            .map(|outcome| outcome.prerequisite.as_str()),
+        Some("FAC-42")
+    );
+    assert!(!restarted.should_dispatch(&workflow, &issue));
+    assert!(restarted.state.running.is_empty());
+    assert!(restarted.state.retrying.is_empty());
+    assert!(tracker_handle.acknowledged_issues().is_empty());
+    assert_eq!(tracker_handle.recorded_comments().len(), 1);
+    assert_eq!(tracker_handle.recorded_workflow_updates(), vec!["Awaiting Dependency"]);
 }
 
 #[tokio::test]
@@ -3524,7 +3565,8 @@ async fn malformed_or_unconfigured_blocked_outcomes_never_create_a_false_block()
     );
     let tracker = TestTracker::new(vec![issue.clone()]);
     let tracker_handle = tracker.clone();
-    let mut service = test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
+    let mut service =
+        test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
     let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
     let run_id = run.id.clone();
     service.state.runs.insert(run_id.clone(), run);
@@ -3549,6 +3591,59 @@ async fn malformed_or_unconfigured_blocked_outcomes_never_create_a_false_block()
         .unwrap();
     assert_ne!(service.state.runs[&run_id].status, RunStatus::Blocked);
     assert!(tracker_handle.recorded_comments().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_prerequisite_reference_never_creates_a_false_block() {
+    let workspace_root = unique_workspace_root("blocked-outcome-invalid-prerequisite");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
+    );
+    let issue = sample_issue(
+        "issue-blocked-invalid-prerequisite",
+        "FAC-INVALID-PREREQUISITE",
+        "Todo",
+        "Invalid prerequisite",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service =
+        test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    let run_id = run.id.clone();
+    service.state.runs.insert(run_id.clone(), run);
+    service.state.running.insert(
+        issue.id.clone(),
+        make_running_task(
+            issue.clone(),
+            workspace_root.join("FAC-INVALID-PREREQUISITE"),
+        ),
+    );
+
+    service
+        .finish_running(
+            issue.id.clone(),
+            issue.identifier.clone(),
+            None,
+            Utc::now(),
+            AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some(
+                    "BLOCKED:\nreason: dependency missing\nevidence: fixture failed\nprerequisite: arbitrary text"
+                        .into(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(service.state.runs[&run_id].status, RunStatus::Blocked);
+    assert!(service.state.runs[&run_id].blocked_outcome.is_none());
+    assert!(tracker_handle.recorded_comments().is_empty());
+    assert!(tracker_handle.recorded_workflow_updates().is_empty());
 }
 
 #[tokio::test]
@@ -5268,7 +5363,6 @@ async fn resolving_run_deliverable_updates_decision_and_snapshot() {
         activity_log: Vec::new(),
         cancel_reason: None,
         blocked_outcome: None,
-        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5327,7 +5421,6 @@ async fn resolving_already_accepted_deliverable_is_ignored() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
-        blocked_outcome: None,
         blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
@@ -5391,7 +5484,6 @@ async fn startup_cleanup_finalizes_merged_accepted_runs() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
-        blocked_outcome: None,
         blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
@@ -5616,7 +5708,6 @@ async fn workspace_progress_updates_are_appended_to_worktree_task() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
-        blocked_outcome: None,
         blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
