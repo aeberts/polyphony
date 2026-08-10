@@ -6710,16 +6710,60 @@ async fn two_approved_issues_isolate_direct_pass_and_repaired_pass_across_restar
             .count(),
         1
     );
-    let restored_runs: Vec<Run> = serde_json::from_value(
-        serde_json::to_value(service.state.runs.values().cloned().collect::<Vec<_>>()).unwrap(),
+    let persisted_bootstrap: StoreBootstrap = serde_json::from_value(
+        serde_json::to_value(StoreBootstrap {
+            snapshot: None,
+            retrying: std::collections::HashMap::new(),
+            throttles: std::collections::HashMap::new(),
+            budgets: std::collections::HashMap::new(),
+            saved_contexts: std::collections::HashMap::new(),
+            recent_events: Vec::new(),
+            runs: service.state.runs.clone(),
+            tasks: service
+                .state
+                .tasks
+                .values()
+                .flatten()
+                .cloned()
+                .map(|task| (task.id.clone(), task))
+                .collect(),
+            reviewed_pull_request_heads: std::collections::HashMap::new(),
+            agent_run_history: Vec::new(),
+        })
+        .unwrap(),
     )
     .unwrap();
-    let restored_tasks: Vec<Vec<Task>> = serde_json::from_value(
-        serde_json::to_value(service.state.tasks.values().cloned().collect::<Vec<_>>()).unwrap(),
+    let (_restart_tx, restart_rx) = watch::channel(workflow.clone());
+    let mut restarted = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent_handle.clone()),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        restart_rx,
     )
-    .unwrap();
-    assert_eq!(restored_runs.len(), 2);
-    assert!(restored_tasks.iter().flatten().any(|task| {
+    .0;
+    restarted.restore_bootstrap(persisted_bootstrap);
+    restarted
+        .normalize_restored_in_progress_runs()
+        .await
+        .unwrap();
+    restarted.tick().await;
+    assert_eq!(restarted.state.runs.len(), 2);
+    assert_eq!(
+        restarted.state.runs[&direct_run.id].status,
+        RunStatus::Delivered
+    );
+    assert_eq!(
+        restarted.state.runs[&repaired_run.id].status,
+        RunStatus::Delivered
+    );
+    assert!(restarted.state.tasks.values().flatten().any(|task| {
         task.activity_log
             .iter()
             .any(|entry| entry.contains("QA PASS"))
@@ -6727,7 +6771,7 @@ async fn two_approved_issues_isolate_direct_pass_and_repaired_pass_across_restar
     assert_eq!(
         agent_handle.calls().len(),
         6,
-        "restart record contains no duplicate dispatch"
+        "restart tick must not duplicate dispatch"
     );
     assert_eq!(tracker.recorded_comments().len(), 6);
 }
