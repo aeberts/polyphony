@@ -6293,6 +6293,103 @@ async fn quality_bar_defers_exotic_non_material_hardening_and_allows_practical_a
 }
 
 #[tokio::test]
+async fn quality_bar_requires_human_decision_for_non_material_lifecycle_risks() {
+    let workspace_root = unique_workspace_root("quality-bar-non-material-risk");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: qa\n  profiles:\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n---\nQuality-bar non-material risk fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let mut issue = sample_issue(
+        "issue-quality-bar-non-material-risk",
+        "QA-NON-MATERIAL-RISK",
+        "Todo",
+        "Non-material lifecycle risk",
+    );
+    issue.description = Some("Acceptance checks\n1. quality gate".into());
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    let qa_needing_human = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(
+            "QA FAIL: non-material lifecycle risks need a human decision\n\
+             tests run: quality-bar fixture\n\
+             checks: 1\n\
+             realistic: yes\n\
+             material: no\n\
+             risks: false pass, lost evidence, duplicate work, human-control bypass\n\
+             small fix: yes\n\
+             recommendation: needs human decision"
+                .into(),
+        ),
+    };
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &qa_needing_human,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Review);
+    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
+    assert_eq!(service.state.tasks[&run_id][1].status, TaskStatus::Pending);
+    assert!(
+        !service.state.running.contains_key(&issue.id),
+        "a non-material finding must not dispatch repair automatically"
+    );
+    assert!(
+        !tracker
+            .recorded_workflow_updates()
+            .iter()
+            .any(|status| status == "Repair Needed")
+    );
+    assert!(
+        service.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|entry| {
+                entry.message.contains("material=false")
+                    && entry.message.contains("decision=needs human decision")
+            })
+    );
+    assert!(tracker.recorded_comments().iter().any(|comment| {
+        comment.body.contains("material: no")
+            && comment
+                .body
+                .contains("recommendation: needs human decision")
+    }));
+}
+
+#[tokio::test]
 async fn quality_bar_rejects_contradictory_or_high_risk_deferral_without_dispatching_repair() {
     let workspace_root = unique_workspace_root("quality-bar-contradiction");
     let workflow = test_workflow_with_front_matter(

@@ -298,15 +298,12 @@ impl RuntimeService {
         let small_fix = parse_yes_no("small fix")?;
         let risks = Self::quality_bar_risks(fields["risks"])?;
         let recommendation = QualityBarDecision::parse(fields["recommendation"])?;
-        let expected = if !risks.is_empty() {
-            if realistic && small_fix {
-                QualityBarDecision::Remediate
-            } else {
-                QualityBarDecision::NeedsHumanDecision
-            }
-        } else if material && realistic && small_fix {
+        // Automatic repair is limited to material, realistic findings with a
+        // small bounded fix. Listed safety risks change whether a finding may
+        // defer, but never relax the material requirement for repair.
+        let expected = if material && realistic && small_fix {
             QualityBarDecision::Remediate
-        } else if !material && !realistic {
+        } else if risks.is_empty() && !material && !realistic {
             QualityBarDecision::Defer
         } else {
             QualityBarDecision::NeedsHumanDecision
