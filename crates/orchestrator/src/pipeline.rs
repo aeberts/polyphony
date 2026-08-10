@@ -5,6 +5,113 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::{prelude::*, *};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualityBarDecision {
+    Remediate,
+    Defer,
+    NeedsHumanDecision,
+}
+
+impl QualityBarDecision {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "remediate" => Ok(Self::Remediate),
+            "defer" => Ok(Self::Defer),
+            "needs human decision" => Ok(Self::NeedsHumanDecision),
+            _ => Err(
+                "quality-bar recommendation must be `remediate`, `defer`, or `needs human decision`"
+                    .into(),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for QualityBarDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Remediate => "remediate",
+            Self::Defer => "defer",
+            Self::NeedsHumanDecision => "needs human decision",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QualityBarRisk {
+    FalsePass,
+    LostEvidence,
+    DuplicateWork,
+    HumanControlBypass,
+}
+
+impl QualityBarRisk {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "false pass" => Ok(Self::FalsePass),
+            "lost evidence" => Ok(Self::LostEvidence),
+            "duplicate work" => Ok(Self::DuplicateWork),
+            "human-control bypass" => Ok(Self::HumanControlBypass),
+            _ => Err(
+                "quality-bar `risks:` may contain only `false pass`, `lost evidence`, `duplicate work`, or `human-control bypass`"
+                    .into(),
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for QualityBarRisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FalsePass => "false pass",
+            Self::LostEvidence => "lost evidence",
+            Self::DuplicateWork => "duplicate work",
+            Self::HumanControlBypass => "human-control bypass",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QualityBarAssessment {
+    realistic: bool,
+    material: bool,
+    risks: Vec<QualityBarRisk>,
+    small_fix: bool,
+    recommendation: QualityBarDecision,
+    follow_up: Option<String>,
+    human_override: Option<QualityBarDecision>,
+}
+
+impl QualityBarAssessment {
+    fn decision(&self) -> QualityBarDecision {
+        self.human_override.unwrap_or(self.recommendation)
+    }
+
+    fn durable_record(&self) -> String {
+        let risks = if self.risks.is_empty() {
+            "none".to_string()
+        } else {
+            self.risks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "quality-bar assessment: realistic={}; material={}; risks={risks}; small_fix={}; recommendation={}; follow_up={}; human_override={}; decision={}",
+            self.realistic,
+            self.material,
+            self.small_fix,
+            self.recommendation,
+            self.follow_up.as_deref().unwrap_or("none"),
+            self.human_override
+                .map(|value| value.to_string())
+                .as_deref()
+                .unwrap_or("none"),
+            self.decision(),
+        )
+    }
+}
+
 impl RuntimeService {
     /// The evidence protocol is intentionally a small fixed checklist rather
     /// than free-form agent prose.  The tracker comment is the durable human
@@ -23,6 +130,17 @@ impl RuntimeService {
     /// It is far above the number of criteria an issue can reasonably carry,
     /// while still keeping the protocol's canonical representation explicit.
     const MAX_ACCEPTANCE_CHECK_ID: u16 = 999;
+    /// The quality-bar protocol is deliberately a short, fixed checklist.
+    /// It records a QA finding's practical lifecycle impact; it is not a
+    /// general-purpose risk score or a substitute for a human decision.
+    const QUALITY_BAR_FIELDS: [&str; 6] = [
+        "realistic",
+        "material",
+        "risks",
+        "small fix",
+        "recommendation",
+        "follow-up",
+    ];
 
     /// A complete Unicode-category check prevents newly discovered or
     /// previously omitted format controls from becoming apparently nonempty
@@ -113,6 +231,155 @@ impl RuntimeService {
             }
         }
         Ok(values)
+    }
+
+    fn quality_bar_fields(report: &str) -> Result<BTreeMap<&str, &str>, String> {
+        let mut values = BTreeMap::new();
+        for line in report.lines() {
+            let Some((label, candidate)) = line.split_once(':') else {
+                continue;
+            };
+            let normalized = label
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            let canonical = Self::QUALITY_BAR_FIELDS.iter().copied().find(|field| {
+                field
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .eq(normalized.chars())
+            });
+            let Some(field) = canonical else {
+                continue;
+            };
+            if label != field {
+                return Err(format!(
+                    "quality-bar field `{field}` must use canonical ASCII grammar `{field}: <value>`"
+                ));
+            }
+            let candidate = candidate.trim_matches([' ', '\t']);
+            if !Self::has_meaningful_evidence_value(candidate) {
+                return Err(format!(
+                    "quality-bar field `{field}` must have a visible nonempty value"
+                ));
+            }
+            if values.insert(field, candidate).is_some() {
+                return Err(format!(
+                    "quality-bar field `{field}` must appear exactly once"
+                ));
+            }
+        }
+        Ok(values)
+    }
+
+    fn qa_quality_bar_assessment(report: &str) -> Result<QualityBarAssessment, String> {
+        let fields = Self::quality_bar_fields(report)?;
+        for required in [
+            "realistic",
+            "material",
+            "risks",
+            "small fix",
+            "recommendation",
+        ] {
+            if !fields.contains_key(required) {
+                return Err(format!(
+                    "QA FAIL quality-bar assessment is missing required `{required}:` field"
+                ));
+            }
+        }
+        let parse_yes_no = |field: &str| match fields[field] {
+            "yes" => Ok(true),
+            "no" => Ok(false),
+            _ => Err(format!("quality-bar `{field}:` must be `yes` or `no`")),
+        };
+        let realistic = parse_yes_no("realistic")?;
+        let material = parse_yes_no("material")?;
+        let small_fix = parse_yes_no("small fix")?;
+        let risks = Self::quality_bar_risks(fields["risks"])?;
+        let recommendation = QualityBarDecision::parse(fields["recommendation"])?;
+        let expected = if !risks.is_empty() {
+            if realistic && small_fix {
+                QualityBarDecision::Remediate
+            } else {
+                QualityBarDecision::NeedsHumanDecision
+            }
+        } else if material && realistic && small_fix {
+            QualityBarDecision::Remediate
+        } else if !material && !realistic {
+            QualityBarDecision::Defer
+        } else {
+            QualityBarDecision::NeedsHumanDecision
+        };
+        if recommendation != expected {
+            return Err(format!(
+                "quality-bar recommendation `{recommendation}` contradicts its lifecycle assessment; expected `{expected}`"
+            ));
+        }
+        let follow_up = fields.get("follow-up").map(|value| (*value).to_string());
+        if recommendation == QualityBarDecision::Defer && follow_up.is_none() {
+            return Err("deferred hardening must include a nonempty `follow-up:` reference".into());
+        }
+        if recommendation != QualityBarDecision::Defer && follow_up.is_some() {
+            return Err("only deferred hardening may include a `follow-up:` reference".into());
+        }
+        Ok(QualityBarAssessment {
+            realistic,
+            material,
+            risks,
+            small_fix,
+            recommendation,
+            follow_up,
+            human_override: None,
+        })
+    }
+
+    fn quality_bar_risks(value: &str) -> Result<Vec<QualityBarRisk>, String> {
+        if value == "none" {
+            return Ok(Vec::new());
+        }
+        let mut risks = Vec::new();
+        for token in value.split(',') {
+            let risk = QualityBarRisk::parse(token.trim_matches([' ', '\t']))?;
+            if risks.contains(&risk) {
+                return Err(format!("quality-bar `risks:` repeats `{risk}`"));
+            }
+            risks.push(risk);
+        }
+        if risks.is_empty() {
+            return Err(
+                "quality-bar `risks:` must be `none` or a comma-separated risk list".into(),
+            );
+        }
+        Ok(risks)
+    }
+
+    fn quality_bar_override(issue: &Issue) -> Result<Option<QualityBarDecision>, String> {
+        let mut override_decision = None;
+        for comment in &issue.comments {
+            for line in comment.body.lines() {
+                let Some(value) = line.strip_prefix("QUALITY BAR OVERRIDE:") else {
+                    continue;
+                };
+                let authorized_human = comment.author.as_ref().is_some_and(|author| {
+                    matches!(
+                        author.role.as_deref(),
+                        Some("owner" | "member" | "collaborator")
+                    )
+                });
+                if !authorized_human {
+                    return Err(
+                        "QUALITY BAR OVERRIDE must be authored by an owner, member, or collaborator"
+                            .into(),
+                    );
+                }
+                let decision = QualityBarDecision::parse(value.trim_matches([' ', '\t']))?;
+                if override_decision.replace(decision).is_some() {
+                    return Err("multiple QUALITY BAR OVERRIDE directives are ambiguous".into());
+                }
+            }
+        }
+        Ok(override_decision)
     }
 
     /// An acceptance source is an explicitly headed `Acceptance checks` or
@@ -397,6 +664,9 @@ impl RuntimeService {
             },
             polyphony_core::PipelineTaskRole::Qa => {
                 Self::require_evidence_fields(body, &["tests run", "checks"], task.role)?;
+                if matches!(Self::qa_verdict(outcome)?, (false, _)) {
+                    Self::qa_quality_bar_assessment(body)?;
+                }
             },
         }
         let fields = Self::evidence_fields(body)?;
@@ -1174,7 +1444,11 @@ impl RuntimeService {
                  commit, push, create a pull request, or dispatch repair work. Inspect and test only; \
                  publish a durable PASS or FAIL verdict with evidence through the tracker evidence tool. \
                  Your final evidence must use `QA PASS:` or `QA FAIL:` followed by nonempty `tests run:` \
-                 and `checks:` lines. The checks line must identify every acceptance check.\n",
+                 and `checks:` lines. The checks line must identify every acceptance check. For `QA FAIL:`, \
+                 also use exactly one line each for `realistic: yes|no`, `material: yes|no`, \
+                 `risks: none|false pass, lost evidence, duplicate work, human-control bypass`, \
+                 `small fix: yes|no`, and `recommendation: remediate|defer|needs human decision`. \
+                 A deferred recommendation also requires `follow-up: <issue or tracker reference>`.\n",
             );
         } else if task.role == polyphony_core::PipelineTaskRole::Implementation {
             prompt.push_str(
@@ -1583,10 +1857,23 @@ impl RuntimeService {
             (evidence_required && matches!(outcome.status, AttemptStatus::Succeeded))
                 .then(|| Self::delivery_note(task, issue, outcome))
         });
-        let evidence_error = delivery_note
+        let mut evidence_error = delivery_note
             .as_ref()
             .and_then(|result| result.as_ref().err())
             .cloned();
+        let mut quality_bar = None;
+        if is_qa
+            && evidence_error.is_none()
+            && let Some(Ok((false, evidence))) = qa_result.as_ref()
+        {
+            match Self::qa_quality_bar_assessment(evidence).and_then(|mut assessment| {
+                assessment.human_override = Self::quality_bar_override(issue)?;
+                Ok(assessment)
+            }) {
+                Ok(assessment) => quality_bar = Some(assessment),
+                Err(error) => evidence_error = Some(error),
+            }
+        }
         let qa_failed = is_qa
             && (!matches!(outcome.status, AttemptStatus::Succeeded)
                 || qa_result
@@ -1680,6 +1967,57 @@ impl RuntimeService {
         }
 
         if qa_failed {
+            let Some(quality_bar) = quality_bar else {
+                if let Some(run) = self.state.runs.get_mut(run_id) {
+                    run.status = RunStatus::Failed;
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        "QA failed without a valid durable quality-bar assessment; repair was not dispatched",
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                return Ok(());
+            };
+            if let Some(run) = self.state.runs.get_mut(run_id) {
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    quality_bar.durable_record(),
+                );
+                run.updated_at = now;
+                // The audit record must be stored before a repair worker can
+                // run. A storage error exits this handler and leaves repair
+                // pending, which is the fail-closed boundary.
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+            match quality_bar.decision() {
+                QualityBarDecision::Defer => {
+                    self.defer_quality_bar_follow_up(run_id, task_id, &quality_bar)
+                        .await?;
+                    return self
+                        .complete_pipeline(&self.workflow(), issue, run_id)
+                        .await;
+                },
+                QualityBarDecision::NeedsHumanDecision => {
+                    if let Some(run) = self.state.runs.get_mut(run_id) {
+                        run.status = RunStatus::Review;
+                        run.push_log(
+                            polyphony_core::RunLogScope::Pipeline,
+                            "quality-bar review needs a human decision; repair was not dispatched",
+                        );
+                        run.updated_at = now;
+                        if let Some(store) = &self.store {
+                            store.save_run(run).await?;
+                        }
+                    }
+                    return Ok(());
+                },
+                QualityBarDecision::Remediate => {},
+            }
             if let Err(error) = self
                 .tracker_for_issue(&issue.id)
                 .update_issue_workflow_status(issue, "Repair Needed")
@@ -1829,6 +2167,71 @@ impl RuntimeService {
             }
             Ok(())
         }
+    }
+
+    async fn defer_quality_bar_follow_up(
+        &mut self,
+        run_id: &str,
+        failed_qa_task_id: &str,
+        assessment: &QualityBarAssessment,
+    ) -> Result<(), Error> {
+        let now = Utc::now();
+        let follow_up = assessment
+            .follow_up
+            .as_deref()
+            .expect("defer assessment validated a follow-up reference");
+        if let Some(tasks) = self.state.tasks.get_mut(run_id) {
+            let failed_qa_ordinal = tasks
+                .iter()
+                .find(|task| task.id == failed_qa_task_id)
+                .map(|task| task.ordinal)
+                .unwrap_or(u32::MAX);
+            for task in tasks.iter_mut().filter(|task| {
+                task.status == TaskStatus::Pending
+                    && task.ordinal > failed_qa_ordinal
+                    && matches!(
+                        task.role,
+                        polyphony_core::PipelineTaskRole::Qa
+                            | polyphony_core::PipelineTaskRole::Repair
+                    )
+            }) {
+                task.status = TaskStatus::Cancelled;
+                task.error = Some(format!(
+                    "quality-bar deferred as hardening; follow-up: {follow_up}"
+                ));
+                task.finished_at = Some(now);
+                task.updated_at = now;
+                if let Some(store) = &self.store {
+                    store.save_task(task).await?;
+                }
+            }
+        }
+        if let Some(run) = self.state.runs.get_mut(run_id) {
+            for step in &mut run.steps {
+                if step.kind == polyphony_core::StepKind::AgentRun
+                    && step.task_id.as_deref().is_some_and(|task_id| {
+                        self.state.tasks.get(run_id).is_some_and(|tasks| {
+                            tasks.iter().any(|task| {
+                                task.id == task_id && task.status == TaskStatus::Cancelled
+                            })
+                        })
+                    })
+                {
+                    step.mark_skipped();
+                }
+            }
+            run.push_log(
+                polyphony_core::RunLogScope::Pipeline,
+                format!(
+                    "quality-bar deferred non-material hardening after QA task {failed_qa_task_id}; follow-up: {follow_up}; practical acceptance continues"
+                ),
+            );
+            run.updated_at = now;
+            if let Some(store) = &self.store {
+                store.save_run(run).await?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn complete_pipeline(

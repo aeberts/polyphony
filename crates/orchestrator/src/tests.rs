@@ -1058,7 +1058,12 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
             Some(if *attempts == 1 {
                 "QA FAIL: fixture found the implementation marker is incomplete\n\
                  tests run: focused fixture\n\
-                 checks: 1, 2, 3, 4, 5"
+                 checks: 1, 2, 3, 4, 5\n\
+                 realistic: yes\n\
+                 material: yes\n\
+                 risks: lost evidence\n\
+                 small fix: yes\n\
+                 recommendation: remediate"
                     .into()
             } else {
                 "QA PASS: fixture confirmed the repair marker and focused checks\n\
@@ -6154,7 +6159,12 @@ async fn qa_failure_does_not_dispatch_repair_when_tracker_cannot_record_repair_n
         final_issue_state: Some(
             "QA FAIL: tracker status mutation must be durable\n\
             tests run: focused fixture\n\
-            checks: 1"
+            checks: 1\n\
+            realistic: yes\n\
+            material: yes\n\
+            risks: lost evidence\n\
+            small fix: yes\n\
+            recommendation: remediate"
                 .into(),
         ),
     };
@@ -6185,6 +6195,327 @@ async fn qa_failure_does_not_dispatch_repair_when_tracker_cannot_record_repair_n
             .iter()
             .any(|log| log.message.contains("Repair Needed failed")
                 && log.message.contains("not dispatched"))
+    );
+}
+
+#[tokio::test]
+async fn quality_bar_defers_exotic_non_material_hardening_and_allows_practical_acceptance() {
+    let workspace_root = unique_workspace_root("quality-bar-defer");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: qa\n  profiles:\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n---\nQuality-bar defer fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let mut issue = sample_issue(
+        "issue-quality-bar-defer",
+        "QA-DEFER",
+        "Todo",
+        "Defer hardening",
+    );
+    issue.description = Some("Acceptance checks\n1. quality gate".into());
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    let deferred_qa = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(
+            "QA FAIL: an exotic presentation variant is not material\n\
+             tests run: quality-bar fixture\n\
+             checks: 1\n\
+             realistic: no\n\
+             material: no\n\
+             risks: none\n\
+             small fix: no\n\
+             recommendation: defer\n\
+             follow-up: #21"
+                .into(),
+        ),
+    };
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &deferred_qa,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Delivered);
+    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
+    assert_eq!(
+        service.state.tasks[&run_id][1].status,
+        TaskStatus::Cancelled
+    );
+    assert!(
+        !tracker
+            .recorded_workflow_updates()
+            .iter()
+            .any(|status| status == "Repair Needed")
+    );
+    assert!(
+        service.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|entry| {
+                entry.message.contains("recommendation=defer")
+                    && entry.message.contains("follow_up=#21")
+            })
+    );
+    assert!(tracker.recorded_comments().iter().any(|comment| {
+        comment.body.contains("recommendation: defer") && comment.body.contains("follow-up: #21")
+    }));
+}
+
+#[tokio::test]
+async fn quality_bar_rejects_contradictory_or_high_risk_deferral_without_dispatching_repair() {
+    let workspace_root = unique_workspace_root("quality-bar-contradiction");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: qa\n  profiles:\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n---\nQuality-bar contradiction fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let mut issue = sample_issue(
+        "issue-quality-bar-contradiction",
+        "QA-CONTRADICT",
+        "Todo",
+        "Contradiction",
+    );
+    issue.description = Some("Acceptance checks\n1. quality gate".into());
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    let contradictory_qa = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(
+            "QA FAIL: a possible false PASS must not be deferred\n\
+             tests run: quality-bar fixture\n\
+             checks: 1\n\
+             realistic: yes\n\
+             material: yes\n\
+             risks: false pass\n\
+             small fix: yes\n\
+             recommendation: defer\n\
+             follow-up: #22"
+                .into(),
+        ),
+    };
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &contradictory_qa,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Failed);
+    assert_eq!(service.state.tasks[&run_id][1].status, TaskStatus::Pending);
+    assert!(!service.state.running.contains_key(&issue.id));
+    assert!(
+        !tracker
+            .recorded_workflow_updates()
+            .iter()
+            .any(|status| status == "Repair Needed")
+    );
+    assert!(
+        service.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|entry| {
+                entry
+                    .message
+                    .contains("without a valid durable quality-bar assessment")
+            })
+    );
+}
+
+#[tokio::test]
+async fn quality_bar_human_override_is_durable_and_restart_resumes_only_repair() {
+    let workspace_root = unique_workspace_root("quality-bar-override-restart");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: qa\n  profiles:\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n---\nQuality-bar override fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let mut issue = sample_issue(
+        "issue-quality-bar-override",
+        "QA-OVERRIDE",
+        "Todo",
+        "Human override",
+    );
+    issue.description = Some("Acceptance checks\n1. quality gate".into());
+    issue.comments.push(IssueComment {
+        id: "human-override".into(),
+        body: "QUALITY BAR OVERRIDE: remediate".into(),
+        author: Some(IssueAuthor {
+            id: None,
+            username: None,
+            display_name: Some("Owner".into()),
+            role: Some("owner".into()),
+            trust_level: Some("trusted_owner".into()),
+            url: None,
+        }),
+        url: Some("https://tracker.test/override".into()),
+        created_at: Some(Utc::now()),
+        updated_at: None,
+    });
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    let qa_needing_human = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(
+            "QA FAIL: a material case has no small bounded fix\n\
+             tests run: quality-bar fixture\n\
+             checks: 1\n\
+             realistic: yes\n\
+             material: yes\n\
+             risks: none\n\
+             small fix: no\n\
+             recommendation: needs human decision"
+                .into(),
+        ),
+    };
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &qa_needing_human,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        service.state.tasks[&run_id][1].status,
+        TaskStatus::InProgress
+    );
+    assert!(
+        service.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|entry| {
+                entry.message.contains("human_override=remediate")
+                    && entry.message.contains("decision=remediate")
+            })
+    );
+
+    let persisted_run: Run =
+        serde_json::from_value(serde_json::to_value(service.state.runs[&run_id].clone()).unwrap())
+            .unwrap();
+    let persisted_tasks: Vec<Task> =
+        serde_json::from_value(serde_json::to_value(service.state.tasks[&run_id].clone()).unwrap())
+            .unwrap();
+    let (_restart_tx, restart_rx) = watch::channel(workflow.clone());
+    let mut restarted = RuntimeService::new(
+        Arc::new(tracker),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        restart_rx,
+    )
+    .0;
+    restarted.state.runs.insert(run_id.clone(), persisted_run);
+    restarted
+        .state
+        .tasks
+        .insert(run_id.clone(), persisted_tasks);
+    restarted
+        .normalize_restored_in_progress_runs()
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.state.tasks[&run_id][1].status,
+        TaskStatus::Pending
+    );
+    assert_eq!(restarted.state.tasks[&run_id][0].status, TaskStatus::Failed);
+    assert!(
+        restarted.state.runs[&run_id]
+            .activity_log
+            .iter()
+            .any(|entry| { entry.message.contains("human_override=remediate") })
     );
 }
 
