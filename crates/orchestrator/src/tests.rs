@@ -6655,6 +6655,143 @@ fn delivery_evidence_rejects_fake_workers_that_omit_each_required_checklist_fiel
     );
 }
 
+#[test]
+fn delivery_evidence_uses_bounded_canonical_check_ids_and_visible_unicode_values() {
+    let issue = Issue {
+        description: Some("Acceptance checks\n1. first\n2. second".into()),
+        ..sample_issue(
+            "issue-evidence-grammar-boundaries",
+            "EV-GRAMMAR",
+            "Todo",
+            "Evidence grammar boundaries",
+        )
+    };
+    let now = Utc::now();
+    let task = |role| Task {
+        id: "task-evidence-grammar-boundaries".into(),
+        run_id: "run-evidence-grammar-boundaries".into(),
+        title: "Checklist evidence".into(),
+        description: None,
+        activity_log: Vec::new(),
+        category: polyphony_core::TaskCategory::Coding,
+        role,
+        status: TaskStatus::InProgress,
+        ordinal: 1,
+        parent_id: None,
+        agent_name: None,
+        session_id: None,
+        thread_id: None,
+        turns_completed: 0,
+        tokens: TokenUsage::default(),
+        started_at: None,
+        finished_at: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let outcome = |note: &str| AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(note.into()),
+    };
+    let qa_task = task(polyphony_core::PipelineTaskRole::Qa);
+
+    // The acceptance list is protocol input.  A line that looks numbered but
+    // is malformed is never ignored, because doing so would make QA coverage
+    // vacuous when no valid check lines remain.
+    for description in [
+        "Acceptance checks\n+1. signed",
+        "Acceptance checks\n-1. signed",
+        "Acceptance checks\n01. leading zero",
+        "Acceptance checks\n0. zero",
+        "Acceptance checks\n1) wrong separator",
+        "Acceptance checks\n1000. out of configured range",
+        "Acceptance checks\n999999999999999999999999999999999999999. overflow",
+        "Acceptance checks\n1. first\n1. duplicate",
+        "Acceptance checks\n2. second\n1. first",
+        "Acceptance checks\n١. non-ASCII numeral",
+    ] {
+        let malformed = Issue {
+            description: Some(description.into()),
+            ..issue.clone()
+        };
+        let error = RuntimeService::delivery_note(
+            &qa_task,
+            &malformed,
+            &outcome("QA PASS: false pass attempt\ntests run: cargo test\nchecks: arbitrary text"),
+        )
+        .expect_err("malformed acceptance input must fail before QA coverage can pass");
+        assert!(
+            error.contains("acceptance check"),
+            "expected acceptance-list error in {error}"
+        );
+    }
+
+    // IDs are canonical decimal integers in the documented 1..=999 range.
+    // The high boundary is accepted; every near miss is rejected for QA as
+    // well as implementation/repair evidence.
+    let bounded_issue = Issue {
+        description: Some("Acceptance checks\n1. first\n999. last".into()),
+        ..issue.clone()
+    };
+    assert!(
+        RuntimeService::delivery_note(
+            &qa_task,
+            &bounded_issue,
+            &outcome("QA PASS: boundary coverage\ntests run: cargo test\nchecks: 1, 999"),
+        )
+        .is_ok()
+    );
+    for invalid_checks in [
+        "+1, 2",
+        "-1, 2",
+        "0, 2",
+        "01, 2",
+        "1, 1000",
+        "1, 999999999999999999999999999999999999999",
+        "1, 2, 2",
+        "1, \u{00a0}2",
+        "1, 2\u{200b}",
+    ] {
+        let error = RuntimeService::delivery_note(
+            &qa_task,
+            &issue,
+            &outcome(&format!(
+                "QA PASS: malformed check coverage\ntests run: cargo test\nchecks: {invalid_checks}"
+            )),
+        )
+        .expect_err("noncanonical check references must fail closed");
+        assert!(error.contains("checks"), "expected checks error in {error}");
+    }
+
+    let implementation_task = task(polyphony_core::PipelineTaskRole::Implementation);
+    let implementation_note = "IMPLEMENTATION NOTE: evidence\nwhat changed: added a guard\ncommit: abc123\ntests run: cargo test\nchecks: 1, 2";
+    for invisible in ["\u{00a0}", "\u{200b}", "\u{2060}", "\u{0007}"] {
+        let error = RuntimeService::delivery_note(
+            &implementation_task,
+            &issue,
+            &outcome(&implementation_note.replace("added a guard", invisible)),
+        )
+        .expect_err("Unicode whitespace/control-only evidence must be rejected");
+        assert!(
+            error.contains("what changed") && error.contains("visible"),
+            "expected visible-value error in {error}"
+        );
+    }
+
+    // Unicode prose (and harmless surrounding Unicode whitespace) is not
+    // mistaken for an invisible value.
+    assert!(
+        RuntimeService::delivery_note(
+            &implementation_task,
+            &issue,
+            &outcome(&implementation_note.replace("added a guard", "\u{00a0}解析の修正\u{00a0}")),
+        )
+        .is_ok()
+    );
+}
+
 #[tokio::test]
 async fn qa_success_without_a_durable_verdict_cannot_mark_a_pipeline_passed() {
     let workspace_root = unique_workspace_root("qa-verdict-required");

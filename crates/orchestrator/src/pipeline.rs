@@ -16,6 +16,62 @@ impl RuntimeService {
         "tests run",
         "recheck",
     ];
+    /// Checklist references are deliberately small, human-authored positive
+    /// integers.  The upper bound makes the grammar finite and prevents an
+    /// arbitrary-length digit string from becoming an accidental identifier.
+    /// It is far above the number of criteria an issue can reasonably carry,
+    /// while still keeping the protocol's canonical representation explicit.
+    const MAX_ACCEPTANCE_CHECK_ID: u16 = 999;
+
+    /// Unicode format controls are not covered by `char::is_control`, but a
+    /// value made entirely of them is just as unreadable as a blank value.
+    /// Keep this deliberately narrow: the parser rejects a value only when it
+    /// contains *nothing but* whitespace/control/format characters, so normal
+    /// Unicode prose remains valid.
+    fn is_invisible_format_control(character: char) -> bool {
+        matches!(
+            character,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff0}'..='\u{fff8}'
+                | '\u{e0000}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
+    }
+
+    /// A checklist value may use Unicode prose, but must contain at least one
+    /// visible, non-control character after Unicode-aware normalization.
+    fn has_meaningful_evidence_value(value: &str) -> bool {
+        value.trim().chars().any(|character| {
+            !character.is_control() && !Self::is_invisible_format_control(character)
+        })
+    }
+
+    fn canonical_acceptance_check_id(value: &str) -> Result<String, String> {
+        if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
+            return Err("acceptance check identifiers must be canonical positive integers".into());
+        }
+        let number = value.parse::<u16>().map_err(|_| {
+            format!(
+                "acceptance check `{value}` is outside the supported 1-{} range",
+                Self::MAX_ACCEPTANCE_CHECK_ID
+            )
+        })?;
+        if number == 0 || number > Self::MAX_ACCEPTANCE_CHECK_ID || number.to_string() != value {
+            return Err(format!(
+                "acceptance check `{value}` must be a canonical integer in the 1-{} range",
+                Self::MAX_ACCEPTANCE_CHECK_ID
+            ));
+        }
+        Ok(number.to_string())
+    }
 
     /// Evidence keys are deliberately a narrow, ASCII-only line grammar:
     /// `key: value`, at column zero, using one of the canonical lower-case
@@ -51,9 +107,9 @@ impl RuntimeService {
                 ));
             }
             let candidate = candidate.trim_matches([' ', '\t']);
-            if candidate.is_empty() {
+            if !Self::has_meaningful_evidence_value(candidate) {
                 return Err(format!(
-                    "evidence field `{field}` must have a nonempty value"
+                    "evidence field `{field}` must have a visible nonempty value"
                 ));
             }
             if values.insert(field, candidate).is_some() {
@@ -66,28 +122,55 @@ impl RuntimeService {
     fn required_acceptance_checks(issue: &Issue) -> Result<Vec<String>, String> {
         let mut checks = Vec::new();
         let mut seen = BTreeSet::new();
+        let mut previous = None;
         for line in issue.description.as_deref().unwrap_or_default().lines() {
             let trimmed = line.trim();
+            let Some(first) = trimmed.chars().next() else {
+                continue;
+            };
+            // Any line that begins as a numbered reference (including a
+            // signed or non-ASCII numeric lookalike) is protocol input, not
+            // harmless prose.  Reject near-misses instead of silently losing
+            // a criterion and letting QA coverage become vacuous.
+            let numbered_looking = first.is_numeric()
+                || matches!(first, '+' | '-')
+                    && trimmed
+                        .chars()
+                        .nth(1)
+                        .is_some_and(|character| character.is_numeric());
+            if !numbered_looking {
+                continue;
+            }
             let digits = trimmed
                 .chars()
                 .take_while(|character| character.is_ascii_digit())
                 .count();
             if digits == 0 || !trimmed[digits..].starts_with('.') {
-                continue;
+                return Err(format!(
+                    "acceptance check `{trimmed}` must use canonical `N. <nonempty description>` grammar"
+                ));
             }
-            let number = &trimmed[..digits];
+            let number = Self::canonical_acceptance_check_id(&trimmed[..digits])?;
             let description = &trimmed[digits + 1..];
-            if number.starts_with('0')
-                || description.trim_matches([' ', '\t']).is_empty()
-                || !description.starts_with([' ', '\t'])
+            if !description.starts_with([' ', '\t'])
+                || !Self::has_meaningful_evidence_value(description)
             {
                 return Err(format!(
                     "acceptance check `{trimmed}` must use canonical `N. <nonempty description>` grammar"
                 ));
             }
-            if !seen.insert(number.to_string()) {
+            if !seen.insert(number.clone()) {
                 return Err(format!("acceptance check `{number}` is duplicated"));
             }
+            let number = number
+                .parse::<u16>()
+                .expect("canonical check id parsed above");
+            if previous.is_some_and(|previous| number <= previous) {
+                return Err(format!(
+                    "acceptance check `{number}` must appear in strictly increasing order"
+                ));
+            }
+            previous = Some(number);
             checks.push(number.to_string());
         }
         Ok(checks)
@@ -101,21 +184,16 @@ impl RuntimeService {
         let mut seen = BTreeSet::new();
         for token in values.split(',') {
             let token = token.trim_matches([' ', '\t']);
-            if token.is_empty()
-                || token.starts_with('0')
-                || !token.chars().all(|character| character.is_ascii_digit())
-            {
-                return Err(
-                    "`checks:` must be a comma-separated list of canonical positive integers"
-                        .into(),
-                );
-            }
-            if !seen.insert(token) {
+            let token = Self::canonical_acceptance_check_id(token).map_err(|_| {
+                "`checks:` must be a comma-separated list of canonical positive integers in the supported range"
+                    .to_string()
+            })?;
+            if !seen.insert(token.clone()) {
                 return Err(format!(
                     "`checks:` contains duplicate acceptance check `{token}`"
                 ));
             }
-            checks.push(token.to_string());
+            checks.push(token);
         }
         Ok(checks)
     }
