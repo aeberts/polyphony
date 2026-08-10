@@ -595,6 +595,7 @@ mod init_command_tests {
         assert_eq!(workflow_contents.matches("role: qa").count(), 3);
         assert!(workflow_contents.contains("thread_sandbox: read-only"));
         assert!(workflow_contents.contains("# Bounded Closed-Loop Delivery"));
+        assert!(workflow_contents.contains("{{ issue.description }}"));
     }
 
     #[test]

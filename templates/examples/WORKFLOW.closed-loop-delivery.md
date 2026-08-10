@@ -57,6 +57,12 @@ agents:
 ---
 # Bounded Closed-Loop Delivery
 
+## Selected Tracker Issue
+
+**{{ issue.identifier }}: {{ issue.title }}**
+
+{{ issue.description }}
+
 Run only issues that have explicit tracker approval. The workflow is:
 
 `implementation → independent QA → repair → fresh QA → repair → fresh QA`.
