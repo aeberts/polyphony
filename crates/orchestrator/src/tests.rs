@@ -9,7 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use polyphony_core::{
-    AgentSession, CreateIssueRequest, Deliverable, DeliverableDecision, DeliverableKind,
+    AddIssueCommentRequest, AgentSession, CreateIssueRequest, Deliverable, DeliverableDecision, DeliverableKind,
     DeliverableStatus, DispatchMode, IssueAuthor, IssueComment, IssueStateUpdate, PullRequestRef,
     StepStatus, StoreBootstrap, UpdateIssueRequest, Workspace, WorkspaceCommitResult,
     WorkspaceRequest,
@@ -31,6 +31,7 @@ struct TestTracker {
     issue_updates: Arc<Mutex<Vec<UpdateIssueRequest>>>,
     acknowledged_issues: Arc<Mutex<Vec<String>>>,
     created_issues: Arc<Mutex<Vec<CreateIssueRequest>>>,
+    comments: Arc<Mutex<Vec<AddIssueCommentRequest>>>,
 }
 
 #[derive(Clone)]
@@ -105,6 +106,7 @@ impl TestTracker {
             issue_updates: Arc::new(Mutex::new(Vec::new())),
             acknowledged_issues: Arc::new(Mutex::new(Vec::new())),
             created_issues: Arc::new(Mutex::new(Vec::new())),
+            comments: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -126,6 +128,10 @@ impl TestTracker {
 
     fn recorded_create_issues(&self) -> Vec<CreateIssueRequest> {
         self.created_issues.lock().unwrap().clone()
+    }
+
+    fn recorded_comments(&self) -> Vec<AddIssueCommentRequest> {
+        self.comments.lock().unwrap().clone()
     }
 }
 
@@ -302,6 +308,21 @@ impl IssueTracker for TestTracker {
         }
         issue.updated_at = Some(Utc::now());
         Ok(issue.clone())
+    }
+
+    async fn comment_on_issue(
+        &self,
+        request: &AddIssueCommentRequest,
+    ) -> Result<IssueComment, polyphony_core::Error> {
+        self.comments.lock().unwrap().push(request.clone());
+        Ok(IssueComment {
+            id: format!("comment-{}", self.comments.lock().unwrap().len()),
+            body: request.body.clone(),
+            author: None,
+            url: Some(format!("https://tracker.test/issues/{}/comments/{}", request.id, self.comments.lock().unwrap().len())),
+            created_at: Some(Utc::now()),
+            updated_at: None,
+        })
     }
 
     async fn acknowledge_issue(&self, issue: &Issue) -> Result<(), polyphony_core::Error> {
@@ -1023,10 +1044,12 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
             Some(if *attempts == 1 {
                 "QA FAIL: fixture found the implementation marker is incomplete".into()
             } else {
-                "QA PASS: fixture confirmed the repair marker and focused checks".into()
+                "QA PASS: checks: 1, 2, 3, 4, 5; fixture confirmed the repair marker and focused checks".into()
             })
+        } else if spec.agent.name == "repair" {
+            Some("REPAIR NOTE: commit: fixture-repair; checks: 3, 4; tests: focused fixture".into())
         } else {
-            None
+            Some("IMPLEMENTATION NOTE: commit: fixture-implementation; checks: 1, 2; tests: focused fixture".into())
         };
         Ok(AgentRunResult {
             status: AttemptStatus::Succeeded,
@@ -5872,16 +5895,18 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
         "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n---\nClosed-loop fixture\n",
     );
     let (_tx, rx) = watch::channel(workflow.clone());
-    let issue = sample_issue(
+    let mut issue = sample_issue(
         "issue-qa-fixture",
         "QA-17",
         "Todo",
         "Closed-loop QA fixture",
     );
+    issue.description = Some("Acceptance checks\n1. implementation evidence\n2. qa pass evidence\n3. repair routing\n4. restart retention\n5. human-readable record".into());
     let agent = ClosedLoopQaFixtureAgent::default();
     let agent_handle = agent.clone();
+    let tracker = TestTracker::new(vec![issue.clone()]);
     let mut service = RuntimeService::new(
-        Arc::new(TestTracker::new(vec![issue.clone()])),
+        Arc::new(tracker.clone()),
         None,
         Arc::new(agent),
         Arc::new(RecordingProvisioner::default()),
@@ -5923,7 +5948,7 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
 
     let (_restart_tx, restart_rx) = watch::channel(workflow.clone());
     let mut restarted = RuntimeService::new(
-        Arc::new(TestTracker::new(vec![issue.clone()])),
+        Arc::new(tracker.clone()),
         None,
         Arc::new(agent_handle.clone()),
         Arc::new(RecordingProvisioner::default()),
@@ -6015,6 +6040,37 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
             .iter()
             .all(|task| task.status != TaskStatus::Pending)
     );
+    let comments = tracker.recorded_comments();
+    assert_eq!(comments.len(), 4, "restart must retain rather than duplicate evidence notes");
+    assert!(comments.iter().any(|note| note.body.contains("implementation note")));
+    assert!(comments.iter().any(|note| note.body.contains("repair note")));
+    assert_eq!(comments.iter().filter(|note| note.body.contains("QA note")).count(), 2);
+}
+
+#[tokio::test]
+async fn closed_loop_implementation_cannot_complete_without_an_implementation_note() {
+    let workspace_root = unique_workspace_root("implementation-note-required");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n---\nEvidence fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue("issue-implementation-note", "EV-1", "Todo", "Evidence required");
+    let mut service = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None, None, None, None, None, None, rx,
+    ).0;
+    service.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None).await.unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    service.handle_task_finished(&workflow, &issue, &run_id, &task_id, &workspace_root, &AgentRunResult::succeeded(1), None).await.unwrap();
+    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Failed);
+    assert!(service.state.tasks[&run_id][0].error.as_deref().unwrap().contains("IMPLEMENTATION NOTE"));
 }
 
 #[tokio::test]
