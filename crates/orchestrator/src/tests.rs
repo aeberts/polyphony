@@ -990,6 +990,53 @@ struct ScriptedPipelineAgent {
     calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+/// Disposable fake worker for the independent-QA delivery contract.  It never
+/// calls a provider or repository automation: role names alone determine the
+/// scripted lifecycle and the QA reports are returned as durable evidence.
+#[derive(Clone, Default)]
+struct ClosedLoopQaFixtureAgent {
+    calls: Arc<Mutex<Vec<String>>>,
+    qa_attempts: Arc<Mutex<u32>>,
+}
+
+impl ClosedLoopQaFixtureAgent {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for ClosedLoopQaFixtureAgent {
+    fn component_key(&self) -> String {
+        "provider:closed-loop-qa-fixture".into()
+    }
+
+    async fn run(
+        &self,
+        spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<AgentRunResult, polyphony_core::Error> {
+        self.calls.lock().unwrap().push(spec.agent.name.clone());
+        let final_issue_state = if spec.agent.name == "qa" {
+            let mut attempts = self.qa_attempts.lock().unwrap();
+            *attempts += 1;
+            Some(if *attempts == 1 {
+                "QA FAIL: fixture found the implementation marker is incomplete".into()
+            } else {
+                "QA PASS: fixture confirmed the repair marker and focused checks".into()
+            })
+        } else {
+            None
+        };
+        Ok(AgentRunResult {
+            status: AttemptStatus::Succeeded,
+            turns_completed: 1,
+            error: None,
+            final_issue_state,
+        })
+    }
+}
+
 impl ScriptedPipelineAgent {
     fn recorded_agent_names(&self) -> Vec<String> {
         self.calls
@@ -5815,6 +5862,212 @@ async fn manual_dispatch_directives_reach_pipeline_router_and_worker_prompts() {
         .find(|run| run.issue_id.as_deref() == Some(issue.id.as_str()))
         .expect("run should be created for pipeline dispatch");
     assert_eq!(run.manual_dispatch_directives.as_deref(), Some(directives));
+}
+
+#[tokio::test]
+async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_durable_evidence() {
+    let workspace_root = unique_workspace_root("independent-qa-roles");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n    - { category: review, role: qa, agent: qa }\n---\nClosed-loop fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-qa-fixture",
+        "QA-17",
+        "Todo",
+        "Closed-loop QA fixture",
+    );
+    let agent = ClosedLoopQaFixtureAgent::default();
+    let agent_handle = agent.clone();
+    let mut service = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    // Implementation and first QA (FAIL), then simulate a restart while the
+    // distinct repair worker is active.
+    for _ in 0..2 {
+        handle_next_worker_message(&mut service).await;
+    }
+    let persisted_run: Run = serde_json::from_value(
+        serde_json::to_value(service.state.runs.values().next().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let persisted_tasks: Vec<Task> = serde_json::from_value(
+        serde_json::to_value(service.state.tasks[&persisted_run.id].clone()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted_tasks[1].status, TaskStatus::Failed);
+    assert_eq!(persisted_tasks[2].status, TaskStatus::InProgress);
+    assert!(
+        persisted_tasks[1]
+            .activity_log
+            .iter()
+            .any(|line| line.contains("QA FAIL") && line.contains("fixture found"))
+    );
+
+    let (_restart_tx, restart_rx) = watch::channel(workflow.clone());
+    let mut restarted = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(agent_handle.clone()),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        restart_rx,
+    )
+    .0;
+    restarted
+        .state
+        .runs
+        .insert(persisted_run.id.clone(), persisted_run.clone());
+    restarted
+        .state
+        .tasks
+        .insert(persisted_run.id.clone(), persisted_tasks);
+    restarted
+        .normalize_restored_in_progress_runs()
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.state.tasks[&persisted_run.id][2].status,
+        TaskStatus::Pending
+    );
+    assert_eq!(
+        restarted.state.tasks[&persisted_run.id][1].status,
+        TaskStatus::Failed
+    );
+    restarted
+        .dispatch_next_task(
+            restarted.workflow(),
+            issue.clone(),
+            None,
+            false,
+            &persisted_run.id,
+            persisted_run.workspace_path.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    // Restart dispatches repair once, then fresh QA once; it never reruns the
+    // first QA that supplied the persisted failure evidence.
+    for _ in 0..2 {
+        handle_next_worker_message(&mut restarted).await;
+    }
+
+    let calls = agent_handle.calls();
+    // The original process may already have started its repair before this
+    // in-memory crash simulation drops it. Crucially, recovery starts repair
+    // (not QA) and produces exactly the original QA plus one fresh QA.
+    assert_eq!(calls.iter().filter(|name| name.as_str() == "qa").count(), 2);
+    assert_eq!(calls.last().map(String::as_str), Some("qa"));
+    let run = restarted.state.runs.values().next().unwrap();
+    let tasks = restarted.state.tasks.get(&run.id).unwrap();
+    assert_eq!(
+        tasks.iter().map(|task| task.role).collect::<Vec<_>>(),
+        vec![
+            polyphony_core::PipelineTaskRole::Implementation,
+            polyphony_core::PipelineTaskRole::Qa,
+            polyphony_core::PipelineTaskRole::Repair,
+            polyphony_core::PipelineTaskRole::Qa,
+        ]
+    );
+    assert_eq!(tasks[1].status, TaskStatus::Failed);
+    assert!(
+        tasks[1]
+            .activity_log
+            .iter()
+            .any(|line| line.contains("QA FAIL") && line.contains("fixture found"))
+    );
+    assert_eq!(tasks[3].status, TaskStatus::Completed);
+    assert!(
+        tasks[3]
+            .activity_log
+            .iter()
+            .any(|line| line.contains("QA PASS") && line.contains("fixture confirmed"))
+    );
+
+    // Task rows are the durable store representation.  The restarted fixture
+    // retained both QA verdicts/evidence and has no pending duplicate QA.
+    let restored: Vec<Task> = serde_json::from_value(serde_json::to_value(tasks).unwrap()).unwrap();
+    assert_eq!(restored[1].activity_log, tasks[1].activity_log);
+    assert_eq!(restored[3].activity_log, tasks[3].activity_log);
+    assert!(
+        restored
+            .iter()
+            .all(|task| task.status != TaskStatus::Pending)
+    );
+}
+
+#[tokio::test]
+async fn qa_success_without_a_durable_verdict_cannot_mark_a_pipeline_passed() {
+    let workspace_root = unique_workspace_root("qa-verdict-required");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: qa\n  profiles:\n    qa: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n---\nQA fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue("issue-qa-verdict", "QA-18", "Todo", "Verdict required");
+    let mut service = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    service
+        .handle_task_finished(
+            &workflow,
+            &issue,
+            &run_id,
+            &task_id,
+            &workspace_root,
+            &AgentRunResult::succeeded(1),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Failed);
+    assert!(
+        service.state.tasks[&run_id][0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("durable QA PASS or QA FAIL")
+    );
 }
 
 #[tokio::test]

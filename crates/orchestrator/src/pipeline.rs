@@ -1,6 +1,25 @@
 use crate::{prelude::*, *};
 
 impl RuntimeService {
+    /// QA is not allowed to silently succeed.  Its terminal state must carry a
+    /// machine-readable verdict and non-empty evidence so restart/retry logic
+    /// can make a durable, role-safe decision without trusting a prompt.
+    fn qa_verdict(outcome: &AgentRunResult) -> Result<(bool, String), String> {
+        let Some(report) = outcome.final_issue_state.as_deref() else {
+            return Err("QA completed without a durable QA PASS or QA FAIL verdict".into());
+        };
+        let report = report.trim();
+        for (prefix, passed) in [("QA PASS:", true), ("QA FAIL:", false)] {
+            if let Some(evidence) = report.strip_prefix(prefix) {
+                let evidence = evidence.trim();
+                if !evidence.is_empty() {
+                    return Ok((passed, evidence.to_string()));
+                }
+            }
+        }
+        Err("QA verdict must be `QA PASS: <evidence>` or `QA FAIL: <evidence>`".into())
+    }
+
     pub(crate) async fn dispatch_pipeline(
         &mut self,
         workflow: LoadedWorkflow,
@@ -1001,18 +1020,60 @@ impl RuntimeService {
             error = outcome.error.as_deref().unwrap_or("none"),
             "pipeline task finished"
         );
+        let is_qa = task_snapshot
+            .as_ref()
+            .is_some_and(|task| task.role == polyphony_core::PipelineTaskRole::Qa);
+        let qa_result = if is_qa && matches!(outcome.status, AttemptStatus::Succeeded) {
+            Some(Self::qa_verdict(outcome))
+        } else {
+            None
+        };
+        let qa_failed = is_qa
+            && (!matches!(outcome.status, AttemptStatus::Succeeded)
+                || qa_result
+                    .as_ref()
+                    .is_some_and(|result| result.as_ref().is_ok_and(|(passed, _)| !passed))
+                || qa_result.as_ref().is_some_and(Result::is_err));
+
         if let Some(tasks) = self.state.tasks.get_mut(run_id)
             && let Some(task) = tasks.iter_mut().find(|t| t.id == task_id)
         {
-            task.status = match outcome.status {
-                AttemptStatus::Succeeded => TaskStatus::Completed,
-                AttemptStatus::CancelledByReconciliation | AttemptStatus::CancelledByUser => {
-                    TaskStatus::Cancelled
-                },
-                _ => TaskStatus::Failed,
+            task.status = if is_qa {
+                if qa_failed {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Completed
+                }
+            } else {
+                match outcome.status {
+                    AttemptStatus::Succeeded => TaskStatus::Completed,
+                    AttemptStatus::CancelledByReconciliation | AttemptStatus::CancelledByUser => {
+                        TaskStatus::Cancelled
+                    },
+                    _ => TaskStatus::Failed,
+                }
             };
             task.turns_completed = outcome.turns_completed;
-            task.error = outcome.error.clone();
+            task.error = if is_qa {
+                match qa_result.as_ref() {
+                    Some(Ok((false, evidence))) => Some(format!("QA FAIL: {evidence}")),
+                    Some(Err(error)) => Some(error.clone()),
+                    _ => outcome.error.clone(),
+                }
+            } else {
+                outcome.error.clone()
+            };
+            if let Some(Ok((passed, evidence))) = qa_result.as_ref() {
+                task.activity_log.push(format!(
+                    "durable QA {} evidence: {}",
+                    if *passed {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    },
+                    evidence
+                ));
+            }
             task.finished_at = Some(now);
             task.updated_at = now;
             if let Some(store) = &self.store {
@@ -1026,7 +1087,7 @@ impl RuntimeService {
                 s.kind == polyphony_core::StepKind::AgentRun
                     && s.task_id.as_deref() == Some(task_id)
             }) {
-                if matches!(outcome.status, AttemptStatus::Succeeded) {
+                if matches!(outcome.status, AttemptStatus::Succeeded) && !qa_failed {
                     step.mark_succeeded();
                 } else if matches!(
                     outcome.status,
@@ -1044,6 +1105,55 @@ impl RuntimeService {
             if let Some(store) = &self.store {
                 store.save_run(run).await?;
             }
+        }
+
+        if qa_failed {
+            let repair_is_next = self
+                .state
+                .tasks
+                .get(run_id)
+                .and_then(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|task| task.status == TaskStatus::Pending)
+                        .min_by_key(|task| task.ordinal)
+                        .map(|task| task.role == polyphony_core::PipelineTaskRole::Repair)
+                })
+                .unwrap_or(false);
+            if repair_is_next {
+                if let Some(run) = self.state.runs.get_mut(run_id) {
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        format!("QA failed; dispatching the next distinct repair role for task {task_id}"),
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                return self
+                    .dispatch_next_task(
+                        self.workflow(),
+                        issue.clone(),
+                        attempt,
+                        false,
+                        run_id,
+                        workspace_path,
+                    )
+                    .await;
+            }
+            if let Some(run) = self.state.runs.get_mut(run_id) {
+                run.status = RunStatus::Failed;
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    "QA failed without a pending distinct repair task; pipeline stopped",
+                );
+                run.updated_at = now;
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+            return Ok(());
         }
 
         if matches!(outcome.status, AttemptStatus::Succeeded) {

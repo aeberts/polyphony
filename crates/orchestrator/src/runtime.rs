@@ -1683,6 +1683,50 @@ impl RuntimeService {
             let Some(tasks) = self.state.tasks.get_mut(&run_id) else {
                 continue;
             };
+            // A QA FAIL is a durable gate, not an agent crash.  If the
+            // process stopped after dispatching its distinct repair role,
+            // restore that repair as pending.  This preserves the QA evidence
+            // and resumes the only permitted next role instead of retrying QA
+            // or silently completing the pipeline.
+            let repair_index = tasks.iter().position(|task| {
+                task.status == TaskStatus::InProgress
+                    && task.role == polyphony_core::PipelineTaskRole::Repair
+                    && tasks.iter().any(|qa| {
+                        qa.ordinal < task.ordinal
+                            && qa.role == polyphony_core::PipelineTaskRole::Qa
+                            && qa.status == TaskStatus::Failed
+                            && qa
+                                .activity_log
+                                .iter()
+                                .any(|entry| entry.starts_with("durable QA FAIL evidence:"))
+                    })
+            });
+            if let Some(repair_index) = repair_index {
+                let repair = &mut tasks[repair_index];
+                repair.status = TaskStatus::Pending;
+                repair.error = None;
+                repair.finished_at = None;
+                repair.updated_at = now;
+                if let Some(store) = &self.store {
+                    store.save_task(repair).await?;
+                }
+                if let Some(run) = self.state.runs.get_mut(&run_id) {
+                    run.status = RunStatus::InProgress;
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        "restart restored pending distinct repair role after durable QA FAIL",
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                self.push_event(
+                    EventScope::Startup,
+                    format!("restored QA-gated run {run_id}; repair remains the next role"),
+                );
+                continue;
+            }
             let has_stale_in_progress_task = tasks
                 .iter()
                 .any(|task| task.status == TaskStatus::InProgress);
