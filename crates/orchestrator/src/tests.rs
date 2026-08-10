@@ -2908,6 +2908,7 @@ async fn run_preserves_restored_cancelled_run_before_first_snapshot() {
         description: None,
         activity_log: Vec::new(),
         category: polyphony_core::TaskCategory::Review,
+        role: polyphony_core::PipelineTaskRole::Implementation,
         status: TaskStatus::InProgress,
         ordinal: 1,
         parent_id: None,
@@ -3742,6 +3743,7 @@ async fn reconcile_running_requests_stop_for_ineligible_issue_when_enabled() {
         category: "coding".into(),
         description: None,
         agent: None,
+        role: polyphony_core::PipelineTaskRole::Implementation,
     }
     .to_task(&run_id, 0);
     let task_id = task.id.clone();
@@ -4379,6 +4381,7 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
         category: "coding".into(),
         description: None,
         agent: None,
+        role: polyphony_core::PipelineTaskRole::Implementation,
     }
     .to_task(&run_id, 0);
     let task_id = task.id.clone();
@@ -4455,6 +4458,7 @@ async fn cancelled_pipeline_task_is_terminal_for_reconciliation_and_user_stops()
         category: "coding".into(),
         description: None,
         agent: None,
+        role: polyphony_core::PipelineTaskRole::Implementation,
     }
     .to_task(&user_run_id, 0);
     let user_task_id = user_task.id.clone();
@@ -4555,6 +4559,7 @@ async fn failed_pipeline_task_replans_when_configured() {
         category: "coding".into(),
         description: None,
         agent: None,
+        role: polyphony_core::PipelineTaskRole::Implementation,
     }
     .to_task(&run_id, 0);
     let task_id = task.id.clone();
@@ -5222,6 +5227,7 @@ async fn workspace_progress_updates_are_appended_to_worktree_task() {
         description: None,
         activity_log: Vec::new(),
         category: polyphony_core::TaskCategory::Research,
+        role: polyphony_core::PipelineTaskRole::Implementation,
         status: TaskStatus::InProgress,
         ordinal: 0,
         parent_id: None,
@@ -5325,6 +5331,7 @@ async fn task_retry_ignores_non_failed_tasks() {
         description: None,
         activity_log: Vec::new(),
         category: polyphony_core::TaskCategory::Research,
+        role: polyphony_core::PipelineTaskRole::Implementation,
         status: TaskStatus::Completed,
         ordinal: 0,
         parent_id: None,
@@ -5438,6 +5445,7 @@ async fn run_retry_relaunches_pull_request_review_from_first_failed_task() {
             description: None,
             activity_log: Vec::new(),
             category: polyphony_core::TaskCategory::Research,
+            role: polyphony_core::PipelineTaskRole::Implementation,
             status: TaskStatus::Failed,
             ordinal: 0,
             parent_id: None,
@@ -5459,6 +5467,7 @@ async fn run_retry_relaunches_pull_request_review_from_first_failed_task() {
             description: None,
             activity_log: Vec::new(),
             category: polyphony_core::TaskCategory::Review,
+            role: polyphony_core::PipelineTaskRole::Implementation,
             status: TaskStatus::Cancelled,
             ordinal: 1,
             parent_id: None,
@@ -5587,6 +5596,7 @@ async fn run_retry_recovers_stalled_pull_request_review_after_restart() {
             description: None,
             activity_log: Vec::new(),
             category: polyphony_core::TaskCategory::Research,
+            role: polyphony_core::PipelineTaskRole::Implementation,
             status: TaskStatus::Pending,
             ordinal: 0,
             parent_id: None,
@@ -5608,6 +5618,7 @@ async fn run_retry_recovers_stalled_pull_request_review_after_restart() {
             description: None,
             activity_log: Vec::new(),
             category: polyphony_core::TaskCategory::Review,
+            role: polyphony_core::PipelineTaskRole::Implementation,
             status: TaskStatus::Cancelled,
             ordinal: 1,
             parent_id: None,
@@ -6239,6 +6250,7 @@ async fn normalize_restored_cancelled_run_keeps_task_terminal() {
             description: None,
             activity_log: Vec::new(),
             category: polyphony_core::TaskCategory::Review,
+            role: polyphony_core::PipelineTaskRole::Implementation,
             status: polyphony_core::TaskStatus::InProgress,
             ordinal: 1,
             parent_id: None,
@@ -6331,6 +6343,7 @@ async fn normalize_restored_in_progress_runs_marks_first_pending_task_failed() {
                 description: None,
                 activity_log: Vec::new(),
                 category: polyphony_core::TaskCategory::Research,
+                role: polyphony_core::PipelineTaskRole::Implementation,
                 status: polyphony_core::TaskStatus::Completed,
                 ordinal: 0,
                 parent_id: None,
@@ -6352,6 +6365,7 @@ async fn normalize_restored_in_progress_runs_marks_first_pending_task_failed() {
                 description: None,
                 activity_log: Vec::new(),
                 category: polyphony_core::TaskCategory::Review,
+                role: polyphony_core::PipelineTaskRole::Implementation,
                 status: polyphony_core::TaskStatus::Pending,
                 ordinal: 1,
                 parent_id: None,

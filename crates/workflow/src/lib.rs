@@ -7,7 +7,7 @@ const fn default_true() -> bool {
     true
 }
 
-use polyphony_core::{CheckoutKind, PtyBackendKind, TrackerKind};
+use polyphony_core::{CheckoutKind, PipelineTaskRole, PtyBackendKind, TrackerKind};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value as YamlValue;
 use thiserror::Error;
@@ -434,6 +434,9 @@ pub struct FeedbackConfig {
 #[serde(default)]
 pub struct PipelineStageConfig {
     pub category: String,
+    /// `qa` tasks are independently read-only and cannot use mutation tools.
+    #[serde(default)]
+    pub role: PipelineTaskRole,
     pub agent: Option<String>,
     pub prompt: Option<String>,
     pub max_turns: Option<u32>,

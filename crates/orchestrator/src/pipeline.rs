@@ -323,6 +323,7 @@ impl RuntimeService {
                     description: None,
                     activity_log: Vec::new(),
                     category,
+                    role: stage.role,
                     status: TaskStatus::Pending,
                     ordinal: (index + 1) as u32,
                     parent_id: None,
@@ -614,9 +615,17 @@ impl RuntimeService {
         prompt.push_str(&format!(
             "\n\n## Pipeline Task {}/{}\n\
              **Task:** {}\n\
-             **Category:** {}\n",
-            task.ordinal, total_tasks, task.title, task.category
+             **Category:** {}\n\
+             **Role:** {}\n",
+            task.ordinal, total_tasks, task.title, task.category, task.role
         ));
+        if task.role == polyphony_core::PipelineTaskRole::Qa {
+            prompt.push_str(
+                "\nYou are the independent QA role. Do not modify the workspace, run git mutation, \
+                 commit, push, create a pull request, or dispatch repair work. Inspect and test only; \
+                 publish a durable PASS or FAIL verdict with evidence through the tracker evidence tool.\n",
+            );
+        }
         if let Some(desc) = &task.description {
             prompt.push_str(&format!("**Description:** {desc}\n"));
         }
@@ -1214,6 +1223,7 @@ impl RuntimeService {
             description: Some(request.prompt.clone()),
             activity_log: Vec::new(),
             category: TaskCategory::Feedback,
+            role: polyphony_core::PipelineTaskRole::Implementation,
             status: TaskStatus::Pending,
             ordinal: next_ordinal,
             parent_id: None,

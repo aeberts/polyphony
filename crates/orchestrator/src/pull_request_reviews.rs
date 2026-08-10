@@ -1574,6 +1574,7 @@ fn upsert_pull_request_task(
         description: None,
         activity_log: Vec::new(),
         category,
+        role: polyphony_core::PipelineTaskRole::Implementation,
         status: TaskStatus::Pending,
         ordinal,
         parent_id: None,

@@ -119,6 +119,28 @@ pub enum TaskCategory {
     Feedback,
 }
 
+/// The authority a pipeline task is granted.  This is persisted separately
+/// from the task category: a `review` category is descriptive, while `Qa`
+/// carries the read-only delivery-pipeline contract.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineTaskRole {
+    #[default]
+    Implementation,
+    Qa,
+    Repair,
+}
+
+impl fmt::Display for PipelineTaskRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Implementation => "implementation",
+            Self::Qa => "qa",
+            Self::Repair => "repair",
+        })
+    }
+}
+
 impl fmt::Display for TaskCategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -676,6 +698,9 @@ pub struct Task {
     #[serde(default)]
     pub activity_log: Vec<String>,
     pub category: TaskCategory,
+    /// Durable task authority for closed-loop delivery pipelines.
+    #[serde(default)]
+    pub role: PipelineTaskRole,
     pub status: TaskStatus,
     pub ordinal: u32,
     pub parent_id: Option<TaskId>,
@@ -709,6 +734,8 @@ pub struct PlannedTask {
     pub description: Option<String>,
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub role: PipelineTaskRole,
 }
 
 impl PlannedTask {
@@ -729,6 +756,7 @@ impl PlannedTask {
             description: self.description.clone(),
             activity_log: Vec::new(),
             category,
+            role: self.role,
             status: TaskStatus::Pending,
             ordinal,
             parent_id: None,

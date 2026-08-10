@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::{self, File},
     io::{BufRead, BufReader},
@@ -89,6 +89,10 @@ pub struct RegistryToolExecutor {
     tools: HashMap<String, Arc<dyn BuiltinTool>>,
     global_policy: ToolPolicy,
     agent_policies: HashMap<String, ToolPolicyConfig>,
+    /// QA authority is derived from the pipeline, not from a cooperative
+    /// per-agent config entry. This prevents a broad global policy from
+    /// accidentally granting a reviewer a mutation tool.
+    qa_agents: HashSet<String>,
 }
 
 impl RegistryToolExecutor {
@@ -128,6 +132,14 @@ impl RegistryToolExecutor {
             register_tool(&mut tools, LinearGraphqlTool { tracker });
         }
 
+        let qa_agents = workflow
+            .config
+            .pipeline
+            .stages
+            .iter()
+            .filter(|stage| stage.role == polyphony_core::PipelineTaskRole::Qa)
+            .filter_map(|stage| stage.agent.clone())
+            .collect();
         Ok(Some(Arc::new(Self {
             tools,
             global_policy: ToolPolicy::from_config(
@@ -135,16 +147,33 @@ impl RegistryToolExecutor {
                 &workflow.config.tools.deny,
             ),
             agent_policies: workflow.config.tools.by_agent.clone(),
+            qa_agents,
         }) as Arc<dyn ToolExecutor>))
     }
 
     fn effective_policy(&self, agent_name: &str) -> ToolPolicy {
-        match self.agent_policies.get(agent_name) {
+        let policy = match self.agent_policies.get(agent_name) {
             Some(policy) => self.global_policy.merge(policy),
             None => ToolPolicy {
                 allow: self.global_policy.allow.clone(),
                 deny: self.global_policy.deny.clone(),
             },
+        };
+        if self.qa_agents.contains(agent_name) {
+            // This is intentionally an allow-list. New mutation tools stay
+            // unavailable to QA until explicitly classified as read-only.
+            ToolPolicy {
+                allow: vec![
+                    "workspace_list_files".into(),
+                    "workspace_read_file".into(),
+                    "workspace_search".into(),
+                    "issue_comment".into(),
+                    "pr_comment".into(),
+                ],
+                deny: policy.deny,
+            }
+        } else {
+            policy
         }
     }
 
@@ -169,18 +198,20 @@ impl ToolExecutor for RegistryToolExecutor {
 
     async fn execute(&self, request: ToolCallRequest) -> Result<ToolCallResult, CoreError> {
         let policy = self.effective_policy(&request.agent_name);
+        if !policy.is_allowed(&request.name) {
+            return Ok(denied_tool_result(
+                &request.name,
+                &request.agent_name,
+                self.qa_agents.contains(&request.agent_name),
+                self.list_tools(&request.agent_name),
+            ));
+        }
         let Some(tool) = self.tools.get(&request.name).cloned() else {
             return Ok(unsupported_tool_result(
                 &request.name,
                 self.list_tools(&request.agent_name),
             ));
         };
-        if !policy.is_allowed(&request.name) {
-            return Ok(unsupported_tool_result(
-                &request.name,
-                self.list_tools(&request.agent_name),
-            ));
-        }
         tool.execute(&request).await
     }
 }
@@ -1196,6 +1227,21 @@ fn unsupported_tool_result(tool_name: &str, supported_tools: Vec<ToolSpec>) -> T
     }))
 }
 
+fn denied_tool_result(
+    tool_name: &str,
+    agent_name: &str,
+    qa_restriction: bool,
+    supported_tools: Vec<ToolSpec>,
+) -> ToolCallResult {
+    failure_result(json!({
+        "error": {
+            "message": format!("Tool `{tool_name}` denied by policy for agent `{agent_name}`."),
+            "code": if qa_restriction { "qa_read_only_policy" } else { "tool_policy_denied" },
+            "supportedTools": supported_tools.into_iter().map(|tool| tool.name).collect::<Vec<_>>(),
+        }
+    }))
+}
+
 fn json_result(success: bool, payload: Value) -> ToolCallResult {
     let output = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
     ToolCallResult::new(success, output.clone(), vec![json!({
@@ -1474,6 +1520,69 @@ prompt
         let comments = commenter.comments.lock().unwrap();
         assert_eq!(comments[0].0.number, 42);
         assert_eq!(comments[0].1, "Looks good");
+    }
+
+    #[tokio::test]
+    async fn qa_role_is_read_only_even_when_global_policy_allows_mutation() {
+        let tempdir = TempDir::new().unwrap();
+        let tracker = Arc::new(MockTracker::default());
+        let workflow = loaded_workflow(
+            r#"---
+tracker:
+  kind: github
+  repository: owner/repo
+  api_key: token
+tools:
+  enabled: true
+  allow: ["*"]
+agents:
+  default: implementer
+  profiles:
+    implementer: { kind: mock, transport: mock, command: mock }
+    qa: { kind: mock, transport: mock, command: mock }
+pipeline:
+  stages:
+    - category: coding
+      role: implementation
+      agent: implementer
+    - category: review
+      role: qa
+      agent: qa
+---
+prompt
+"#,
+        );
+        let executor =
+            RegistryToolExecutor::from_runtime_components(&workflow, tracker.clone(), None)
+                .unwrap()
+                .unwrap();
+
+        let visible = executor
+            .list_tools("qa")
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(visible.contains(&"workspace_read_file".into()));
+        assert!(visible.contains(&"issue_comment".into()));
+        assert!(!visible.contains(&"issue_update".into()));
+
+        let mut denied = tool_request("issue_update", tempdir.path(), json!({ "title": "mutate" }));
+        denied.agent_name = "qa".into();
+        let denied = executor.execute(denied).await.unwrap();
+        assert!(!denied.success);
+        assert!(denied.output.contains("qa_read_only_policy"));
+        assert!(tracker.updates.lock().unwrap().is_empty());
+
+        let mut write = tool_request(
+            "workspace_write_file",
+            tempdir.path(),
+            json!({ "path": "src/lib.rs" }),
+        );
+        write.agent_name = "qa".into();
+        let write = executor.execute(write).await.unwrap();
+        assert!(!write.success);
+        assert!(write.output.contains("qa_read_only_policy"));
+        assert!(!tempdir.path().join("src/lib.rs").exists());
     }
 
     fn loaded_workflow(raw: &str) -> LoadedWorkflow {

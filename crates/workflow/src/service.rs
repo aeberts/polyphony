@@ -735,6 +735,33 @@ impl ServiceConfig {
                 "agents.reviewer `{agent_name}` is not defined"
             )));
         }
+        let qa_agents = self
+            .pipeline
+            .stages
+            .iter()
+            .filter(|stage| stage.role == polyphony_core::PipelineTaskRole::Qa)
+            .filter_map(|stage| stage.agent.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        for stage in &self.pipeline.stages {
+            if let Some(agent_name) = stage.agent.as_deref()
+                && !self.agents.profiles.contains_key(agent_name)
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "pipeline stage references unknown agent `{agent_name}`"
+                )));
+            }
+            if stage.role != polyphony_core::PipelineTaskRole::Qa
+                && stage
+                    .agent
+                    .as_deref()
+                    .is_some_and(|agent| qa_agents.contains(agent))
+            {
+                return Err(Error::InvalidConfig(
+                    "pipeline QA agent must be distinct from implementation and repair agents"
+                        .into(),
+                ));
+            }
+        }
         if let Some(agent_name) = &self.orchestration.router_agent
             && !self.agents.profiles.contains_key(agent_name)
         {
