@@ -862,6 +862,7 @@ fn draw_runs_table(
                             ("✓", theme.success, "delivered (no changes)")
                         },
                         polyphony_core::RunStatus::Failed => ("✕", theme.danger, "failed"),
+                        polyphony_core::RunStatus::Blocked => ("⊘", theme.muted, "blocked"),
                         _ => ("●", theme.muted, "unknown"),
                     };
                     let mut spans = vec![
@@ -1068,6 +1069,7 @@ fn run_status_emoji(
         RunStatus::Delivered => ("✓", theme.success),
         RunStatus::Failed => ("✕", theme.danger),
         RunStatus::Cancelled => ("⊘", theme.muted),
+        RunStatus::Blocked => ("⊘", theme.muted),
     }
 }
 
@@ -1154,6 +1156,7 @@ pub(crate) fn run_status_label(status: &polyphony_core::RunStatus) -> &'static s
         RunStatus::Delivered => "delivered",
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
+        RunStatus::Blocked => "blocked",
     }
 }
 
@@ -1169,6 +1172,7 @@ fn run_status_color(
         RunStatus::Delivered => theme.success,
         RunStatus::Failed => theme.danger,
         RunStatus::Cancelled => theme.muted,
+        RunStatus::Blocked => theme.muted,
     }
 }
 
@@ -1416,6 +1420,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
         };
 
@@ -1441,6 +1446,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
         };
 

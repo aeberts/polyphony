@@ -102,6 +102,11 @@ pub fn build_run_insight(
             .as_ref()
             .map(|reason| format!("Cancelled. {reason}"))
             .unwrap_or_else(|| "Run cancelled.".into()),
+        RunStatus::Blocked => run
+            .blocked_outcome
+            .as_ref()
+            .map(|outcome| format!("Blocked pending {}: {}", outcome.prerequisite, outcome.reason))
+            .unwrap_or_else(|| "Run is blocked pending prerequisite work.".into()),
     };
 
     let next_action = next_action(run);
@@ -186,6 +191,7 @@ fn next_action(run: &RunRow) -> Option<String> {
         RunStatus::Failed => Some("Inspect the failure, then retry the run.".into()),
         RunStatus::Review => Some("Inspect the review output and decide on handoff.".into()),
         RunStatus::Cancelled => Some("Retry after addressing the cancellation reason.".into()),
+        RunStatus::Blocked => None,
         _ => None,
     }
 }
@@ -478,6 +484,7 @@ mod tests {
             created_at: Utc::now(),
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
         }
     }

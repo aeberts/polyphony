@@ -470,6 +470,7 @@ struct WorkflowReloadSupport {
     reload_error: Option<String>,
 }
 
+mod blocked_outcomes;
 mod dispatch;
 mod handoff;
 mod heartbeat;

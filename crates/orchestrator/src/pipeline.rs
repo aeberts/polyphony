@@ -832,12 +832,13 @@ impl RuntimeService {
         if self
             .find_existing_run_for_issue(&issue.id)
             .and_then(|run_id| self.state.runs.get(&run_id))
-            .is_some_and(|run| run.status == RunStatus::Cancelled)
+            .is_some_and(|run| matches!(run.status, RunStatus::Cancelled | RunStatus::Blocked))
+            || self.issue_is_in_blocked_state(&workflow, &issue.state)
         {
             self.push_event(
                 EventScope::Dispatch,
                 format!(
-                    "{} pipeline dispatch skipped: run was cancelled",
+                    "{} pipeline dispatch skipped: run is terminal",
                     issue.identifier
                 ),
             );
@@ -973,6 +974,7 @@ impl RuntimeService {
                     created_at: now,
                     updated_at: now,
                     cancel_reason: None,
+                    blocked_outcome: None,
                     steps: initial_steps,
                     activity_log: Vec::new(),
                 };
@@ -1249,6 +1251,18 @@ impl RuntimeService {
         run_id: &str,
         workspace_path: &Path,
     ) -> Result<(), Error> {
+        if self
+            .state
+            .runs
+            .get(run_id)
+            .is_some_and(|run| run.status == RunStatus::Blocked)
+        {
+            self.push_event(
+                EventScope::Dispatch,
+                format!("{} pipeline continuation skipped: run is blocked", issue.identifier),
+            );
+            return Ok(());
+        }
         let next_task = self.state.tasks.get(run_id).and_then(|tasks| {
             tasks
                 .iter()
@@ -2278,6 +2292,11 @@ impl RuntimeService {
                 "run {run_id} not found"
             ))));
         };
+        if run.status == RunStatus::Blocked {
+            return Err(Error::Core(CoreError::Adapter(format!(
+                "run {run_id} is blocked and cannot accept continuation feedback"
+            ))));
+        }
         let Some(issue_id) = &run.issue_id else {
             return Err(Error::Core(CoreError::Adapter(format!(
                 "run {run_id} has no associated issue"

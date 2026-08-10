@@ -45,6 +45,7 @@ pub enum RunStatus {
     Delivered,
     Failed,
     Cancelled,
+    Blocked,
 }
 
 impl fmt::Display for RunStatus {
@@ -57,6 +58,7 @@ impl fmt::Display for RunStatus {
             Self::Delivered => "delivered",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Blocked => "blocked",
         };
         f.write_str(s)
     }
@@ -639,6 +641,9 @@ pub struct Run {
     /// Explanation of why a run was cancelled by reconciliation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<String>,
+    /// Durable worker block that prevents ordinary retry or continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_outcome: Option<crate::BlockedOutcome>,
     /// Ordered execution steps for this run. Empty for legacy runs
     /// created before step tracking was introduced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -800,6 +805,8 @@ pub struct RunRow {
     pub activity_log: Vec<RunLogEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_outcome: Option<crate::BlockedOutcome>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<crate::StepRecord>,
 }
@@ -885,6 +892,7 @@ mod tests {
             updated_at: Utc::now(),
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
         };
         run.push_log(RunLogScope::Inbox, "state changed");
@@ -912,6 +920,7 @@ mod tests {
             updated_at: Utc::now(),
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
         };
         for i in 0..100 {

@@ -952,6 +952,50 @@ tracker:
 }
 
 #[test]
+fn blocked_state_must_name_a_configured_active_workflow_state() {
+    let config = serde_yaml::from_str::<YamlValue>(
+        r#"
+tracker:
+  kind: mock
+  active_states: [Ready, Waiting]
+  blocked_state: Paused
+"#,
+    )
+    .unwrap();
+    let workflow = WorkflowDefinition {
+        config,
+        prompt_template: String::new(),
+    };
+
+    let error = ServiceConfig::from_workflow(&workflow).unwrap_err();
+    assert!(matches!(error, crate::Error::InvalidConfig(_)));
+    assert!(error.to_string().contains("tracker.blocked_state `Paused`"));
+}
+
+#[test]
+fn configured_blocked_state_is_preserved_without_literal_name_assumptions() {
+    let config = serde_yaml::from_str::<YamlValue>(
+        r#"
+tracker:
+  kind: mock
+  active_states: [Ready, Awaiting Dependency]
+  blocked_state: Awaiting Dependency
+"#,
+    )
+    .unwrap();
+    let workflow = WorkflowDefinition {
+        config,
+        prompt_template: String::new(),
+    };
+
+    let config = ServiceConfig::from_workflow(&workflow).unwrap();
+    assert_eq!(
+        config.tracker.blocked_state.as_deref(),
+        Some("Awaiting Dependency")
+    );
+}
+
+#[test]
 fn tracker_profile_can_supply_global_tracker_credentials() {
     let user_config_path = unique_temp_path("tracker-profile", "toml");
     fs::write(

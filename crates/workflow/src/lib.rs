@@ -65,6 +65,8 @@ pub struct TrackerConfig {
     pub team_id: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    /// Workflow state used for a durable worker-reported block.
+    pub blocked_state: Option<String>,
     #[serde(default)]
     pub stop_when_ineligible: bool,
 }
@@ -83,6 +85,7 @@ struct TrackerProfileConfig {
     pub team_id: Option<String>,
     pub active_states: Vec<String>,
     pub terminal_states: Vec<String>,
+    pub blocked_state: Option<String>,
     pub stop_when_ineligible: bool,
 }
 

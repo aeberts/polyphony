@@ -820,6 +820,7 @@ fn issue_control_state(snapshot: &RuntimeSnapshot, item: &InboxItemRow) -> &'sta
             RunStatus::Pending | RunStatus::Planning | RunStatus::InProgress | RunStatus::Review,
         ) => "orchestrating",
         Some(RunStatus::Failed | RunStatus::Cancelled) => "paused/stopped",
+        Some(RunStatus::Blocked) => "blocked",
         Some(RunStatus::Delivered) => "delivered",
         None => "ready",
     }
@@ -867,6 +868,7 @@ fn run_status_color(status: &RunStatus) -> ratatui::style::Color {
     match status {
         RunStatus::Delivered => theme::done(),
         RunStatus::Failed | RunStatus::Cancelled => theme::error(),
+        RunStatus::Blocked => theme::muted(),
         RunStatus::InProgress | RunStatus::Planning | RunStatus::Review => theme::primary(),
         RunStatus::Pending => theme::muted(),
     }

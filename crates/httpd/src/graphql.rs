@@ -17,6 +17,7 @@ pub(crate) enum GqlRunStatus {
     Delivered,
     Failed,
     Cancelled,
+    Blocked,
 }
 
 impl From<polyphony_core::RunStatus> for GqlRunStatus {
@@ -29,6 +30,7 @@ impl From<polyphony_core::RunStatus> for GqlRunStatus {
             polyphony_core::RunStatus::Delivered => Self::Delivered,
             polyphony_core::RunStatus::Failed => Self::Failed,
             polyphony_core::RunStatus::Cancelled => Self::Cancelled,
+            polyphony_core::RunStatus::Blocked => Self::Blocked,
         }
     }
 }

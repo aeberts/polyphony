@@ -66,6 +66,16 @@ pub struct AgentRunResult {
     pub final_issue_state: Option<String>,
 }
 
+/// A worker-reported reason that its run cannot proceed until prerequisite work
+/// is complete. The record is parsed from the strict `BLOCKED:` report format
+/// before the orchestrator persists it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockedOutcome {
+    pub reason: String,
+    pub evidence: String,
+    pub prerequisite: String,
+}
+
 impl AgentRunResult {
     pub fn succeeded(turns: u32) -> Self {
         Self {
@@ -91,6 +101,113 @@ impl AgentRunResult {
             turns_completed: 0,
             error: Some(error.into()),
             final_issue_state: None,
+        }
+    }
+
+    /// Parse a structured blocked report, if this result reports one.
+    ///
+    /// The grammar is deliberately small and closed:
+    ///
+    /// ```text
+    /// BLOCKED:
+    /// reason: <non-empty>
+    /// evidence: <non-empty>
+    /// prerequisite: <non-empty linked work reference>
+    /// ```
+    ///
+    /// This prevents prose that merely mentions a block from becoming a
+    /// durable terminal state.
+    pub fn blocked_outcome(&self) -> Result<Option<BlockedOutcome>, String> {
+        let Some(report) = self.final_issue_state.as_deref() else {
+            return Ok(None);
+        };
+        let mut lines = report.lines();
+        let Some(header) = lines.next() else {
+            return Ok(None);
+        };
+        if header.trim() != "BLOCKED:" {
+            return Ok(None);
+        }
+
+        let mut reason = None;
+        let mut evidence = None;
+        let mut prerequisite = None;
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                return Err("blocked outcome fields must use `key: value`".into());
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("blocked outcome `{key}` must be non-empty"));
+            }
+            let field = match key.trim() {
+                "reason" => &mut reason,
+                "evidence" => &mut evidence,
+                "prerequisite" => &mut prerequisite,
+                _ => return Err(format!("blocked outcome has unknown field `{}`", key.trim())),
+            };
+            if field.replace(value.to_string()).is_some() {
+                return Err(format!("blocked outcome repeats `{}`", key.trim()));
+            }
+        }
+
+        let reason = reason.ok_or_else(|| "blocked outcome is missing `reason`".to_string())?;
+        let evidence =
+            evidence.ok_or_else(|| "blocked outcome is missing `evidence`".to_string())?;
+        let prerequisite = prerequisite
+            .ok_or_else(|| "blocked outcome is missing `prerequisite`".to_string())?;
+        Ok(Some(BlockedOutcome {
+            reason,
+            evidence,
+            prerequisite,
+        }))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_complete_blocked_outcome() {
+        let result = AgentRunResult {
+            status: AttemptStatus::Succeeded,
+            turns_completed: 1,
+            error: None,
+            final_issue_state: Some(
+                "BLOCKED:\nreason: API contract is absent\nevidence: integration test shows 404\nprerequisite: POL-42".into(),
+            ),
+        };
+
+        assert_eq!(
+            result.blocked_outcome().unwrap(),
+            Some(BlockedOutcome {
+                reason: "API contract is absent".into(),
+                evidence: "integration test shows 404".into(),
+                prerequisite: "POL-42".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_duplicated_blocked_outcome() {
+        for report in [
+            "BLOCKED:\nreason: waiting\nevidence: trace",
+            "BLOCKED:\nreason: waiting\nevidence: trace\nprerequisite: POL-42\nreason: again",
+            "BLOCKED:\nreason: waiting\nevidence:\nprerequisite: POL-42",
+        ] {
+            let result = AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some(report.into()),
+            };
+            assert!(result.blocked_outcome().is_err(), "{report}");
         }
     }
 }

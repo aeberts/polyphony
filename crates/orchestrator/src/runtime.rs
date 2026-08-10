@@ -1222,11 +1222,11 @@ impl RuntimeService {
                 .state
                 .runs
                 .get(&run_id)
-                .is_some_and(|run| run.status == RunStatus::Cancelled)
+                .is_some_and(|run| matches!(run.status, RunStatus::Cancelled | RunStatus::Blocked))
             {
                 self.push_event(
                     EventScope::Dispatch,
-                    format!("task resolution ignored: run {run_id} was cancelled"),
+                    format!("task resolution ignored: run {run_id} is terminal"),
                 );
                 continue;
             }
@@ -1477,10 +1477,10 @@ impl RuntimeService {
             );
             return Ok(());
         };
-        if run.status == RunStatus::Cancelled {
+        if matches!(run.status, RunStatus::Cancelled | RunStatus::Blocked) {
             self.push_event(
                 EventScope::Dispatch,
-                format!("run retry ignored: run {run_id} was cancelled"),
+                format!("run retry ignored: run {run_id} is terminal"),
             );
             return Ok(());
         }
@@ -1645,11 +1645,17 @@ impl RuntimeService {
             // even if the process stopped while a task still said InProgress.
             // Startup normalization must never reinterpret it as a failure
             // that can be retried or replanned.
-            if run_snapshot.status == RunStatus::Cancelled {
+            if matches!(run_snapshot.status, RunStatus::Cancelled | RunStatus::Blocked) {
                 let cancellation_reason = run_snapshot
                     .cancel_reason
                     .as_deref()
-                    .unwrap_or("restored cancelled run");
+                    .or_else(|| {
+                        run_snapshot
+                            .blocked_outcome
+                            .as_ref()
+                            .map(|outcome| outcome.reason.as_str())
+                    })
+                    .unwrap_or("restored terminal run");
                 if let Some(tasks) = self.state.tasks.get_mut(&run_id) {
                     for task in tasks.iter_mut().filter(|task| {
                         matches!(task.status, TaskStatus::Pending | TaskStatus::InProgress)
@@ -2887,6 +2893,7 @@ mod tests {
                 created_at: now,
                 activity_log: Vec::new(),
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
             }],
             tasks: vec![TaskRow {

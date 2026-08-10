@@ -547,6 +547,7 @@ impl RuntimeService {
                 created_at: now,
                 updated_at: now,
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
                 activity_log: Vec::new(),
             };
@@ -975,7 +976,7 @@ impl RuntimeService {
         issue_identifier: String,
         attempt: Option<u32>,
         started_at: DateTime<Utc>,
-        outcome: AgentRunResult,
+        mut outcome: AgentRunResult,
     ) -> Result<(), Error> {
         let Some(running) = self.state.running.remove(&issue_id) else {
             return Ok(());
@@ -987,6 +988,69 @@ impl RuntimeService {
             .as_secs_f64();
         self.state.totals.seconds_running = self.state.ended_runtime_seconds;
         let finished_at = Utc::now();
+        match outcome.blocked_outcome() {
+            Ok(Some(blocked_outcome))
+                if running.review_target.is_none()
+                    && matches!(outcome.status, AttemptStatus::Succeeded) =>
+            {
+                let workflow = self.workflow_for_issue(&issue_id);
+                match self
+                    .record_blocked_outcome(
+                        &workflow,
+                        &running.issue,
+                        running.run_id.as_deref(),
+                        running.active_task_id.as_deref(),
+                        &blocked_outcome,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.finalize_saved_context(&issue_id, &issue_identifier, &running, &outcome);
+                        if let Some(context) = self.state.saved_contexts.get(&issue_id)
+                            && let Err(error) = persist_workspace_saved_context_artifact(
+                                &running.workspace_path,
+                                context,
+                            )
+                            .await
+                        {
+                            warn!(
+                                %error,
+                                workspace_path = %running.workspace_path.display(),
+                                issue_identifier = %issue_identifier,
+                                "persisting blocked-run saved context failed"
+                            );
+                        }
+                        let persisted_run = build_persisted_agent_run_record(
+                            self.repo_id_for_issue(&issue_id),
+                            &running,
+                            outcome.status,
+                            finished_at,
+                            outcome.error.clone(),
+                            self.state.saved_contexts.get(&issue_id).cloned(),
+                        );
+                        self.record_agent_run_history(persisted_run).await?;
+                        self.emit_snapshot().await?;
+                        return Ok(());
+                    },
+                    Err(error) => {
+                        // The tracker record did not complete, so do not
+                        // commit a local blocked state. Treat the worker
+                        // report as a failed attempt instead.
+                        outcome.status = AttemptStatus::Failed;
+                        outcome.error = Some(error.to_string());
+                        outcome.final_issue_state = None;
+                    },
+                }
+            },
+            Err(error) => {
+                // A malformed blocked report is never allowed to become a
+                // durable terminal outcome.
+                outcome.status = AttemptStatus::Failed;
+                outcome.error = Some(format!("blocked outcome rejected: {error}"));
+                outcome.final_issue_state = None;
+            },
+            _ => {},
+        }
         self.finalize_saved_context(&issue_id, &issue_identifier, &running, &outcome);
         if let Some(context) = self.state.saved_contexts.get(&issue_id)
             && let Err(error) =

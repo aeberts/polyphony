@@ -3717,6 +3717,7 @@ mod tests {
                 created_at: Utc::now(),
                 activity_log: Vec::new(),
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
             }],
             tasks: vec![],
@@ -3771,6 +3772,7 @@ mod tests {
                 created_at: now,
                 activity_log: Vec::new(),
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
             }],
             tasks: vec![polyphony_core::TaskRow {
@@ -3846,6 +3848,7 @@ mod tests {
                 created_at: now,
                 activity_log: Vec::new(),
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
             }],
             tasks: vec![polyphony_core::TaskRow {
@@ -4035,6 +4038,7 @@ mod tests {
                 created_at: now,
                 activity_log: Vec::new(),
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
             }],
             tasks: vec![

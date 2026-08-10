@@ -1075,6 +1075,7 @@ fn render_outputs_shows_output_and_decision() {
         created_at: Utc::now(),
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
     }];
     let mut app = AppState::new(default_theme(), LogBuffer::default());
@@ -1447,6 +1448,7 @@ fn run_detail_renders_history_facts() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
     }];
     snapshot.tasks = vec![TaskRow {

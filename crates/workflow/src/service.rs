@@ -68,6 +68,9 @@ pub(crate) fn apply_tracker_profile(
     {
         tracker.terminal_states = profile.terminal_states.clone();
     }
+    if tracker.blocked_state.is_none() {
+        tracker.blocked_state = profile.blocked_state.clone();
+    }
     if profile.stop_when_ineligible {
         tracker.stop_when_ineligible = true;
     }
@@ -623,6 +626,24 @@ impl ServiceConfig {
             return Err(Error::InvalidConfig(
                 "tracker.repository is required for github".into(),
             ));
+        }
+        if let Some(blocked_state) = self.tracker.blocked_state.as_deref() {
+            let blocked_state = blocked_state.trim();
+            if blocked_state.is_empty() {
+                return Err(Error::InvalidConfig(
+                    "tracker.blocked_state must be non-empty when configured".into(),
+                ));
+            }
+            if !self
+                .tracker
+                .active_states
+                .iter()
+                .any(|state| state.eq_ignore_ascii_case(blocked_state))
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "tracker.blocked_state `{blocked_state}` must be one of tracker.active_states"
+                )));
+            }
         }
         if self.agents.profiles.is_empty() {
             if let Some(default_agent) = self.agents.default.as_deref() {

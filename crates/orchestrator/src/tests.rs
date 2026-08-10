@@ -33,6 +33,7 @@ struct TestTracker {
     acknowledged_issues: Arc<Mutex<Vec<String>>>,
     created_issues: Arc<Mutex<Vec<CreateIssueRequest>>>,
     comments: Arc<Mutex<Vec<AddIssueCommentRequest>>>,
+    write_order: Arc<Mutex<Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -109,6 +110,7 @@ impl TestTracker {
             acknowledged_issues: Arc::new(Mutex::new(Vec::new())),
             created_issues: Arc::new(Mutex::new(Vec::new())),
             comments: Arc::new(Mutex::new(Vec::new())),
+            write_order: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -139,6 +141,10 @@ impl TestTracker {
 
     fn recorded_comments(&self) -> Vec<AddIssueCommentRequest> {
         self.comments.lock().unwrap().clone()
+    }
+
+    fn write_order(&self) -> Vec<String> {
+        self.write_order.lock().unwrap().clone()
     }
 }
 
@@ -292,6 +298,10 @@ impl IssueTracker for TestTracker {
             .lock()
             .unwrap()
             .push(status.to_string());
+        self.write_order
+            .lock()
+            .unwrap()
+            .push(format!("workflow:{status}"));
         Ok(())
     }
 
@@ -325,6 +335,7 @@ impl IssueTracker for TestTracker {
         request: &AddIssueCommentRequest,
     ) -> Result<IssueComment, polyphony_core::Error> {
         self.comments.lock().unwrap().push(request.clone());
+        self.write_order.lock().unwrap().push("comment".into());
         Ok(IssueComment {
             id: format!("comment-{}", self.comments.lock().unwrap().len()),
             body: request.body.clone(),
@@ -610,6 +621,7 @@ struct RecordingSessionAgent {
     prompts: Arc<Mutex<Vec<String>>>,
     session_starts: Arc<Mutex<u32>>,
     stops: Arc<Mutex<u32>>,
+    final_issue_state: Option<String>,
 }
 
 impl RecordingSessionAgent {
@@ -624,11 +636,19 @@ impl RecordingSessionAgent {
     fn stops(&self) -> u32 {
         *self.stops.lock().unwrap()
     }
+
+    fn with_final_issue_state(final_issue_state: impl Into<String>) -> Self {
+        Self {
+            final_issue_state: Some(final_issue_state.into()),
+            ..Self::default()
+        }
+    }
 }
 
 struct RecordingSession {
     prompts: Arc<Mutex<Vec<String>>>,
     stops: Arc<Mutex<u32>>,
+    final_issue_state: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -812,7 +832,12 @@ impl AgentRuntime for FailingStopSessionAgent {
 impl AgentSession for RecordingSession {
     async fn run_turn(&mut self, prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
         self.prompts.lock().unwrap().push(prompt);
-        Ok(AgentRunResult::succeeded(1))
+        Ok(AgentRunResult {
+            status: AttemptStatus::Succeeded,
+            turns_completed: 1,
+            error: None,
+            final_issue_state: self.final_issue_state.clone(),
+        })
     }
 
     async fn stop(&mut self) -> Result<(), polyphony_core::Error> {
@@ -836,6 +861,7 @@ impl AgentRuntime for RecordingSessionAgent {
         Ok(Some(Box::new(RecordingSession {
             prompts: self.prompts.clone(),
             stops: self.stops.clone(),
+            final_issue_state: self.final_issue_state.clone(),
         })))
     }
 
@@ -1337,6 +1363,7 @@ fn persisted_issue_run(issue: &Issue, workspace_root: &Path, status: RunStatus) 
         updated_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
     }
 }
@@ -1661,6 +1688,7 @@ async fn reconcile_running_preserves_session_for_non_terminal_state() {
         updated_at: Utc::now(),
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
     });
 
@@ -1713,6 +1741,7 @@ async fn reconcile_running_sets_cancel_reason_for_missing_issue() {
         updated_at: Utc::now(),
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
     });
 
@@ -1768,6 +1797,7 @@ async fn reconcile_running_sets_cancel_reason_for_terminal_state() {
         updated_at: Utc::now(),
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
     });
 
@@ -2009,6 +2039,7 @@ async fn completed_pull_request_reviews_are_marked_reviewed_and_not_redispatched
         created_at: Utc::now(),
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: Utc::now(),
     });
@@ -3008,6 +3039,7 @@ async fn run_preserves_restored_cancelled_run_before_first_snapshot() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: Some("stopped by user".into()),
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     };
@@ -3365,6 +3397,204 @@ async fn finish_running_with_active_final_state_skips_workflow_transition() {
     assert!(service.state.retrying.contains_key(&issue.id));
 }
 
+#[tokio::test]
+async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
+    let workspace_root = unique_workspace_root("blocked-outcome");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
+    );
+    let issue = sample_issue("issue-blocked", "FAC-BLOCKED", "Todo", "Blocked work");
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service = test_service_for_workflow(
+        workflow.clone(),
+        tracker,
+        RecordingProvisioner::default(),
+    );
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    let run_id = run.id.clone();
+    service.state.runs.insert(run_id.clone(), run);
+    service.state.running.insert(
+        issue.id.clone(),
+        make_running_task(issue.clone(), workspace_root.join("FAC-BLOCKED")),
+    );
+    service.claim_issue(issue.id.clone(), IssueClaimState::Running);
+
+    service
+        .finish_running(
+            issue.id.clone(),
+            issue.identifier.clone(),
+            None,
+            Utc::now(),
+            AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some(
+                    "BLOCKED:\nreason: waiting for an API contract\nevidence: endpoint returned 404 in the disposable fixture\nprerequisite: FAC-42"
+                        .into(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+    let run = &service.state.runs[&run_id];
+    assert_eq!(run.status, RunStatus::Blocked);
+    assert_eq!(
+        run.blocked_outcome.as_ref().map(|outcome| outcome.prerequisite.as_str()),
+        Some("FAC-42")
+    );
+    assert_eq!(tracker_handle.recorded_workflow_updates(), vec!["Awaiting Dependency"]);
+    assert_eq!(tracker_handle.recorded_comments().len(), 1);
+    assert_eq!(
+        tracker_handle.write_order(),
+        vec!["comment", "workflow:Awaiting Dependency"]
+    );
+    assert!(tracker_handle.recorded_comments()[0].body.contains("FAC-42"));
+    assert!(service.state.retrying.is_empty());
+    assert!(!service.should_dispatch(&workflow, &issue));
+
+    service.retry_failed_run_from_task(&run_id, None).await.unwrap();
+    service
+        .dispatch_issue(workflow.clone(), issue.clone(), None, false, None, false, None)
+        .await
+        .unwrap();
+    assert!(!service.state.running.contains_key(&issue.id));
+    let error = service
+        .inject_feedback_task(&FeedbackInjectionRequest {
+            run_id: run_id.clone(),
+            prompt: "try to continue blocked work".into(),
+            agent_name: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("blocked"));
+
+    // A restored blocked record stays terminal before automatic recovery can
+    // reinterpret its incomplete task state as retryable work.
+    service.normalize_restored_in_progress_runs().await.unwrap();
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Blocked);
+    assert!(!service.should_dispatch(&workflow, &issue));
+}
+
+#[tokio::test]
+async fn malformed_or_unconfigured_blocked_outcomes_never_create_a_false_block() {
+    let workspace_root = unique_workspace_root("blocked-outcome-rejection");
+    let issue = sample_issue("issue-blocked-rejected", "FAC-REJECT", "Todo", "Rejected block");
+
+    // Missing configuration fails closed before any tracker evidence or local
+    // terminal record is accepted.
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service = test_service(tracker, RecordingProvisioner::default(), &workspace_root);
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    let run_id = run.id.clone();
+    service.state.runs.insert(run_id.clone(), run);
+    service.state.running.insert(
+        issue.id.clone(),
+        make_running_task(issue.clone(), workspace_root.join("FAC-REJECT")),
+    );
+    service
+        .finish_running(
+            issue.id.clone(),
+            issue.identifier.clone(),
+            None,
+            Utc::now(),
+            AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some(
+                    "BLOCKED:\nreason: dependency missing\nevidence: fixture failed\nprerequisite: FAC-42".into(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(service.state.runs[&run_id].status, RunStatus::Blocked);
+    assert!(service.state.runs[&run_id].blocked_outcome.is_none());
+    assert!(tracker_handle.recorded_comments().is_empty());
+
+    // An incomplete record is rejected before it can write tracker evidence.
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let tracker_handle = tracker.clone();
+    let mut service = test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    let run_id = run.id.clone();
+    service.state.runs.insert(run_id.clone(), run);
+    service.state.running.insert(
+        issue.id.clone(),
+        make_running_task(issue.clone(), workspace_root.join("FAC-REJECT-2")),
+    );
+    service
+        .finish_running(
+            issue.id.clone(),
+            issue.identifier.clone(),
+            None,
+            Utc::now(),
+            AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some("BLOCKED:\nreason: dependency missing\nevidence: fixture failed".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_ne!(service.state.runs[&run_id].status, RunStatus::Blocked);
+    assert!(tracker_handle.recorded_comments().is_empty());
+}
+
+#[tokio::test]
+async fn tracker_write_failure_leaves_the_run_non_blocked() {
+    let workspace_root = unique_workspace_root("blocked-outcome-tracker-failure");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
+    );
+    let issue = sample_issue("issue-blocked-write", "FAC-WRITE", "Todo", "Write failure");
+    let tracker = TestTracker::new(vec![issue.clone()]).fail_workflow_status_updates("tracker unavailable");
+    let tracker_handle = tracker.clone();
+    let mut service = test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
+    let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
+    let run_id = run.id.clone();
+    service.state.runs.insert(run_id.clone(), run);
+    service.state.running.insert(
+        issue.id.clone(),
+        make_running_task(issue.clone(), workspace_root.join("FAC-WRITE")),
+    );
+
+    service
+        .finish_running(
+            issue.id.clone(),
+            issue.identifier.clone(),
+            None,
+            Utc::now(),
+            AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: 1,
+                error: None,
+                final_issue_state: Some(
+                    "BLOCKED:\nreason: dependency missing\nevidence: fixture failed\nprerequisite: FAC-42".into(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(service.state.runs[&run_id].status, RunStatus::Blocked);
+    assert!(service.state.runs[&run_id].blocked_outcome.is_none());
+    assert_eq!(tracker_handle.recorded_comments().len(), 1);
+    assert!(tracker_handle.recorded_workflow_updates().is_empty());
+    assert_eq!(tracker_handle.write_order(), vec!["comment"]);
+}
+
 #[test]
 fn worker_timeout_errors_map_to_timed_out_attempts() {
     let result =
@@ -3476,6 +3706,58 @@ Turn {{ turn_number }} of {{ max_turns }}. Continuation={{ is_continuation }}."
         prompts[1],
         "Continue FAC-TURNS in state Todo.\nTurn 2 of 4. Continuation=true."
     );
+}
+
+#[tokio::test]
+async fn run_worker_attempt_does_not_continue_after_a_blocked_report() {
+    let workspace_root = unique_workspace_root("blocked-live-session");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue("issue-blocked-live", "FAC-LIVE", "Todo", "Blocked live");
+    let agent = Arc::new(RecordingSessionAgent::with_final_issue_state(
+        "BLOCKED:\nreason: contract is missing\nevidence: disposable fixture reproduced the failure\nprerequisite: FAC-42",
+    ));
+    let hooks = HooksConfig {
+        after_create: None,
+        before_run: None,
+        after_run: None,
+        after_outcome: None,
+        before_remove: None,
+        timeout_ms: 1_000,
+    };
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+
+    let result = run_worker_attempt(
+        &workspace_manager,
+        &hooks,
+        agent.clone(),
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        issue,
+        None,
+        workspace_root.join("FAC-LIVE"),
+        "Initial prompt".into(),
+        vec!["Todo".into()],
+        4,
+        None,
+        polyphony_core::AgentDefinition::default(),
+        None,
+        watch::channel(None).1,
+        command_tx,
+    )
+    .await
+    .unwrap();
+
+    assert!(result.blocked_outcome().unwrap().is_some());
+    assert_eq!(agent.prompts(), vec!["Initial prompt"]);
+    assert_eq!(agent.stops(), 1);
 }
 
 #[tokio::test]
@@ -4437,6 +4719,7 @@ async fn cancelled_pipeline_planner_is_terminal_and_never_creates_tasks() {
             created_at: now,
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: polyphony_core::build_planner_steps(),
             updated_at: now,
         });
@@ -4984,6 +5267,8 @@ async fn resolving_run_deliverable_updates_decision_and_snapshot() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5042,6 +5327,8 @@ async fn resolving_already_accepted_deliverable_is_ignored() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5104,6 +5391,8 @@ async fn startup_cleanup_finalizes_merged_accepted_runs() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5327,6 +5616,8 @@ async fn workspace_progress_updates_are_appended_to_worktree_task() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5431,6 +5722,7 @@ async fn task_retry_ignores_non_failed_tasks() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5544,6 +5836,7 @@ async fn run_retry_relaunches_pull_request_review_from_first_failed_task() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -5695,6 +5988,7 @@ async fn run_retry_recovers_stalled_pull_request_review_after_restart() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -7609,6 +7903,7 @@ fn find_existing_run_prefers_active_over_terminal() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -7638,6 +7933,7 @@ fn find_existing_run_prefers_active_over_terminal() {
         created_at: now,
         activity_log: Vec::new(),
         cancel_reason: None,
+        blocked_outcome: None,
         steps: Vec::new(),
         updated_at: now,
     });
@@ -7764,6 +8060,7 @@ async fn normalize_restored_cancelled_run_keeps_task_terminal() {
             created_at: now,
             activity_log: Vec::new(),
             cancel_reason: Some("eligibility revoked".into()),
+            blocked_outcome: None,
             steps: Vec::new(),
             updated_at: now,
         })]),
@@ -7856,6 +8153,7 @@ async fn normalize_restored_in_progress_runs_marks_first_pending_task_failed() {
             created_at: now,
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
             updated_at: now,
         })]),

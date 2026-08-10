@@ -503,6 +503,7 @@ mod tests {
             updated_at: Utc::now(),
             activity_log: Vec::new(),
             cancel_reason: None,
+            blocked_outcome: None,
             steps: Vec::new(),
         };
 

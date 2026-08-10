@@ -785,6 +785,7 @@ fn run_color(status: &polyphony_core::RunStatus) -> Color {
     match status {
         polyphony_core::RunStatus::Delivered => theme::done(),
         polyphony_core::RunStatus::Failed | polyphony_core::RunStatus::Cancelled => theme::error(),
+        polyphony_core::RunStatus::Blocked => theme::muted(),
         polyphony_core::RunStatus::InProgress
         | polyphony_core::RunStatus::Planning
         | polyphony_core::RunStatus::Review => theme::primary(),

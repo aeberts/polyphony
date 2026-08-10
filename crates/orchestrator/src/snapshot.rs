@@ -49,6 +49,9 @@ impl RuntimeService {
         if self.has_non_resumable_persisted_run(&issue.id) {
             return false;
         }
+        if self.issue_is_in_blocked_state(workflow, &issue.state) {
+            return false;
+        }
         let state = issue.normalized_state();
         if !workflow.config.is_active_state(&issue.state)
             || workflow.config.is_terminal_state(&issue.state)
@@ -116,7 +119,7 @@ impl RuntimeService {
             }
             let is_active = !matches!(
                 m.status,
-                RunStatus::Delivered | RunStatus::Failed | RunStatus::Cancelled
+                RunStatus::Delivered | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Blocked
             );
             match best {
                 None => best = Some((id, is_active)),
@@ -463,6 +466,7 @@ impl RuntimeService {
                         workspace_path: m.workspace_path.clone(),
                         created_at: m.created_at,
                         cancel_reason: m.cancel_reason.clone(),
+                        blocked_outcome: m.blocked_outcome.clone(),
                         steps: m.steps.clone(),
                         activity_log: m.activity_log.clone(),
                     }

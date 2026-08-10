@@ -170,6 +170,22 @@ pub(crate) async fn run_worker_attempt(
                     final_issue_state: turn_result.final_issue_state,
                 });
             }
+            match turn_result.blocked_outcome() {
+                Ok(Some(_)) => {
+                    break Ok(AgentRunResult {
+                        status: AttemptStatus::Succeeded,
+                        turns_completed: total_turns,
+                        error: turn_result.error,
+                        final_issue_state: turn_result.final_issue_state,
+                    });
+                },
+                Err(error) => {
+                    break Ok(AgentRunResult::failed(format!(
+                        "blocked outcome rejected: {error}"
+                    )));
+                },
+                Ok(None) => {},
+            }
 
             let state_updates = tracker
                 .fetch_issue_states_by_ids(&[current_issue.id.clone()])

@@ -140,6 +140,18 @@ impl RuntimeService {
         skip_workspace_sync: bool,
         directives: Option<&str>,
     ) -> Result<(), Error> {
+        if self
+            .find_existing_run_for_issue(&issue.id)
+            .and_then(|run_id| self.state.runs.get(&run_id))
+            .is_some_and(|run| run.status == RunStatus::Blocked)
+            || self.issue_is_in_blocked_state(&workflow, &issue.state)
+        {
+            self.push_event(
+                EventScope::Dispatch,
+                format!("{} dispatch skipped: blocked outcome is terminal", issue.identifier),
+            );
+            return Ok(());
+        }
         let manual_dispatch_directives = directives
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -254,6 +266,7 @@ impl RuntimeService {
                 created_at: now,
                 updated_at: now,
                 cancel_reason: None,
+                blocked_outcome: None,
                 steps: Vec::new(),
                 activity_log: Vec::new(),
             };
