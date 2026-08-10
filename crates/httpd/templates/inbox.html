@@ -319,14 +319,14 @@
         {# Close: only for issues, not running, not already closed #}
         {% set ns_running = namespace(is_running=false) %}
         {% for a in running %}{% if a.issue_id == t.item_id %}{% set ns_running.is_running = true %}{% endif %}{% endfor %}
-        {% if t.kind == "Issue" and not ns_running.is_running and t.status != "closed" and t.status != "done" and t.status != "completed" and t.status != "cancelled" and t.status != "canceled" %}
+        {% if t.kind == "issue" and not ns_running.is_running and t.status != "closed" and t.status != "done" and t.status != "completed" and t.status != "cancelled" and t.status != "canceled" %}
         <button class="btn btn-danger" onclick="polyphonyAction.close('{{ t.item_id }}', this)">Close</button>
         {% endif %}
       </div>
 
       {# Dispatch form (hidden) #}
       <div class="dispatch-form" id="dispatch-form-{{ t.item_id }}">
-        {% if t.kind == "Issue" and agent_profiles %}
+        {% if t.kind == "issue" and agent_profiles %}
         <select class="dispatch-textarea" id="dispatch-agent-{{ t.item_id }}" style="min-height: auto; height: 2.2rem;">
           <option value="">Default routing agent</option>
           {% for profile in agent_profiles %}
@@ -517,7 +517,7 @@ var polyphonyAction = (function() {
       var prompt = document.getElementById('dispatch-prompt-' + itemId).value || null;
       var agentSelect = document.getElementById('dispatch-agent-' + itemId);
       var agentName = agentSelect ? (agentSelect.value || null) : null;
-      if (kind === 'Issue') {
+      if (kind === 'issue') {
         gqlMutate(MUTATIONS.dispatchIssue, { id: itemId, a: agentName, d: prompt });
       } else {
         gqlMutate(MUTATIONS.dispatchPR, { id: itemId, d: prompt });

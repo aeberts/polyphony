@@ -666,6 +666,14 @@ mod tests {
         assert!(child_section.contains("&nbsp;"));
         assert!(!child_section.contains("<time datetime=\"2026-03-12T23:39:44Z\">"));
         assert!(!child_section.contains(">polyphony</span>"));
+        assert!(
+            rendered.contains("if (kind === 'issue')"),
+            "issue inbox items must use the issue-dispatch mutation"
+        );
+        assert!(
+            rendered.contains("polyphonyAction.close('parent'"),
+            "issue inbox items must render the issue close control"
+        );
     }
 
     #[test]
