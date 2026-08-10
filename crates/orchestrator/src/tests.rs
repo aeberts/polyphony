@@ -6703,14 +6703,27 @@ fn delivery_evidence_uses_bounded_canonical_check_ids_and_visible_unicode_values
     for description in [
         "Acceptance checks\n+1. signed",
         "Acceptance checks\n-1. signed",
+        "Acceptance checks\n- 1. unordered Markdown wrapper",
+        "Acceptance checks\n* 1. unordered Markdown wrapper",
+        "Acceptance checks\n## 1. heading wrapper",
+        "Acceptance checks\n1) Markdown ordered-list variant",
+        "Acceptance checks\n1 . whitespace-obscured separator",
         "Acceptance checks\n01. leading zero",
         "Acceptance checks\n0. zero",
-        "Acceptance checks\n1) wrong separator",
         "Acceptance checks\n1000. out of configured range",
         "Acceptance checks\n999999999999999999999999999999999999999. overflow",
         "Acceptance checks\n1. first\n1. duplicate",
         "Acceptance checks\n2. second\n1. first",
         "Acceptance checks\n١. non-ASCII numeral",
+        "Acceptance checks\n１. full-width numeral",
+        "Acceptance checks\n−1. Unicode minus",
+        "Acceptance checks\n＋1. Unicode plus",
+        "Acceptance checks\n﹢1. small Unicode plus",
+        "Acceptance checks\n-\u{00a0}1. Unicode whitespace after sign",
+        "Acceptance checks\n1\u{200b}. zero-width-obscured separator",
+        "Acceptance checks\n1\u{200b}2. zero-width-obscured digits",
+        "Acceptance checks\n\u{202e}1. bidi-obscured marker",
+        "Acceptance checks\n1. first\n- 2. mixed malformed Markdown item",
     ] {
         let malformed = Issue {
             description: Some(description.into()),
@@ -6725,6 +6738,55 @@ fn delivery_evidence_uses_bounded_canonical_check_ids_and_visible_unicode_values
         assert!(
             error.contains("acceptance check"),
             "expected acceptance-list error in {error}"
+        );
+    }
+
+    // The grammar is scoped to an explicit acceptance heading.  Outside that
+    // section, natural number-leading prose is not protocol input.  Within it,
+    // unnumbered prose is still allowed, but an empty section cannot make QA
+    // coverage vacuous.
+    let prose_and_heading_boundary = Issue {
+        description: Some(
+            "2026 roadmap\n\
+             ## Acceptance criteria\n\
+             This is explanatory prose.\n\
+             - ordinary unnumbered Markdown prose\n\
+             1. first\n\
+             2. second\n\
+             ## Background\n\
+             2027 roadmap\n\
+             3. not an acceptance check"
+                .into(),
+        ),
+        ..issue.clone()
+    };
+    assert!(
+        RuntimeService::delivery_note(
+            &qa_task,
+            &prose_and_heading_boundary,
+            &outcome("QA PASS: scoped checks\ntests run: cargo test\nchecks: 1, 2"),
+        )
+        .is_ok(),
+        "ordinary prose and later sections must not become accidental checks"
+    );
+    for description in [
+        "Acceptance checks\n- 1. first\n- 2. second",
+        "Acceptance checks\n## 1. first\n## 2. second",
+        "Acceptance checks\n- explanatory prose only",
+    ] {
+        let invalid_or_empty = Issue {
+            description: Some(description.into()),
+            ..issue.clone()
+        };
+        let error = RuntimeService::delivery_note(
+            &qa_task,
+            &invalid_or_empty,
+            &outcome("QA PASS: false vacuous pass\ntests run: cargo test\nchecks: arbitrary text"),
+        )
+        .expect_err("invalid or empty source criteria must fail before QA can pass");
+        assert!(
+            error.contains("acceptance"),
+            "expected source-criteria error in {error}"
         );
     }
 
@@ -6767,7 +6829,10 @@ fn delivery_evidence_uses_bounded_canonical_check_ids_and_visible_unicode_values
 
     let implementation_task = task(polyphony_core::PipelineTaskRole::Implementation);
     let implementation_note = "IMPLEMENTATION NOTE: evidence\nwhat changed: added a guard\ncommit: abc123\ntests run: cargo test\nchecks: 1, 2";
-    for invisible in ["\u{00a0}", "\u{200b}", "\u{2060}", "\u{0007}"] {
+    for invisible in [
+        "\u{00a0}", "\u{0600}", "\u{0301}", "\u{20dd}", "\u{200b}", "\u{202e}", "\u{2060}",
+        "\u{0007}",
+    ] {
         let error = RuntimeService::delivery_note(
             &implementation_task,
             &issue,
@@ -6786,7 +6851,10 @@ fn delivery_evidence_uses_bounded_canonical_check_ids_and_visible_unicode_values
         RuntimeService::delivery_note(
             &implementation_task,
             &issue,
-            &outcome(&implementation_note.replace("added a guard", "\u{00a0}解析の修正\u{00a0}")),
+            &outcome(&implementation_note.replace(
+                "added a guard",
+                "\u{0600}\u{00a0}解析の修正\u{202e}\u{00a0}",
+            ),),
         )
         .is_ok()
     );

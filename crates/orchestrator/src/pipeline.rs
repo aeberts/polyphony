@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::{prelude::*, *};
 
@@ -23,35 +24,30 @@ impl RuntimeService {
     /// while still keeping the protocol's canonical representation explicit.
     const MAX_ACCEPTANCE_CHECK_ID: u16 = 999;
 
-    /// Unicode format controls are not covered by `char::is_control`, but a
-    /// value made entirely of them is just as unreadable as a blank value.
-    /// Keep this deliberately narrow: the parser rejects a value only when it
-    /// contains *nothing but* whitespace/control/format characters, so normal
-    /// Unicode prose remains valid.
-    fn is_invisible_format_control(character: char) -> bool {
-        matches!(
-            character,
-            '\u{00ad}'
-                | '\u{061c}'
-                | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206f}'
-                | '\u{feff}'
-                | '\u{fff0}'..='\u{fff8}'
-                | '\u{e0000}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
-        )
+    /// A complete Unicode-category check prevents newly discovered or
+    /// previously omitted format controls from becoming apparently nonempty
+    /// checklist values.  Keep the policy narrow: ordinary visible Unicode
+    /// prose remains valid; only whitespace, controls, format characters, and
+    /// standalone combining marks are disregarded when deciding whether a
+    /// value is meaningful.
+    fn is_nonvisible(character: char) -> bool {
+        character.is_whitespace()
+            || matches!(
+                get_general_category(character),
+                GeneralCategory::Control
+                    | GeneralCategory::Format
+                    | GeneralCategory::NonspacingMark
+                    | GeneralCategory::EnclosingMark
+                    | GeneralCategory::SpacingMark
+            )
     }
 
     /// A checklist value may use Unicode prose, but must contain at least one
     /// visible, non-control character after Unicode-aware normalization.
     fn has_meaningful_evidence_value(value: &str) -> bool {
-        value.trim().chars().any(|character| {
-            !character.is_control() && !Self::is_invisible_format_control(character)
-        })
+        value
+            .chars()
+            .any(|character| !Self::is_nonvisible(character))
     }
 
     fn canonical_acceptance_check_id(value: &str) -> Result<String, String> {
@@ -77,7 +73,7 @@ impl RuntimeService {
     /// `key: value`, at column zero, using one of the canonical lower-case
     /// keys.  A case or whitespace variant is rejected rather than silently
     /// being treated as prose beside a canonical (possibly contradictory) key.
-    fn evidence_fields<'a>(report: &'a str) -> Result<BTreeMap<&'a str, &'a str>, String> {
+    fn evidence_fields(report: &str) -> Result<BTreeMap<&str, &str>, String> {
         let mut values = BTreeMap::new();
         for line in report.lines() {
             let Some((label, candidate)) = line.split_once(':') else {
@@ -119,39 +115,136 @@ impl RuntimeService {
         Ok(values)
     }
 
+    /// An acceptance source is an explicitly headed `Acceptance checks` or
+    /// `Acceptance criteria` section (plain or ATX Markdown).  This narrow
+    /// boundary keeps ordinary prose such as `2026 roadmap` outside that
+    /// section from being mistaken for protocol input.  Once inside a marked
+    /// section, every numeric/list/heading form that could be read as a
+    /// criterion is input: it must be the canonical `N. description` grammar
+    /// or the entire source fails closed.
+    fn is_acceptance_heading(line: &str) -> bool {
+        let trimmed = line.trim();
+        let title = if let Some(markdown_title) = Self::markdown_heading_title(trimmed) {
+            markdown_title
+        } else {
+            trimmed
+        };
+        let title = title.strip_suffix(':').unwrap_or(title).trim_end();
+        title.eq_ignore_ascii_case("acceptance checks")
+            || title.eq_ignore_ascii_case("acceptance criteria")
+    }
+
+    /// Returns a standard ATX Markdown heading title.  A malformed `##1.` is
+    /// deliberately not treated as a section boundary; the criterion detector
+    /// below sees it and rejects it instead of silently skipping its content.
+    fn markdown_heading_title(line: &str) -> Option<&str> {
+        let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+        if hashes == 0 {
+            return None;
+        }
+        let remainder = line.get(hashes..)?;
+        let first = remainder.chars().next()?;
+        first.is_whitespace().then_some(remainder.trim())
+    }
+
+    fn is_number_sign(character: char) -> bool {
+        matches!(
+            get_general_category(character),
+            GeneralCategory::MathSymbol | GeneralCategory::DashPunctuation
+        )
+    }
+
+    fn is_criterion_separator(character: char) -> bool {
+        matches!(character, '.' | ')' | ':' | '\u{ff0e}' | '\u{3002}')
+    }
+
+    /// This is intentionally broader than the accepted grammar.  It detects
+    /// only forms with a criterion delimiter (or a signed number), so prose
+    /// like `2026 roadmap` remains prose, while `01.`, `1)`, `- 1.`, `## 1.`,
+    /// Unicode signs/digits, and bidi/zero-width-obscured markers fail closed.
+    fn looks_like_acceptance_criterion(line: &str) -> bool {
+        fn direct_candidate(value: &str) -> bool {
+            // The accepted grammar intentionally does not normalize source
+            // text.  Detection does, so controls cannot split `1` from `.`,
+            // or hide a sign/digit marker and turn invalid criteria into
+            // ignored prose.  The raw line is then rejected below.
+            let value = value
+                .chars()
+                .filter(|character| !RuntimeService::is_nonvisible(*character))
+                .collect::<String>();
+            let Some(first) = value.chars().next() else {
+                return false;
+            };
+            if RuntimeService::is_number_sign(first) {
+                let remainder = &value[first.len_utf8()..];
+                return remainder.chars().next().is_some_and(char::is_numeric);
+            }
+            if !first.is_numeric() {
+                return false;
+            }
+            let numeric_end = value
+                .char_indices()
+                .find_map(|(index, character)| (!character.is_numeric()).then_some(index))
+                .unwrap_or(value.len());
+            let remainder = &value[numeric_end..];
+            remainder
+                .chars()
+                .next()
+                .is_some_and(RuntimeService::is_criterion_separator)
+        }
+
+        let trimmed = line.trim();
+        if direct_candidate(trimmed) {
+            return true;
+        }
+        let hashes = trimmed.bytes().take_while(|byte| *byte == b'#').count();
+        if hashes > 0 && trimmed.get(hashes..).is_some_and(direct_candidate) {
+            return true;
+        }
+        let Some(marker) = trimmed.chars().next() else {
+            return false;
+        };
+        if !matches!(marker, '*' | '+' | '-') {
+            return false;
+        }
+        let remainder = &trimmed[marker.len_utf8()..];
+        remainder.chars().next().is_some_and(Self::is_nonvisible) && direct_candidate(remainder)
+    }
+
     fn required_acceptance_checks(issue: &Issue) -> Result<Vec<String>, String> {
         let mut checks = Vec::new();
         let mut seen = BTreeSet::new();
         let mut previous = None;
+        let mut in_acceptance_section = false;
         for line in issue.description.as_deref().unwrap_or_default().lines() {
-            let trimmed = line.trim();
-            let Some(first) = trimmed.chars().next() else {
+            if !in_acceptance_section {
+                in_acceptance_section = Self::is_acceptance_heading(line);
                 continue;
-            };
-            // Any line that begins as a numbered reference (including a
-            // signed or non-ASCII numeric lookalike) is protocol input, not
-            // harmless prose.  Reject near-misses instead of silently losing
-            // a criterion and letting QA coverage become vacuous.
-            let numbered_looking = first.is_numeric()
-                || matches!(first, '+' | '-')
-                    && trimmed
-                        .chars()
-                        .nth(1)
-                        .is_some_and(|character| character.is_numeric());
-            if !numbered_looking {
+            }
+            let trimmed = line.trim();
+            if Self::markdown_heading_title(trimmed).is_some()
+                && !Self::looks_like_acceptance_criterion(trimmed)
+            {
+                break;
+            }
+            if !Self::looks_like_acceptance_criterion(trimmed) {
                 continue;
             }
             let digits = trimmed
-                .chars()
-                .take_while(|character| character.is_ascii_digit())
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit())
                 .count();
-            if digits == 0 || !trimmed[digits..].starts_with('.') {
+            let Some(remainder) = trimmed.get(digits..) else {
                 return Err(format!(
                     "acceptance check `{trimmed}` must use canonical `N. <nonempty description>` grammar"
                 ));
-            }
+            };
+            let Some(description) = remainder.strip_prefix('.') else {
+                return Err(format!(
+                    "acceptance check `{trimmed}` must use canonical `N. <nonempty description>` grammar"
+                ));
+            };
             let number = Self::canonical_acceptance_check_id(&trimmed[..digits])?;
-            let description = &trimmed[digits + 1..];
             if !description.starts_with([' ', '\t'])
                 || !Self::has_meaningful_evidence_value(description)
             {
@@ -172,6 +265,12 @@ impl RuntimeService {
             }
             previous = Some(number);
             checks.push(number.to_string());
+        }
+        if in_acceptance_section && checks.is_empty() {
+            return Err(
+                "acceptance section must contain at least one canonical `N. <nonempty description>` check"
+                    .into(),
+            );
         }
         Ok(checks)
     }

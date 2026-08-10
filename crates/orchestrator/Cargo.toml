@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+unicode-general-category.workspace = true
 polyphony-core = { path = "../core" }
 polyphony-git = { path = "../git" }
 polyphony-feedback = { path = "../feedback" }
