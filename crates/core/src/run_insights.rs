@@ -105,7 +105,12 @@ pub fn build_run_insight(
         RunStatus::Blocked => run
             .blocked_outcome
             .as_ref()
-            .map(|outcome| format!("Blocked pending {}: {}", outcome.prerequisite, outcome.reason))
+            .map(|outcome| {
+                format!(
+                    "Blocked pending {}: {}",
+                    outcome.prerequisite, outcome.reason
+                )
+            })
             .unwrap_or_else(|| "Run is blocked pending prerequisite work.".into()),
     };
 

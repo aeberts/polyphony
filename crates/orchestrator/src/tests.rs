@@ -3407,11 +3407,8 @@ async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
     let issue = sample_issue("issue-blocked", "FAC-BLOCKED", "Todo", "Blocked work");
     let tracker = TestTracker::new(vec![issue.clone()]);
     let tracker_handle = tracker.clone();
-    let mut service = test_service_for_workflow(
-        workflow.clone(),
-        tracker,
-        RecordingProvisioner::default(),
-    );
+    let mut service =
+        test_service_for_workflow(workflow.clone(), tracker, RecordingProvisioner::default());
     let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
     let run_id = run.id.clone();
     service.state.runs.insert(run_id.clone(), run);
@@ -3443,22 +3440,42 @@ async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
     let run = &service.state.runs[&run_id];
     assert_eq!(run.status, RunStatus::Blocked);
     assert_eq!(
-        run.blocked_outcome.as_ref().map(|outcome| outcome.prerequisite.as_str()),
+        run.blocked_outcome
+            .as_ref()
+            .map(|outcome| outcome.prerequisite.as_str()),
         Some("FAC-42")
     );
-    assert_eq!(tracker_handle.recorded_workflow_updates(), vec!["Awaiting Dependency"]);
+    assert_eq!(tracker_handle.recorded_workflow_updates(), vec![
+        "Awaiting Dependency"
+    ]);
     assert_eq!(tracker_handle.recorded_comments().len(), 1);
-    assert_eq!(
-        tracker_handle.write_order(),
-        vec!["comment", "workflow:Awaiting Dependency"]
+    assert_eq!(tracker_handle.write_order(), vec![
+        "comment",
+        "workflow:Awaiting Dependency"
+    ]);
+    assert!(
+        tracker_handle.recorded_comments()[0]
+            .body
+            .contains("FAC-42")
     );
-    assert!(tracker_handle.recorded_comments()[0].body.contains("FAC-42"));
     assert!(service.state.retrying.is_empty());
     assert!(!service.should_dispatch(&workflow, &issue));
 
-    service.retry_failed_run_from_task(&run_id, None).await.unwrap();
+    // Retry through the same queued path that handles a normal RetryRun
+    // command. A blocked run must remain terminal before it reaches retry
+    // dispatch.
+    service.pending_run_retries.push(run_id.clone());
+    service.process_pending_run_retries().await;
     service
-        .dispatch_issue(workflow.clone(), issue.clone(), None, false, None, false, None)
+        .dispatch_issue(
+            workflow.clone(),
+            issue.clone(),
+            None,
+            false,
+            None,
+            false,
+            None,
+        )
         .await
         .unwrap();
     assert!(!service.state.running.contains_key(&issue.id));
@@ -3500,7 +3517,10 @@ async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
         RecordingProvisioner::default(),
     );
     restarted.restore_bootstrap(persisted_bootstrap);
-    restarted.normalize_restored_in_progress_runs().await.unwrap();
+    restarted
+        .normalize_restored_in_progress_runs()
+        .await
+        .unwrap();
     restarted.tick().await;
     restarted.tick().await;
 
@@ -3517,13 +3537,20 @@ async fn blocked_outcome_is_durable_and_prevents_retry_dispatch_and_restart() {
     assert!(restarted.state.retrying.is_empty());
     assert!(tracker_handle.acknowledged_issues().is_empty());
     assert_eq!(tracker_handle.recorded_comments().len(), 1);
-    assert_eq!(tracker_handle.recorded_workflow_updates(), vec!["Awaiting Dependency"]);
+    assert_eq!(tracker_handle.recorded_workflow_updates(), vec![
+        "Awaiting Dependency"
+    ]);
 }
 
 #[tokio::test]
 async fn malformed_or_unconfigured_blocked_outcomes_never_create_a_false_block() {
     let workspace_root = unique_workspace_root("blocked-outcome-rejection");
-    let issue = sample_issue("issue-blocked-rejected", "FAC-REJECT", "Todo", "Rejected block");
+    let issue = sample_issue(
+        "issue-blocked-rejected",
+        "FAC-REJECT",
+        "Todo",
+        "Rejected block",
+    );
 
     // Missing configuration fails closed before any tracker evidence or local
     // terminal record is accepted.
@@ -3565,8 +3592,7 @@ async fn malformed_or_unconfigured_blocked_outcomes_never_create_a_false_block()
     );
     let tracker = TestTracker::new(vec![issue.clone()]);
     let tracker_handle = tracker.clone();
-    let mut service =
-        test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
+    let mut service = test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
     let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
     let run_id = run.id.clone();
     service.state.runs.insert(run_id.clone(), run);
@@ -3584,7 +3610,9 @@ async fn malformed_or_unconfigured_blocked_outcomes_never_create_a_false_block()
                 status: AttemptStatus::Succeeded,
                 turns_completed: 1,
                 error: None,
-                final_issue_state: Some("BLOCKED:\nreason: dependency missing\nevidence: fixture failed".into()),
+                final_issue_state: Some(
+                    "BLOCKED:\nreason: dependency missing\nevidence: fixture failed".into(),
+                ),
             },
         )
         .await
@@ -3608,8 +3636,7 @@ async fn invalid_prerequisite_reference_never_creates_a_false_block() {
     );
     let tracker = TestTracker::new(vec![issue.clone()]);
     let tracker_handle = tracker.clone();
-    let mut service =
-        test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
+    let mut service = test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
     let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);
     let run_id = run.id.clone();
     service.state.runs.insert(run_id.clone(), run);
@@ -3654,7 +3681,8 @@ async fn tracker_write_failure_leaves_the_run_non_blocked() {
         "---\ntracker:\n  kind: mock\n  active_states: [Todo, Awaiting Dependency]\n  blocked_state: Awaiting Dependency\nworkspace:\n  root: __ROOT__\nagents:\n  default: mock\n  profiles:\n    mock: { kind: mock, transport: mock, command: mock }\n---\nTest prompt\n",
     );
     let issue = sample_issue("issue-blocked-write", "FAC-WRITE", "Todo", "Write failure");
-    let tracker = TestTracker::new(vec![issue.clone()]).fail_workflow_status_updates("tracker unavailable");
+    let tracker =
+        TestTracker::new(vec![issue.clone()]).fail_workflow_status_updates("tracker unavailable");
     let tracker_handle = tracker.clone();
     let mut service = test_service_for_workflow(workflow, tracker, RecordingProvisioner::default());
     let run = persisted_issue_run(&issue, &workspace_root, RunStatus::InProgress);

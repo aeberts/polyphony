@@ -1005,7 +1005,12 @@ impl RuntimeService {
                     .await
                 {
                     Ok(()) => {
-                        self.finalize_saved_context(&issue_id, &issue_identifier, &running, &outcome);
+                        self.finalize_saved_context(
+                            &issue_id,
+                            &issue_identifier,
+                            &running,
+                            &outcome,
+                        );
                         if let Some(context) = self.state.saved_contexts.get(&issue_id)
                             && let Err(error) = persist_workspace_saved_context_artifact(
                                 &running.workspace_path,

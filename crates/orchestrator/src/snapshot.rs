@@ -119,7 +119,10 @@ impl RuntimeService {
             }
             let is_active = !matches!(
                 m.status,
-                RunStatus::Delivered | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Blocked
+                RunStatus::Delivered
+                    | RunStatus::Failed
+                    | RunStatus::Cancelled
+                    | RunStatus::Blocked
             );
             match best {
                 None => best = Some((id, is_active)),

@@ -1277,7 +1277,10 @@ impl AppState {
             for m in &snapshot.runs {
                 if matches!(
                     m.status,
-                    RunStatus::Delivered | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Blocked
+                    RunStatus::Delivered
+                        | RunStatus::Failed
+                        | RunStatus::Cancelled
+                        | RunStatus::Blocked
                 ) {
                     self.collapsed_runs.insert(m.id.clone());
                 }
@@ -1337,7 +1340,9 @@ impl AppState {
             let has_outcome = run.deliverable.is_some()
                 || matches!(
                     run.status,
-                    polyphony_core::RunStatus::Delivered | polyphony_core::RunStatus::Failed | polyphony_core::RunStatus::Blocked
+                    polyphony_core::RunStatus::Delivered
+                        | polyphony_core::RunStatus::Failed
+                        | polyphony_core::RunStatus::Blocked
                 );
             let issue_id = run.issue_identifier.as_deref().and_then(|ident| {
                 snapshot

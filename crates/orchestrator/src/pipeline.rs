@@ -1259,7 +1259,10 @@ impl RuntimeService {
         {
             self.push_event(
                 EventScope::Dispatch,
-                format!("{} pipeline continuation skipped: run is blocked", issue.identifier),
+                format!(
+                    "{} pipeline continuation skipped: run is blocked",
+                    issue.identifier
+                ),
             );
             return Ok(());
         }

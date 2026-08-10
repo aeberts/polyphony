@@ -148,7 +148,10 @@ impl RuntimeService {
         {
             self.push_event(
                 EventScope::Dispatch,
-                format!("{} dispatch skipped: blocked outcome is terminal", issue.identifier),
+                format!(
+                    "{} dispatch skipped: blocked outcome is terminal",
+                    issue.identifier
+                ),
             );
             return Ok(());
         }

@@ -1645,7 +1645,10 @@ impl RuntimeService {
             // even if the process stopped while a task still said InProgress.
             // Startup normalization must never reinterpret it as a failure
             // that can be retried or replanned.
-            if matches!(run_snapshot.status, RunStatus::Cancelled | RunStatus::Blocked) {
+            if matches!(
+                run_snapshot.status,
+                RunStatus::Cancelled | RunStatus::Blocked
+            ) {
                 let cancellation_reason = run_snapshot
                     .cancel_reason
                     .as_deref()

@@ -148,7 +148,12 @@ impl AgentRunResult {
                 "reason" => &mut reason,
                 "evidence" => &mut evidence,
                 "prerequisite" => &mut prerequisite,
-                _ => return Err(format!("blocked outcome has unknown field `{}`", key.trim())),
+                _ => {
+                    return Err(format!(
+                        "blocked outcome has unknown field `{}`",
+                        key.trim()
+                    ));
+                },
             };
             if field.replace(value.to_string()).is_some() {
                 return Err(format!("blocked outcome repeats `{}`", key.trim()));
@@ -158,8 +163,8 @@ impl AgentRunResult {
         let reason = reason.ok_or_else(|| "blocked outcome is missing `reason`".to_string())?;
         let evidence =
             evidence.ok_or_else(|| "blocked outcome is missing `evidence`".to_string())?;
-        let prerequisite = prerequisite
-            .ok_or_else(|| "blocked outcome is missing `prerequisite`".to_string())?;
+        let prerequisite =
+            prerequisite.ok_or_else(|| "blocked outcome is missing `prerequisite`".to_string())?;
         if !is_linked_work_reference(&prerequisite) {
             return Err(
                 "blocked outcome `prerequisite` must be a linked work reference (for example `FAC-42`, `#42`, or `owner/repo#42`)"
@@ -191,12 +196,9 @@ fn is_linked_work_reference(reference: &str) -> bool {
             && repository.split('/').count() == 2
             && repository.split('/').all(|part| {
                 !part.is_empty()
-                    && part
-                        .bytes()
-                        .all(|byte| {
-                            byte.is_ascii_alphanumeric()
-                                || matches!(byte, b'-' | b'_' | b'.')
-                        })
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
             })
             && is_issue_number(number);
     }
