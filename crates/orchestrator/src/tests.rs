@@ -1070,7 +1070,7 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
             Some(
                 "REPAIR NOTE:\n\
                   what fixed: completed the missing fixture marker\n\
-                  commit: fixture-repair\n\
+                  commit: def456\n\
                   tests run: focused fixture\n\
                   recheck: independent QA checks 1 through 5\n\
                   checks: 3, 4"
@@ -1080,7 +1080,7 @@ impl AgentRuntime for ClosedLoopQaFixtureAgent {
             Some(
                 "IMPLEMENTATION NOTE:\n\
                   what changed: added the fixture implementation marker\n\
-                  commit: fixture-implementation\n\
+                  commit: abc123\n\
                   tests run: focused fixture\n\
                   checks: 1, 2"
                     .into(),
@@ -6419,6 +6419,35 @@ fn delivery_evidence_rejects_fake_workers_that_omit_each_required_checklist_fiel
         )
         .is_ok()
     );
+
+    // Both coding roles may have a legitimate non-code outcome, but the
+    // durable note must make its reason explicit.  Do not accept bare or
+    // ambiguous `none` values as if they were commit identifiers.
+    let repair_no_commit = "REPAIR NOTE:\nwhat fixed: documented the decision\ncommit: none — no code change\ntests run: not applicable\nrecheck: QA checks 1\nchecks: 1";
+    assert!(
+        RuntimeService::delivery_note(
+            &task(polyphony_core::PipelineTaskRole::Repair),
+            &issue,
+            &outcome(repair_no_commit)
+        )
+        .is_ok()
+    );
+    for invalid_commit in [
+        "none",
+        "none —",
+        "none —    ",
+        "none - no code change",
+        "not-a-commit",
+    ] {
+        let invalid_note = no_commit.replace("none — no code change", invalid_commit);
+        let error = RuntimeService::delivery_note(
+            &task(polyphony_core::PipelineTaskRole::Implementation),
+            &issue,
+            &outcome(&invalid_note),
+        )
+        .expect_err("invalid no-commit evidence must fail closed");
+        assert!(error.contains("commit"), "expected commit error in {error}");
+    }
 }
 
 #[tokio::test]

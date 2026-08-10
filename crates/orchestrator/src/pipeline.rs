@@ -64,6 +64,31 @@ impl RuntimeService {
         }
     }
 
+    fn require_commit_evidence(
+        report: &str,
+        role: polyphony_core::PipelineTaskRole,
+    ) -> Result<(), String> {
+        let commit = Self::evidence_field(report, "commit")
+            .expect("commit field is required before its value is validated");
+        // Six hexadecimal characters is the shortest abbreviated SHA accepted
+        // by Git's revision parser; full hashes remain valid as well.
+        let is_commit_hash = (6..=64).contains(&commit.len())
+            && commit
+                .chars()
+                .all(|character| character.is_ascii_hexdigit());
+        let is_explained_no_commit = commit
+            .strip_prefix("none — ")
+            .is_some_and(|reason| !reason.trim().is_empty());
+
+        if is_commit_hash || is_explained_no_commit {
+            Ok(())
+        } else {
+            Err(format!(
+                "{role} evidence must use a 6-64 character hexadecimal commit hash or `commit: none — <nonempty reason>`"
+            ))
+        }
+    }
+
     pub(crate) fn delivery_note(
         task: &Task,
         issue: &Issue,
@@ -101,6 +126,7 @@ impl RuntimeService {
                     &["what changed", "commit", "tests run", "checks"],
                     task.role,
                 )?;
+                Self::require_commit_evidence(body, task.role)?;
             },
             polyphony_core::PipelineTaskRole::Repair => {
                 Self::require_evidence_fields(
@@ -108,6 +134,7 @@ impl RuntimeService {
                     &["what fixed", "commit", "tests run", "recheck", "checks"],
                     task.role,
                 )?;
+                Self::require_commit_evidence(body, task.role)?;
             },
             polyphony_core::PipelineTaskRole::Qa => {
                 Self::require_evidence_fields(body, &["tests run", "checks"], task.role)?;
