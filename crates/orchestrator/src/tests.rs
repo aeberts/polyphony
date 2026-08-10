@@ -27,6 +27,7 @@ use crate::{helpers::*, prelude::*, *};
 struct TestTracker {
     issues: Arc<Mutex<HashMap<String, Issue>>>,
     workflow_updates: Arc<Mutex<Vec<String>>>,
+    workflow_status_error: Arc<Mutex<Option<String>>>,
     fetch_by_ids_calls: Arc<Mutex<u32>>,
     issue_updates: Arc<Mutex<Vec<UpdateIssueRequest>>>,
     acknowledged_issues: Arc<Mutex<Vec<String>>>,
@@ -102,6 +103,7 @@ impl TestTracker {
                     .collect(),
             )),
             workflow_updates: Arc::new(Mutex::new(Vec::new())),
+            workflow_status_error: Arc::new(Mutex::new(None)),
             fetch_by_ids_calls: Arc::new(Mutex::new(0)),
             issue_updates: Arc::new(Mutex::new(Vec::new())),
             acknowledged_issues: Arc::new(Mutex::new(Vec::new())),
@@ -112,6 +114,11 @@ impl TestTracker {
 
     fn recorded_workflow_updates(&self) -> Vec<String> {
         self.workflow_updates.lock().unwrap().clone()
+    }
+
+    fn fail_workflow_status_updates(self, error: impl Into<String>) -> Self {
+        *self.workflow_status_error.lock().unwrap() = Some(error.into());
+        self
     }
 
     fn fetch_by_ids_calls(&self) -> u32 {
@@ -278,6 +285,9 @@ impl IssueTracker for TestTracker {
         _issue: &Issue,
         status: &str,
     ) -> Result<(), polyphony_core::Error> {
+        if let Some(error) = self.workflow_status_error.lock().unwrap().clone() {
+            return Err(polyphony_core::Error::Adapter(error));
+        }
         self.workflow_updates
             .lock()
             .unwrap()
@@ -6045,6 +6055,83 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
     assert!(comments.iter().any(|note| note.body.contains("implementation note")));
     assert!(comments.iter().any(|note| note.body.contains("repair note")));
     assert_eq!(comments.iter().filter(|note| note.body.contains("QA note")).count(), 2);
+}
+
+#[tokio::test]
+async fn qa_failure_does_not_dispatch_repair_when_tracker_cannot_record_repair_needed() {
+    let workspace_root = unique_workspace_root("qa-fail-closed-tracker-status");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\n    repair: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\n---\nFail-closed QA fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue("issue-qa-fail-closed", "QA-FAIL-CLOSED", "Todo", "QA failure");
+    let tracker = TestTracker::new(vec![issue.clone()])
+        .fail_workflow_status_updates("simulated tracker status outage");
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()), None, Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()), None, None, None, None, None, None, rx,
+    ).0;
+
+    service.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None).await.unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    let failed_qa = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some("QA FAIL: tracker status mutation must be durable".into()),
+    };
+    service.handle_task_finished(&workflow, &issue, &run_id, &task_id, &workspace_root, &failed_qa, None).await.unwrap();
+
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Failed);
+    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Failed);
+    assert_eq!(service.state.tasks[&run_id][1].status, TaskStatus::Pending);
+    assert!(!service.state.running.contains_key(&issue.id), "repair must not be dispatched after an unrecorded QA failure");
+    assert!(tracker.recorded_workflow_updates().is_empty());
+    assert!(service.state.runs[&run_id].activity_log.iter().any(|log| log.message.contains("Repair Needed failed") && log.message.contains("not dispatched")));
+}
+
+#[tokio::test]
+async fn restart_crash_window_reconciles_existing_evidence_marker_without_duplicate_comment() {
+    let workspace_root = unique_workspace_root("evidence-publication-reconciliation");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock }\n    qa: { kind: mock, transport: mock, command: mock }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n---\nEvidence reconciliation fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue("issue-evidence-reconcile", "EVIDENCE-RECONCILE", "Todo", "Publication recovery");
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()), None, Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()), None, None, None, None, None, None, rx,
+    ).0;
+
+    service.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None).await.unwrap();
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    let task_id = service.state.tasks[&run_id][0].id.clone();
+    service.state.running.remove(&issue.id);
+    // Simulate a crash after the tracker accepted this comment but before the
+    // task/run checkpoint could be persisted.  A restarted tracker fetch
+    // supplies the existing comment in the issue snapshot.
+    let mut restarted_issue = issue.clone();
+    restarted_issue.comments.push(IssueComment {
+        id: "already-published".into(),
+        body: format!("<!-- polyphony:delivery-evidence run={run_id} task={task_id} -->\\n## Polyphony implementation note"),
+        author: None, url: None, created_at: None, updated_at: None,
+    });
+    let completed = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some("IMPLEMENTATION NOTE: tracker note survived crash".into()),
+    };
+    service.handle_task_finished(&workflow, &restarted_issue, &run_id, &task_id, &workspace_root, &completed, None).await.unwrap();
+
+    assert_eq!(service.state.tasks[&run_id][0].status, TaskStatus::Completed);
+    assert!(tracker.recorded_comments().is_empty(), "existing marker must prevent a duplicate evidence comment");
+    assert!(service.state.runs[&run_id].activity_log.iter().any(|log| log.message.contains("not posting a duplicate")));
 }
 
 #[tokio::test]

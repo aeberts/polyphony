@@ -88,6 +88,23 @@ impl RuntimeService {
         note: &str,
     ) -> Result<(), Error> {
         let marker = format!("<!-- polyphony:delivery-evidence run={run_id} task={} -->", task.id);
+        // A worker can finish after the tracker accepted its comment but before
+        // the run/task state is persisted.  On recovery the task is retried,
+        // so the tracker-provided issue snapshot is the durable source of
+        // truth for whether that publication already happened.
+        if issue.comments.iter().any(|comment| comment.body.contains(&marker)) {
+            if let Some(run) = self.state.runs.get_mut(run_id) {
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    format!("evidence already recorded for {} task {}; not posting a duplicate", task.role, task.id),
+                );
+                run.updated_at = Utc::now();
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+            return Ok(());
+        }
         let body = format!(
             "{marker}\n## Polyphony {}\n\n{note}\n\nRole: `{}`\nTask: `{}`",
             match task.role {
@@ -1246,10 +1263,28 @@ impl RuntimeService {
         }
 
         if qa_failed {
-            let _ = self
+            if let Err(error) = self
                 .tracker_for_issue(&issue.id)
                 .update_issue_workflow_status(issue, "Repair Needed")
-                .await;
+                .await
+            {
+                // A repair worker must never be released until the failed QA
+                // result is durably visible in the tracker.  Otherwise a
+                // restart/person could see stale tracker state while code is
+                // being changed in response to an invisible failure.
+                if let Some(run) = self.state.runs.get_mut(run_id) {
+                    run.status = RunStatus::Failed;
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        format!("QA failed, but tracker transition to Repair Needed failed; repair was not dispatched: {error}"),
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                return Ok(());
+            }
             let repair_is_next = self
                 .state
                 .tasks
