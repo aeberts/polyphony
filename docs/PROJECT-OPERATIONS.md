@@ -67,11 +67,13 @@ constrain routine fork work around hypothetical upstream adoption.
 
 ## Inherited Beads context
 
-The repository includes Beads product support and inherited `.beads` material.
-This material can help explain the original project's tracker model. It is not
-the active issue store or delivery tracker for the Polyphony Safety Fork. Do
-not remove Beads product support or `.beads` material merely as part of normal
-issue work.
+The repository includes Beads product support. Historical Beads tracker
+material is archived in [`docs/reference/beads-history/`](reference/beads-history/)
+to explain the original project's tracker model. It is not the active issue
+store, delivery tracker, or configuration source for the Polyphony Safety Fork.
+The root `.beads` directory is deliberately absent so Polyphony cannot activate
+it as a supplemental runtime tracker. Do not remove Beads product support as
+part of normal issue work.
 
 ## Repository configuration
 
