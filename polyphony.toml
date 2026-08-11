@@ -7,10 +7,13 @@
 
 [tracker]
 kind = "github"
-repository = "penso/polyphony"
+repository = "aeberts/polyphony"
 api_key = "$GITHUB_TOKEN"
-active_states = ["open", "todo", "in progress"]
-terminal_states = ["closed"]
+project_owner = "aeberts"
+project_number = 6
+project_status_field = "Status"
+active_states = ["Todo", "In Progress"]
+terminal_states = ["Done"]
 # Optional shared tracker profile from ~/.config/polyphony/config.toml:
 # profile = "github_personal"
 # GitHub example:
@@ -27,8 +30,7 @@ terminal_states = ["closed"]
 
 [workspace]
 checkout_kind = "discrete_clone"
-source_repo_path = "/Users/penso/code/polyphony"
-clone_url = "https://github.com/penso/polyphony.git"
+clone_url = "https://github.com/aeberts/polyphony.git"
 sync_on_reuse = false
 default_branch = "main"
 
