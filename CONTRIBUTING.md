@@ -43,7 +43,10 @@ Don't add manual `CHANGELOG.md` entries. The changelog is generated from commit 
 
 ## Reporting Issues
 
-Open a [GitHub issue](https://github.com/penso/polyphony/issues). Include steps to reproduce, expected vs actual behavior, and your OS/Rust version.
+Open a [GitHub issue](https://github.com/aeberts/polyphony/issues). Include
+steps to reproduce, expected versus actual behavior, and your OS/Rust version.
+The issue and the Polyphony safety fork GitHub Project (#6) are the delivery
+tracker for this fork; see [AGENTS.md](AGENTS.md) for the working process.
 
 ## License
 
