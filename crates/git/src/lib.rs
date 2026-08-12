@@ -1734,6 +1734,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discrete_clone_creates_an_isolated_repository_checkout() {
+        let temp = tempdir().unwrap();
+        let source_path = temp.path().join("source");
+        init_repo(&source_path);
+        let root = temp.path().join("workspaces");
+        let provisioner = GitWorkspaceProvisioner::default();
+        let request = make_request(
+            &root,
+            "FAC-102-clone",
+            CheckoutKind::DiscreteClone,
+            Some(source_path.clone()),
+        );
+
+        let workspace = provisioner.ensure_workspace(request).await.unwrap();
+        let workspace_repo = git2::Repository::open(&workspace.path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("README.md")).unwrap(),
+            "hello\n"
+        );
+        assert!(workspace.path.join(".git").is_dir());
+        assert_ne!(
+            workspace_repo.path().canonicalize().unwrap(),
+            source_path.join(".git").canonicalize().unwrap()
+        );
+        assert_eq!(current_branch(&workspace_repo), "task/FAC-102-clone");
+
+        std::fs::remove_dir_all(source_path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.path.join("README.md")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(current_branch(&workspace_repo), "task/FAC-102-clone");
+    }
+
+    #[tokio::test]
+    async fn discrete_clone_fails_closed_when_the_source_cannot_be_cloned() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspaces");
+        let workspace_path = root.join("FAC-102-missing-source");
+        let provisioner = GitWorkspaceProvisioner::default();
+        let request = make_request(
+            &root,
+            "FAC-102-missing-source",
+            CheckoutKind::DiscreteClone,
+            Some(temp.path().join("missing-source")),
+        );
+
+        let error = provisioner.ensure_workspace(request).await.unwrap_err();
+
+        assert!(error.to_string().contains("clone"));
+        assert!(!workspace_path.exists());
+    }
+
+    #[tokio::test]
     async fn existing_clone_rechecks_out_requested_branch() {
         let temp = tempdir().unwrap();
         let source_path = temp.path().join("source");

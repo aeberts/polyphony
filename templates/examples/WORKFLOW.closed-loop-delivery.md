@@ -7,7 +7,8 @@ polling:
   interval_ms: 60000
 workspace:
   root: .polyphony/workspaces
-  checkout_kind: directory
+  # Each worker gets an isolated repository checkout and its own Git metadata.
+  checkout_kind: discrete_clone
   sync_on_reuse: true
 agent:
   # Eligible issues can run concurrently, while each issue remains sequential.

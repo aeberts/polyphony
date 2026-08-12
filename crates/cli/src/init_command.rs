@@ -927,6 +927,12 @@ fn write_seeded_repo_config(
             default_agent,
         )
     };
+    if template == InitTemplate::ClosedLoopDelivery {
+        content = content.replace(
+            "checkout_kind = \"linked_worktree\"",
+            "checkout_kind = \"discrete_clone\"",
+        );
+    }
     content = content.replace(
         "kind = \"none\"",
         &render_tracker_seed_replacement(tracker_seed),

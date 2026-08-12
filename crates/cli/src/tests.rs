@@ -589,7 +589,10 @@ mod init_command_tests {
         .unwrap();
 
         let workflow_contents = fs::read_to_string(workflow_path).unwrap();
+        let repo_config_contents = fs::read_to_string(repo_root.join("polyphony.toml")).unwrap();
         assert_eq!(report.pack, "closed-loop-delivery");
+        assert!(workflow_contents.contains("checkout_kind: discrete_clone"));
+        assert!(repo_config_contents.contains("checkout_kind = \"discrete_clone\""));
         assert!(workflow_contents.contains("role: implementation"));
         assert_eq!(workflow_contents.matches("role: repair").count(), 2);
         assert_eq!(workflow_contents.matches("role: qa").count(), 3);

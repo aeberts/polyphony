@@ -96,6 +96,7 @@ Use it when:
 Note:
 
 - seed a tracker during init; tracker comments are the durable evidence record
+- workers use isolated `discrete_clone` checkouts with standalone Git metadata
 - this pack does not enable commits, pull requests, deployment, or release automation
 
 ## `automation-feedback`
