@@ -20,17 +20,6 @@ impl RuntimeService {
         {
             return Ok(());
         }
-        let already_recorded = self.state.runs.get(run_id).is_some_and(|run| {
-            run.steps.iter().any(|step| {
-                step.kind == StepKind::LocalCommit
-                    && step.task_id.as_deref() == Some(&task.id)
-                    && step.status == polyphony_core::StepStatus::Succeeded
-            })
-        });
-        if already_recorded {
-            return Ok(());
-        }
-
         let branch_name = issue
             .branch_name
             .clone()
@@ -42,55 +31,126 @@ impl RuntimeService {
         let committer = self.committer_for_issue(&issue.id).ok_or_else(|| {
             CoreError::Adapter("local workspace committer is not configured".into())
         })?;
+        if self.store.is_none() {
+            return Err(CoreError::Adapter(
+                "local commit requires a durable state store for candidate and outcome evidence"
+                    .into(),
+            )
+            .into());
+        }
+        let capture_request = LocalWorkspaceCommitRequest {
+            workspace_path: workspace_path.to_path_buf(),
+            expected_branch: branch_name.clone(),
+            issue_identifier: issue.identifier.clone(),
+            run_id: run_id.to_string(),
+            task_id: task.id.clone(),
+            commit_message: commit_message.clone(),
+            author_name: "Polyphony Local Commit".into(),
+            author_email: "local-commit@polyphony.invalid".into(),
+            candidate: LocalWorkspaceCommitCandidate {
+                base_sha: String::new(),
+                tree_sha: String::new(),
+                changed_files: Vec::new(),
+                status: Vec::new(),
+                diff: String::new(),
+                lock_token: String::new(),
+            },
+        };
 
-        // Persist the intent first.  If the process stops after Git creates
-        // the commit but before this outcome is stored, recovery repeats this
-        // exact request and the Git committer reconciles the matching HEAD.
-        if let Some(run) = self.state.runs.get_mut(run_id) {
-            let recovering = run.steps.iter().any(|step| {
-                step.kind == StepKind::LocalCommit
-                    && step.task_id.as_deref() == Some(&task.id)
-                    && step.status == polyphony_core::StepStatus::Running
-            });
-            if !recovering {
-                let ordinal = run.steps.iter().map(|step| step.ordinal).max().unwrap_or(0) + 1;
-                let mut step = polyphony_core::StepRecord::new(StepKind::LocalCommit, ordinal)
-                    .with_task_id(task.id.clone());
-                step.mark_running();
-                run.steps.push(step);
-                run.push_log(
-                    polyphony_core::RunLogScope::Pipeline,
-                    format!("local commit pending for {}", task.id),
-                );
-                run.updated_at = Utc::now();
-                if let Some(store) = &self.store {
-                    store.save_run(run).await?;
-                }
+        let existing_step = self.state.runs.get(run_id).and_then(|run| {
+            run.steps.iter().find(|step| {
+                step.kind == StepKind::LocalCommit && step.task_id.as_deref() == Some(&task.id)
+            })
+        });
+        if existing_step.is_some_and(|step| step.status == polyphony_core::StepStatus::Succeeded) {
+            if let Some(candidate) = existing_step.and_then(local_commit_candidate_from_step) {
+                let recorded_request = LocalWorkspaceCommitRequest {
+                    candidate,
+                    ..capture_request
+                };
+                committer
+                    .release_local_commit_lock(&recorded_request)
+                    .await?;
             }
+            return Ok(());
         }
 
-        let result = committer
-            .commit_local(&LocalWorkspaceCommitRequest {
-                workspace_path: workspace_path.to_path_buf(),
-                expected_branch: branch_name,
-                issue_identifier: issue.identifier.clone(),
-                run_id: run_id.to_string(),
-                task_id: task.id.clone(),
-                commit_message,
-                author_name: "Polyphony Local Commit".into(),
-                author_email: "local-commit@polyphony.invalid".into(),
-            })
-            .await;
+        // Capture under a workspace lock, then persist the immutable status,
+        // diff, and tree before Git is allowed to create the commit.
+        let candidate =
+            if let Some(candidate) = existing_step.and_then(local_commit_candidate_from_step) {
+                candidate
+            } else {
+                let Some(candidate) = committer
+                    .capture_local_commit_candidate(&capture_request)
+                    .await?
+                else {
+                    let error = "local commit blocked: coding workspace has no eligible changes";
+                    self.fail_local_commit(run_id, &task.id, error).await?;
+                    return Err(CoreError::Adapter(error.into()).into());
+                };
+                if let Some(run) = self.state.runs.get_mut(run_id) {
+                    let ordinal = run.steps.iter().map(|step| step.ordinal).max().unwrap_or(0) + 1;
+                    let mut step = polyphony_core::StepRecord::new(StepKind::LocalCommit, ordinal)
+                        .with_task_id(task.id.clone());
+                    step.mark_running();
+                    step.output.insert(
+                        "candidate".into(),
+                        serde_json::to_value(&candidate).map_err(|error| {
+                            CoreError::Adapter(format!(
+                                "serialize local-commit candidate failed: {error}"
+                            ))
+                        })?,
+                    );
+                    step.output.insert(
+                        "candidate_status".into(),
+                        serde_json::Value::Array(
+                            candidate
+                                .status
+                                .iter()
+                                .cloned()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    );
+                    step.output.insert(
+                        "candidate_diff".into(),
+                        serde_json::Value::String(candidate.diff.clone()),
+                    );
+                    step.output.insert(
+                        "candidate_tree_sha".into(),
+                        serde_json::Value::String(candidate.tree_sha.clone()),
+                    );
+                    run.steps.push(step);
+                    run.push_log(
+                        polyphony_core::RunLogScope::Pipeline,
+                        format!("local commit candidate locked and recorded for {}", task.id),
+                    );
+                    run.updated_at = Utc::now();
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                candidate
+            };
+        let request = LocalWorkspaceCommitRequest {
+            candidate,
+            ..capture_request
+        };
+
+        let result = committer.commit_local(&request).await;
         let result = match result {
             Ok(Some(result)) => result,
             Ok(None) => {
                 let error = "local commit blocked: coding workspace has no eligible changes";
                 self.fail_local_commit(run_id, &task.id, error).await?;
+                committer.release_local_commit_lock(&request).await?;
                 return Err(CoreError::Adapter(error.into()).into());
             },
             Err(error) => {
                 self.fail_local_commit(run_id, &task.id, &error.to_string())
                     .await?;
+                committer.release_local_commit_lock(&request).await?;
                 return Err(Error::Core(error));
             },
         };
@@ -149,6 +209,10 @@ impl RuntimeService {
                 store.save_run(run).await?;
             }
         }
+        // The lock remains held until this successful outcome, including its
+        // candidate snapshot, is durable. A crash before this point leaves a
+        // running step that recovery reconciles without another agent stage.
+        committer.release_local_commit_lock(&request).await?;
         if let Some(tasks) = self.state.tasks.get_mut(run_id)
             && let Some(saved_task) = tasks.iter_mut().find(|saved| saved.id == task.id)
         {
@@ -1311,6 +1375,15 @@ impl RuntimeService {
             );
         }
     }
+}
+
+fn local_commit_candidate_from_step(
+    step: &polyphony_core::StepRecord,
+) -> Option<LocalWorkspaceCommitCandidate> {
+    step.output
+        .get("candidate")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 /// Detect the current branch name and diff stats against the default branch.

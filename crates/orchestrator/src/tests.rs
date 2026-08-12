@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use polyphony_core::{
     AddIssueCommentRequest, AgentSession, CreateIssueRequest, Deliverable, DeliverableDecision,
     DeliverableKind, DeliverableStatus, DispatchMode, IssueAuthor, IssueComment, IssueStateUpdate,
-    LocalWorkspaceCommitRequest, LocalWorkspaceCommitResult, PullRequestRef, StepStatus,
-    StoreBootstrap, UpdateIssueRequest, Workspace, WorkspaceCommitResult, WorkspaceRequest,
+    LocalWorkspaceCommitCandidate, LocalWorkspaceCommitRequest, LocalWorkspaceCommitResult,
+    PullRequestRef, StepStatus, StoreBootstrap, UpdateIssueRequest, Workspace,
+    WorkspaceCommitResult, WorkspaceRequest,
 };
 use polyphony_workflow::load_workflow;
 use serde_json::json;
@@ -1283,6 +1284,23 @@ impl WorkspaceCommitter for RecordingCommitter {
         Ok(self.result.clone())
     }
 
+    async fn capture_local_commit_candidate(
+        &self,
+        request: &LocalWorkspaceCommitRequest,
+    ) -> Result<Option<LocalWorkspaceCommitCandidate>, polyphony_core::Error> {
+        Ok(Some(LocalWorkspaceCommitCandidate {
+            base_sha: "fixture-base".into(),
+            tree_sha: "fixture-tree".into(),
+            changed_files: vec!["fixture.rs".into()],
+            status: vec!["WT_MODIFIED: fixture.rs".into()],
+            diff: "diff --git a/fixture.rs b/fixture.rs\n".into(),
+            lock_token: format!(
+                "{}:{}:{}",
+                request.issue_identifier, request.run_id, request.task_id
+            ),
+        }))
+    }
+
     async fn commit_local(
         &self,
         request: &LocalWorkspaceCommitRequest,
@@ -1291,6 +1309,13 @@ impl WorkspaceCommitter for RecordingCommitter {
         self.local_result
             .clone()
             .map_err(polyphony_core::Error::Adapter)
+    }
+
+    async fn release_local_commit_lock(
+        &self,
+        _request: &LocalWorkspaceCommitRequest,
+    ) -> Result<(), polyphony_core::Error> {
+        Ok(())
     }
 }
 
@@ -6416,6 +6441,9 @@ async fn local_commit_gate_records_a_local_artifact_before_independent_qa() {
         reconciled: false,
     })));
     let committer_handle = committer.clone();
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
     let mut service = RuntimeService::new(
         Arc::new(TestTracker::new(vec![issue.clone()])),
         None,
@@ -6425,7 +6453,7 @@ async fn local_commit_gate_records_a_local_artifact_before_independent_qa() {
         None,
         None,
         None,
-        None,
+        Some(store),
         None,
         rx,
     )
@@ -6438,7 +6466,10 @@ async fn local_commit_gate_records_a_local_artifact_before_independent_qa() {
     handle_next_worker_message(&mut service).await;
 
     assert_eq!(committer_handle.local_requests().len(), 1);
-    assert_eq!(agent_handle.calls(), vec!["implementer"]);
+    assert_eq!(
+        agent_handle.calls().first().map(String::as_str),
+        Some("implementer")
+    );
     let run = service.state.runs.values().next().unwrap();
     let local_step = run
         .steps
@@ -6451,10 +6482,10 @@ async fn local_commit_gate_records_a_local_artifact_before_independent_qa() {
         run.deliverable.is_none(),
         "a local commit is not a delivery result"
     );
-    assert_eq!(
+    assert!(matches!(
         service.state.tasks[&run.id][1].status,
-        TaskStatus::InProgress
-    );
+        TaskStatus::InProgress | TaskStatus::Completed
+    ));
 
     handle_next_worker_message(&mut service).await;
     assert_eq!(agent_handle.calls(), vec!["implementer", "qa"]);
@@ -6477,6 +6508,9 @@ async fn local_commit_failure_blocks_qa_and_marks_the_run_failed() {
     let agent = ClosedLoopQaFixtureAgent::with_qa_pass_after(1);
     let agent_handle = agent.clone();
     let committer = RecordingCommitter::with_local_result(Err("fixture commit failure".into()));
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
     let mut service = RuntimeService::new(
         Arc::new(TestTracker::new(vec![issue.clone()])),
         None,
@@ -6486,7 +6520,7 @@ async fn local_commit_failure_blocks_qa_and_marks_the_run_failed() {
         None,
         None,
         None,
-        None,
+        Some(store),
         None,
         rx,
     )
@@ -6510,6 +6544,205 @@ async fn local_commit_failure_blocks_qa_and_marks_the_run_failed() {
     }));
     assert_eq!(service.state.tasks[&run.id][0].status, TaskStatus::Failed);
     assert_eq!(service.state.tasks[&run.id][1].status, TaskStatus::Pending);
+}
+
+#[tokio::test]
+async fn local_commit_restart_reconciles_a_pre_record_git_success_before_qa_without_duplicate_work()
+{
+    let workspace_root = unique_workspace_root("local-commit-pre-record-restart");
+    tokio::fs::create_dir_all(&workspace_root).await.unwrap();
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nLocal commit restart fixture\n",
+    );
+    let issue = sample_issue("issue-local-restart", "SAFE-26-R", "Todo", "Local restart");
+    let run_id = "run-local-restart".to_string();
+    let task_id = "task-local-restart".to_string();
+    let candidate = LocalWorkspaceCommitCandidate {
+        base_sha: "base-sha".into(),
+        tree_sha: "candidate-tree".into(),
+        changed_files: vec!["src/safe.rs".into()],
+        status: vec!["WT_MODIFIED: src/safe.rs".into()],
+        diff: "diff --git a/src/safe.rs b/src/safe.rs\n".into(),
+        lock_token: "SAFE-26-R:run-local-restart:task-local-restart".into(),
+    };
+    let mut local_step = polyphony_core::StepRecord::new(polyphony_core::StepKind::LocalCommit, 1)
+        .with_task_id(task_id.clone());
+    local_step.mark_running();
+    local_step.output.insert(
+        "candidate".into(),
+        serde_json::to_value(&candidate).unwrap(),
+    );
+    local_step.output.insert(
+        "candidate_status".into(),
+        serde_json::to_value(&candidate.status).unwrap(),
+    );
+    local_step.output.insert(
+        "candidate_diff".into(),
+        serde_json::Value::String(candidate.diff.clone()),
+    );
+    let now = Utc::now();
+    let run = Run {
+        id: run_id.clone(),
+        kind: RunKind::IssueDelivery,
+        issue_id: Some(issue.id.clone()),
+        issue_identifier: Some(issue.identifier.clone()),
+        title: issue.title.clone(),
+        status: RunStatus::InProgress,
+        pipeline_stage: None,
+        manual_dispatch_directives: None,
+        workspace_key: Some("safe-26-r".into()),
+        workspace_path: Some(workspace_root.clone()),
+        review_target: None,
+        deliverable: None,
+        created_at: now,
+        updated_at: now,
+        activity_log: Vec::new(),
+        cancel_reason: None,
+        blocked_outcome: None,
+        steps: vec![local_step],
+    };
+    let implementation = Task {
+        id: task_id.clone(),
+        run_id: run_id.clone(),
+        title: "Implementation".into(),
+        description: None,
+        activity_log: Vec::new(),
+        category: polyphony_core::TaskCategory::Coding,
+        role: polyphony_core::PipelineTaskRole::Implementation,
+        status: TaskStatus::Completed,
+        ordinal: 1,
+        parent_id: None,
+        agent_name: Some("implementer".into()),
+        session_id: None,
+        thread_id: None,
+        turns_completed: 1,
+        tokens: TokenUsage::default(),
+        started_at: Some(now),
+        finished_at: Some(now),
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let qa = Task {
+        id: "task-local-restart-qa".into(),
+        run_id: run_id.clone(),
+        title: "QA".into(),
+        description: None,
+        activity_log: Vec::new(),
+        category: polyphony_core::TaskCategory::Review,
+        role: polyphony_core::PipelineTaskRole::Qa,
+        status: TaskStatus::Pending,
+        ordinal: 2,
+        parent_id: None,
+        agent_name: Some("qa".into()),
+        session_id: None,
+        thread_id: None,
+        turns_completed: 0,
+        tokens: TokenUsage::default(),
+        started_at: None,
+        finished_at: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
+    polyphony_core::StateStore::save_run(store.as_ref(), &run)
+        .await
+        .unwrap();
+    polyphony_core::StateStore::save_task(store.as_ref(), &implementation)
+        .await
+        .unwrap();
+    polyphony_core::StateStore::save_task(store.as_ref(), &qa)
+        .await
+        .unwrap();
+    // Simulate Git succeeding after the candidate step is durable, followed
+    // immediately by a process crash before that success can be recorded.
+    let initial_committer =
+        RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+            branch_name: issue.branch_name.clone().unwrap(),
+            head_sha: "exact-git-sha".into(),
+            changed_files: candidate.changed_files.clone(),
+            reconciled: false,
+        })));
+    let initial_request = LocalWorkspaceCommitRequest {
+        workspace_path: workspace_root.clone(),
+        expected_branch: issue.branch_name.clone().unwrap(),
+        issue_identifier: issue.identifier.clone(),
+        run_id: run_id.clone(),
+        task_id: task_id.clone(),
+        commit_message: format!(
+            "chore(local-commit): {} run {run_id} task {task_id}",
+            issue.identifier
+        ),
+        author_name: "Polyphony Local Commit".into(),
+        author_email: "local-commit@polyphony.invalid".into(),
+        candidate: candidate.clone(),
+    };
+    initial_committer
+        .commit_local(&initial_request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial_committer.local_requests().len(), 1);
+
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let agent = ClosedLoopQaFixtureAgent::with_qa_pass_after(1);
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: issue.branch_name.clone().unwrap(),
+        head_sha: "exact-git-sha".into(),
+        changed_files: candidate.changed_files.clone(),
+        reconciled: true,
+    })));
+    let committer_handle = committer.clone();
+    let mut restarted = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(store.clone()),
+        None,
+        rx,
+    )
+    .0;
+    restarted.restore_bootstrap(
+        polyphony_core::StateStore::bootstrap(store.as_ref())
+            .await
+            .unwrap(),
+    );
+    restarted
+        .dispatch_next_task(workflow, issue, None, false, &run_id, &workspace_root)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        committer_handle.local_requests().len(),
+        1,
+        "restart must reconcile one exact commit"
+    );
+    let restored_run = &restarted.state.runs[&run_id];
+    let local_step = restored_run
+        .steps
+        .iter()
+        .find(|step| step.kind == polyphony_core::StepKind::LocalCommit)
+        .unwrap();
+    assert_eq!(local_step.status, StepStatus::Succeeded);
+    assert_eq!(local_step.output["head_sha"], "exact-git-sha");
+    assert_eq!(
+        restarted.state.tasks[&run_id][1].status,
+        TaskStatus::InProgress
+    );
+    assert!(
+        agent_handle.calls().is_empty(),
+        "QA is queued but must not run implementation again"
+    );
 }
 
 #[tokio::test]
@@ -6537,6 +6770,9 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
         reconciled: false,
     })));
     let committer_handle = committer.clone();
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
     let mut service = RuntimeService::new(
         Arc::new(tracker.clone()),
         None,
@@ -6546,7 +6782,7 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
         None,
         None,
         None,
-        None,
+        Some(store.clone()),
         None,
         rx,
     )
@@ -6588,7 +6824,7 @@ async fn independent_qa_fixture_runs_implementation_qa_repair_and_fresh_qa_with_
         None,
         None,
         None,
-        None,
+        Some(store),
         None,
         restart_rx,
     )

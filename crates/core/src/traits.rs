@@ -210,11 +210,24 @@ pub trait WorkspaceCommitter: Send + Sync {
         request: &WorkspaceCommitRequest,
     ) -> Result<Option<WorkspaceCommitResult>, Error>;
 
+    /// Lock the provisioned workspace and capture an immutable, eligible
+    /// candidate tree before a local-only commit is attempted.
+    async fn capture_local_commit_candidate(
+        &self,
+        request: &LocalWorkspaceCommitRequest,
+    ) -> Result<Option<LocalWorkspaceCommitCandidate>, Error>;
+
     /// Commit a captured workspace diff without contacting a remote.
     async fn commit_local(
         &self,
         request: &LocalWorkspaceCommitRequest,
     ) -> Result<Option<LocalWorkspaceCommitResult>, Error>;
+
+    /// Release the workspace lock after the local-commit outcome is durable.
+    async fn release_local_commit_lock(
+        &self,
+        request: &LocalWorkspaceCommitRequest,
+    ) -> Result<(), Error>;
 }
 
 #[async_trait]

@@ -195,13 +195,19 @@ implementation or repair task exits and before any later task starts. It is
 separate from `automation.enabled`: it never pushes, opens a pull request,
 merges, deploys, releases, or marks a run delivered. Polyphony records the
 local-only commit SHA and changed-file list as a distinct run step before it
-can dispatch independent QA. An empty eligible diff, a wrong branch, a commit
-failure, or a failure to record the outcome stops the run.
+can dispatch independent QA. Before it commits, Polyphony locks the provisioned
+workspace and durably stores an immutable eligible status, patch, and Git tree.
+It commits that captured tree, not the live Git index. This prevents staged
+runtime files from entering the commit after capture. A durable state store is
+required. An empty eligible diff, a wrong branch, a commit failure, or a
+failure to record the candidate or outcome stops the run.
 
 The committer uses the fixed `Polyphony Local Commit
 <local-commit@polyphony.invalid>` identity and an issue/run/task-identifying
 message. It excludes `.polyphony/` runtime artifacts and reconciles an exact
-matching local commit after a restart rather than creating a duplicate.
+matching local commit after a restart rather than creating a duplicate. Cleanup
+retains a workspace with a system-owned local commit until QA or recovery can
+review it.
 
 With this gate enabled, implementation and repair profiles must set both
 `thread_sandbox` and `turn_sandbox_policy` to `workspace-write`; QA profiles

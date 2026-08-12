@@ -685,6 +685,24 @@ pub struct LocalWorkspaceCommitRequest {
     pub commit_message: String,
     pub author_name: String,
     pub author_email: String,
+    /// The immutable candidate captured while Polyphony held the workspace
+    /// lock. A committer must create the commit from this tree, never from a
+    /// later live index or worktree status.
+    pub candidate: LocalWorkspaceCommitCandidate,
+}
+
+/// An auditable, immutable local-commit candidate captured before Git creates
+/// the system-owned commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalWorkspaceCommitCandidate {
+    pub base_sha: String,
+    pub tree_sha: String,
+    pub changed_files: Vec<String>,
+    pub status: Vec<String>,
+    pub diff: String,
+    /// An opaque owner token for the workspace-local lock. It is persisted so
+    /// restart recovery can complete the same commit safely.
+    pub lock_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
