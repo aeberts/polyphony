@@ -209,6 +209,12 @@ pub trait WorkspaceCommitter: Send + Sync {
         &self,
         request: &WorkspaceCommitRequest,
     ) -> Result<Option<WorkspaceCommitResult>, Error>;
+
+    /// Commit a captured workspace diff without contacting a remote.
+    async fn commit_local(
+        &self,
+        request: &LocalWorkspaceCommitRequest,
+    ) -> Result<Option<LocalWorkspaceCommitResult>, Error>;
 }
 
 #[async_trait]

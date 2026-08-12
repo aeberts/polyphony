@@ -236,6 +236,7 @@ impl ServiceConfig {
             agents: raw.agents,
             pipeline: raw.pipeline,
             automation: raw.automation,
+            local_commit: raw.local_commit,
             review_events: raw.review_events,
             feedback: raw.feedback,
             server: raw.server,

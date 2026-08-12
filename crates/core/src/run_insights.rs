@@ -434,6 +434,7 @@ fn step_kind_label(kind: StepKind) -> &'static str {
         StepKind::PlannerRun => "planner run",
         StepKind::AgentRun => "agent execution",
         StepKind::Commit => "commit",
+        StepKind::LocalCommit => "local-only commit",
         StepKind::Push => "push",
         StepKind::CreatePullRequest => "pull request creation",
         StepKind::ReviewPass => "review pass",

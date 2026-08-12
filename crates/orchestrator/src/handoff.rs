@@ -3,6 +3,207 @@ use polyphony_core::StepKind;
 use crate::{prelude::*, *};
 
 impl RuntimeService {
+    pub(crate) async fn commit_local_stage(
+        &mut self,
+        workflow: &LoadedWorkflow,
+        issue: &Issue,
+        run_id: &str,
+        task: &polyphony_core::Task,
+        workspace_path: &Path,
+    ) -> Result<(), Error> {
+        if !workflow.config.local_commit.enabled
+            || !matches!(
+                task.role,
+                polyphony_core::PipelineTaskRole::Implementation
+                    | polyphony_core::PipelineTaskRole::Repair
+            )
+        {
+            return Ok(());
+        }
+        let already_recorded = self.state.runs.get(run_id).is_some_and(|run| {
+            run.steps.iter().any(|step| {
+                step.kind == StepKind::LocalCommit
+                    && step.task_id.as_deref() == Some(&task.id)
+                    && step.status == polyphony_core::StepStatus::Succeeded
+            })
+        });
+        if already_recorded {
+            return Ok(());
+        }
+
+        let branch_name = issue
+            .branch_name
+            .clone()
+            .unwrap_or_else(|| format!("task/{}", sanitize_workspace_key(&issue.identifier)));
+        let commit_message = format!(
+            "chore(local-commit): {} run {} task {}",
+            issue.identifier, run_id, task.id
+        );
+        let committer = self.committer_for_issue(&issue.id).ok_or_else(|| {
+            CoreError::Adapter("local workspace committer is not configured".into())
+        })?;
+
+        // Persist the intent first.  If the process stops after Git creates
+        // the commit but before this outcome is stored, recovery repeats this
+        // exact request and the Git committer reconciles the matching HEAD.
+        if let Some(run) = self.state.runs.get_mut(run_id) {
+            let recovering = run.steps.iter().any(|step| {
+                step.kind == StepKind::LocalCommit
+                    && step.task_id.as_deref() == Some(&task.id)
+                    && step.status == polyphony_core::StepStatus::Running
+            });
+            if !recovering {
+                let ordinal = run.steps.iter().map(|step| step.ordinal).max().unwrap_or(0) + 1;
+                let mut step = polyphony_core::StepRecord::new(StepKind::LocalCommit, ordinal)
+                    .with_task_id(task.id.clone());
+                step.mark_running();
+                run.steps.push(step);
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    format!("local commit pending for {}", task.id),
+                );
+                run.updated_at = Utc::now();
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+            }
+        }
+
+        let result = committer
+            .commit_local(&LocalWorkspaceCommitRequest {
+                workspace_path: workspace_path.to_path_buf(),
+                expected_branch: branch_name,
+                issue_identifier: issue.identifier.clone(),
+                run_id: run_id.to_string(),
+                task_id: task.id.clone(),
+                commit_message,
+                author_name: "Polyphony Local Commit".into(),
+                author_email: "local-commit@polyphony.invalid".into(),
+            })
+            .await;
+        let result = match result {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                let error = "local commit blocked: coding workspace has no eligible changes";
+                self.fail_local_commit(run_id, &task.id, error).await?;
+                return Err(CoreError::Adapter(error.into()).into());
+            },
+            Err(error) => {
+                self.fail_local_commit(run_id, &task.id, &error.to_string())
+                    .await?;
+                return Err(Error::Core(error));
+            },
+        };
+        if let Some(run) = self.state.runs.get_mut(run_id) {
+            if let Some(step) = run.steps.iter_mut().find(|step| {
+                step.kind == StepKind::LocalCommit
+                    && step.task_id.as_deref() == Some(&task.id)
+                    && step.status == polyphony_core::StepStatus::Running
+            }) {
+                step.mark_succeeded_with_output(std::collections::HashMap::from([
+                    (
+                        "outcome".into(),
+                        serde_json::Value::String("local_only".into()),
+                    ),
+                    (
+                        "branch".into(),
+                        serde_json::Value::String(result.branch_name.clone()),
+                    ),
+                    (
+                        "head_sha".into(),
+                        serde_json::Value::String(result.head_sha.clone()),
+                    ),
+                    (
+                        "changed_files".into(),
+                        serde_json::Value::Array(
+                            result
+                                .changed_files
+                                .iter()
+                                .cloned()
+                                .map(serde_json::Value::String)
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "reconciled".into(),
+                        serde_json::Value::Bool(result.reconciled),
+                    ),
+                ]));
+            }
+            run.push_log(
+                polyphony_core::RunLogScope::Pipeline,
+                format!(
+                    "local-only commit recorded for {}: {} ({} files{})",
+                    task.id,
+                    result.head_sha,
+                    result.changed_files.len(),
+                    if result.reconciled {
+                        "; reconciled after restart"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+            run.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                store.save_run(run).await?;
+            }
+        }
+        if let Some(tasks) = self.state.tasks.get_mut(run_id)
+            && let Some(saved_task) = tasks.iter_mut().find(|saved| saved.id == task.id)
+        {
+            saved_task.activity_log.push(format!(
+                "local-only commit recorded: {} [{}]",
+                result.head_sha,
+                result.changed_files.join(", ")
+            ));
+            saved_task.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                store.save_task(saved_task).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn fail_local_commit(
+        &mut self,
+        run_id: &str,
+        task_id: &str,
+        error: &str,
+    ) -> Result<(), Error> {
+        if let Some(tasks) = self.state.tasks.get_mut(run_id)
+            && let Some(task) = tasks.iter_mut().find(|task| task.id == task_id)
+        {
+            task.status = TaskStatus::Failed;
+            task.error = Some(error.to_string());
+            task.activity_log
+                .push(format!("local-only commit failed: {error}"));
+            task.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                store.save_task(task).await?;
+            }
+        }
+        if let Some(run) = self.state.runs.get_mut(run_id) {
+            if let Some(step) = run.steps.iter_mut().find(|step| {
+                step.kind == StepKind::LocalCommit
+                    && step.task_id.as_deref() == Some(task_id)
+                    && step.status == polyphony_core::StepStatus::Running
+            }) {
+                step.mark_failed(error);
+            }
+            run.status = RunStatus::Failed;
+            run.push_log(
+                polyphony_core::RunLogScope::Pipeline,
+                format!("local commit failed for {task_id}: {error}"),
+            );
+            run.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                store.save_run(run).await?;
+            }
+        }
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Step tracking helpers
     // -----------------------------------------------------------------------

@@ -476,10 +476,8 @@ pub(crate) fn build_runtime_components(
     };
     let (pull_request_event_source, pull_request_manager, pull_request_commenter) =
         build_pull_request_components(workflow, &workflow_root)?;
-    let committer: Option<Arc<dyn WorkspaceCommitter>> = workflow
-        .config
-        .automation
-        .enabled
+    let committer: Option<Arc<dyn WorkspaceCommitter>> = (workflow.config.automation.enabled
+        || workflow.config.local_commit.enabled)
         .then_some(Arc::new(polyphony_git::GitWorkspaceCommitter::default())
             as Arc<dyn WorkspaceCommitter>);
     let tool_executor = polyphony_tools::RegistryToolExecutor::from_runtime_components(

@@ -354,6 +354,14 @@ pub struct AutomationConfig {
     pub git: AutomationGitConfig,
 }
 
+/// Explicit opt-in for the system-owned, local-only commit gate that runs
+/// between a mutating pipeline task and independent QA.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct LocalCommitConfig {
+    pub enabled: bool,
+}
+
 impl Default for AutomationConfig {
     fn default() -> Self {
         Self {
@@ -476,6 +484,7 @@ pub struct ServiceConfig {
     pub agents: AgentsConfig,
     pub pipeline: PipelineConfig,
     pub automation: AutomationConfig,
+    pub local_commit: LocalCommitConfig,
     #[serde(alias = "review_triggers")]
     pub review_events: ReviewEventsConfig,
     pub feedback: FeedbackConfig,
@@ -503,6 +512,8 @@ struct RawServiceConfig {
     pub provider: Option<CodexConfig>,
     pub pipeline: PipelineConfig,
     pub automation: AutomationConfig,
+    #[serde(default)]
+    pub local_commit: LocalCommitConfig,
     #[serde(alias = "review_triggers")]
     pub review_events: ReviewEventsConfig,
     pub feedback: FeedbackConfig,

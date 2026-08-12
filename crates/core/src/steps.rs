@@ -16,6 +16,8 @@ pub enum StepKind {
     AgentRun,
     /// Commit workspace changes to the local branch.
     Commit,
+    /// Commit a sandboxed coding-stage diff locally before QA.
+    LocalCommit,
     /// Push the branch to the remote.
     Push,
     /// Create or update the pull request / merge request.
@@ -36,6 +38,7 @@ impl fmt::Display for StepKind {
             Self::PlannerRun => "planner_run",
             Self::AgentRun => "agent_run",
             Self::Commit => "commit",
+            Self::LocalCommit => "local_commit",
             Self::Push => "push",
             Self::CreatePullRequest => "create_pull_request",
             Self::ReviewPass => "review_pass",

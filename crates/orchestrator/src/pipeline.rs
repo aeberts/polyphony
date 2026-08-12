@@ -1272,6 +1272,34 @@ impl RuntimeService {
             );
             return Ok(());
         }
+        // A restored run can contain a Git commit made immediately before a
+        // crash but no durable outcome. Reconcile every completed mutating
+        // stage before any later agent, especially QA, is allowed to start.
+        if workflow.config.local_commit.enabled {
+            let completed_mutating_tasks = self
+                .state
+                .tasks
+                .get(run_id)
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|task| {
+                            task.status == TaskStatus::Completed
+                                && matches!(
+                                    task.role,
+                                    polyphony_core::PipelineTaskRole::Implementation
+                                        | polyphony_core::PipelineTaskRole::Repair
+                                )
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for task in completed_mutating_tasks {
+                self.commit_local_stage(&workflow, &issue, run_id, &task, workspace_path)
+                    .await?;
+            }
+        }
         let next_task = self.state.tasks.get(run_id).and_then(|tasks| {
             tasks
                 .iter()
@@ -1315,6 +1343,20 @@ impl RuntimeService {
                     "unknown agent `{agent_name}` for pipeline task"
                 )))
             })?;
+        if workflow.config.local_commit.enabled {
+            let required_sandbox = match task.role {
+                polyphony_core::PipelineTaskRole::Implementation
+                | polyphony_core::PipelineTaskRole::Repair => "workspace-write",
+                polyphony_core::PipelineTaskRole::Qa => "read-only",
+            };
+            if profile.thread_sandbox.as_deref() != Some(required_sandbox)
+                || profile.turn_sandbox_policy.as_deref() != Some(required_sandbox)
+            {
+                return Err(Error::Core(CoreError::Adapter(format!(
+                    "local_commit requires `{required_sandbox}` thread and turn sandboxes for agent `{agent_name}`"
+                ))));
+            }
+        }
         let selected_agent =
             agent_definition_with_pty(&agent_name, profile, workflow.config.agent.pty_backend);
         info!(
@@ -2217,6 +2259,19 @@ impl RuntimeService {
         }
 
         if matches!(outcome.status, AttemptStatus::Succeeded) {
+            if workflow.config.local_commit.enabled
+                && task_snapshot.as_ref().is_some_and(|task| {
+                    matches!(
+                        task.role,
+                        polyphony_core::PipelineTaskRole::Implementation
+                            | polyphony_core::PipelineTaskRole::Repair
+                    )
+                })
+                && let Some(task) = task_snapshot.as_ref()
+            {
+                self.commit_local_stage(workflow, issue, run_id, task, workspace_path)
+                    .await?;
+            }
             self.dispatch_next_task(
                 self.workflow(),
                 issue.clone(),

@@ -670,6 +670,33 @@ pub struct WorkspaceCommitResult {
     pub lines_removed: Option<usize>,
 }
 
+/// A system-owned commit that deliberately has no network handoff semantics.
+///
+/// This request is used after a sandboxed implementation or repair agent has
+/// exited.  It is intentionally separate from `WorkspaceCommitRequest`, whose
+/// existing contract includes a push.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalWorkspaceCommitRequest {
+    pub workspace_path: PathBuf,
+    pub expected_branch: String,
+    pub issue_identifier: String,
+    pub run_id: String,
+    pub task_id: TaskId,
+    pub commit_message: String,
+    pub author_name: String,
+    pub author_email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalWorkspaceCommitResult {
+    pub branch_name: String,
+    pub head_sha: String,
+    pub changed_files: Vec<String>,
+    /// True when recovery found the exact system-owned commit after an
+    /// interruption before Polyphony could persist its outcome.
+    pub reconciled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CachedSnapshot {
     pub saved_at: Option<DateTime<Utc>>,

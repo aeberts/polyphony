@@ -8,10 +8,10 @@ use std::{
 
 use async_trait::async_trait;
 use polyphony_core::{
-    CheckoutKind, Error as CoreError, UserInteractionKind, UserInteractionReporter,
-    UserInteractionRequest, Workspace, WorkspaceCommitRequest, WorkspaceCommitResult,
-    WorkspaceCommitter, WorkspaceProgressReporter, WorkspaceProgressUpdate, WorkspaceProvisioner,
-    WorkspaceRequest,
+    CheckoutKind, Error as CoreError, LocalWorkspaceCommitRequest, LocalWorkspaceCommitResult,
+    UserInteractionKind, UserInteractionReporter, UserInteractionRequest, Workspace,
+    WorkspaceCommitRequest, WorkspaceCommitResult, WorkspaceCommitter, WorkspaceProgressReporter,
+    WorkspaceProgressUpdate, WorkspaceProvisioner, WorkspaceRequest,
 };
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -141,6 +141,14 @@ impl WorkspaceCommitter for GitWorkspaceCommitter {
         let request = request.clone();
         let interaction_reporter = self.interaction_reporter();
         tokio_wrap(move || commit_and_push_sync(&request, interaction_reporter)).await
+    }
+
+    async fn commit_local(
+        &self,
+        request: &LocalWorkspaceCommitRequest,
+    ) -> Result<Option<LocalWorkspaceCommitResult>, CoreError> {
+        let request = request.clone();
+        tokio_wrap(move || commit_local_sync(&request)).await
     }
 }
 
@@ -282,6 +290,163 @@ pub fn has_unpushed_commits(workspace_path: &Path) -> bool {
         return false;
     };
     local_oid != remote_oid
+}
+
+fn commit_local_sync(
+    request: &LocalWorkspaceCommitRequest,
+) -> Result<Option<LocalWorkspaceCommitResult>, CoreError> {
+    let workspace = request.workspace_path.canonicalize().map_err(|error| {
+        CoreError::Adapter(format!("resolve local-commit workspace failed: {error}"))
+    })?;
+    let repo = git2::Repository::open(&workspace)
+        .map_err(|error| CoreError::Adapter(format!("open workspace repo failed: {error}")))?;
+    let repo_workdir = repo.workdir().ok_or_else(|| {
+        CoreError::Adapter("local commit requires a non-bare workspace repository".into())
+    })?;
+    let repo_workdir = repo_workdir.canonicalize().map_err(|error| {
+        CoreError::Adapter(format!("resolve repository workdir failed: {error}"))
+    })?;
+    if repo_workdir != workspace {
+        return Err(CoreError::Adapter(
+            "local commit rejected: repository workdir differs from provisioned workspace".into(),
+        ));
+    }
+    let head = repo
+        .head()
+        .map_err(|error| CoreError::Adapter(format!("read workspace HEAD failed: {error}")))?;
+    let branch = head.shorthand().ok_or_else(|| {
+        CoreError::Adapter("local commit rejected: workspace HEAD is detached".into())
+    })?;
+    if branch != request.expected_branch {
+        return Err(CoreError::Adapter(format!(
+            "local commit rejected: expected branch `{}`, found `{branch}`",
+            request.expected_branch
+        )));
+    }
+
+    let head_commit = head.peel_to_commit().map_err(|error| {
+        CoreError::Adapter(format!("resolve workspace HEAD commit failed: {error}"))
+    })?;
+    if head_commit.message() == Some(request.commit_message.as_str()) {
+        return Ok(Some(LocalWorkspaceCommitResult {
+            branch_name: branch.to_string(),
+            head_sha: head_commit.id().to_string(),
+            changed_files: changed_files_for_commit(&repo, &head_commit)?,
+            reconciled: true,
+        }));
+    }
+
+    let statuses = repo
+        .statuses(Some(
+            git2::StatusOptions::new()
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .renames_head_to_index(true)
+                .renames_index_to_workdir(true)
+                .include_ignored(false),
+        ))
+        .map_err(|error| {
+            CoreError::Adapter(format!("capture local-commit status failed: {error}"))
+        })?;
+    let changed_files = statuses
+        .iter()
+        .filter_map(|entry| entry.path().map(str::to_owned))
+        .filter(|path| !is_polyphony_runtime_path(path))
+        .collect::<Vec<_>>();
+    if changed_files.is_empty() {
+        return Ok(None);
+    }
+    if changed_files.iter().any(|path| {
+        Path::new(path).is_absolute()
+            || Path::new(path)
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+    }) {
+        return Err(CoreError::Adapter(
+            "local commit rejected a changed-file path outside the provisioned workspace".into(),
+        ));
+    }
+
+    let mut index = repo
+        .index()
+        .map_err(|error| CoreError::Adapter(format!("open local-commit index failed: {error}")))?;
+    for path in &changed_files {
+        index.add_path(Path::new(path)).map_err(|error| {
+            CoreError::Adapter(format!("stage local-commit path `{path}` failed: {error}"))
+        })?;
+    }
+    let tree_id = index
+        .write_tree()
+        .map_err(|error| CoreError::Adapter(format!("write local-commit tree failed: {error}")))?;
+    index.write().map_err(|error| {
+        CoreError::Adapter(format!("persist local-commit index failed: {error}"))
+    })?;
+    let tree = repo
+        .find_tree(tree_id)
+        .map_err(|error| CoreError::Adapter(format!("find local-commit tree failed: {error}")))?;
+    let signature =
+        git2::Signature::now(&request.author_name, &request.author_email).map_err(|error| {
+            CoreError::Adapter(format!("create system git identity failed: {error}"))
+        })?;
+    let commit_id = repo
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            &request.commit_message,
+            &tree,
+            &[&head_commit],
+        )
+        .map_err(|error| {
+            CoreError::Adapter(format!("create local-only git commit failed: {error}"))
+        })?;
+    info!(
+        workspace_path = %workspace.display(),
+        branch_name = %branch,
+        head_sha = %commit_id,
+        changed_files = changed_files.len(),
+        issue_identifier = %request.issue_identifier,
+        run_id = %request.run_id,
+        task_id = %request.task_id,
+        "created local-only workspace commit"
+    );
+    Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: branch.to_string(),
+        head_sha: commit_id.to_string(),
+        changed_files,
+        reconciled: false,
+    }))
+}
+
+fn is_polyphony_runtime_path(path: &str) -> bool {
+    path == ".polyphony" || path.starts_with(".polyphony/")
+}
+
+fn changed_files_for_commit(
+    repo: &git2::Repository,
+    commit: &git2::Commit<'_>,
+) -> Result<Vec<String>, CoreError> {
+    let tree = commit
+        .tree()
+        .map_err(|error| CoreError::Adapter(format!("read local-commit tree failed: {error}")))?;
+    let parent_tree = commit.parent(0).ok().and_then(|parent| parent.tree().ok());
+    let diff = repo
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(|error| {
+            CoreError::Adapter(format!("read local-commit changed files failed: {error}"))
+        })?;
+    Ok(diff
+        .deltas()
+        .filter_map(|delta| {
+            delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .and_then(|path| path.to_str())
+                .map(str::to_owned)
+        })
+        .filter(|path| !is_polyphony_runtime_path(path))
+        .collect())
 }
 
 fn commit_and_push_sync(
@@ -1576,8 +1741,8 @@ mod tests {
     };
 
     use polyphony_core::{
-        CheckoutKind, UserInteractionKind, UserInteractionReporter, WorkspaceCommitRequest,
-        WorkspaceCommitter, WorkspaceProvisioner, WorkspaceRequest,
+        CheckoutKind, LocalWorkspaceCommitRequest, UserInteractionKind, UserInteractionReporter,
+        WorkspaceCommitRequest, WorkspaceCommitter, WorkspaceProvisioner, WorkspaceRequest,
     };
     use tempfile::tempdir;
 
@@ -1654,6 +1819,7 @@ mod tests {
         index
             .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
             .unwrap();
+        index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
         let sig = git2::Signature::now("polyphony", "polyphony@example.com").unwrap();
@@ -1666,6 +1832,19 @@ mod tests {
         let parent_refs = parents.iter().collect::<Vec<_>>();
         repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parent_refs)
             .unwrap();
+    }
+
+    fn local_commit_request(path: &Path, branch: &str) -> LocalWorkspaceCommitRequest {
+        LocalWorkspaceCommitRequest {
+            workspace_path: path.to_path_buf(),
+            expected_branch: branch.into(),
+            issue_identifier: "SAFE-26".into(),
+            run_id: "run-safe-26".into(),
+            task_id: "task-safe-26".into(),
+            commit_message: "chore(local-commit): SAFE-26 run run-safe-26 task task-safe-26".into(),
+            author_name: "Polyphony Local Commit".into(),
+            author_email: "local-commit@polyphony.invalid".into(),
+        }
     }
 
     fn commit_on_branch(repo: &git2::Repository, branch_name: &str, file_name: &str, body: &str) {
@@ -1901,6 +2080,92 @@ mod tests {
             std::fs::read_to_string(workspace.path.join("review.txt")).unwrap(),
             "second\n"
         );
+    }
+
+    #[tokio::test]
+    async fn local_committer_creates_a_system_owned_commit_without_pushing() {
+        let temp = tempdir().unwrap();
+        let remote_path = temp.path().join("remote.git");
+        git2::Repository::init_bare(&remote_path).unwrap();
+        let repo_path = temp.path().join("repo");
+        let repo = init_repo(&repo_path);
+        repo.remote("origin", &remote_path.display().to_string())
+            .unwrap();
+        std::fs::write(repo_path.join("README.md"), "locally committed\n").unwrap();
+
+        let result = GitWorkspaceCommitter::default()
+            .commit_local(&local_commit_request(&repo_path, "main"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(!result.reconciled);
+        assert_eq!(result.branch_name, "main");
+        assert_eq!(result.changed_files, vec!["README.md"]);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.id().to_string(), result.head_sha);
+        assert_eq!(head.author().name(), Some("Polyphony Local Commit"));
+        assert!(
+            git2::Repository::open_bare(&remote_path)
+                .unwrap()
+                .find_reference("refs/heads/main")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_committer_rejects_wrong_branch_and_runtime_only_changes() {
+        let temp = tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        let _repo = init_repo(&repo_path);
+        std::fs::write(repo_path.join("README.md"), "changed\n").unwrap();
+        let error = GitWorkspaceCommitter::default()
+            .commit_local(&local_commit_request(&repo_path, "task/safe-26"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expected branch"));
+
+        let runtime_repo_path = temp.path().join("runtime-repo");
+        let runtime_repo = init_repo(&runtime_repo_path);
+        std::fs::create_dir_all(runtime_repo_path.join(".polyphony/runtime")).unwrap();
+        std::fs::write(
+            runtime_repo_path.join(".polyphony/runtime/state.json"),
+            "{}\n",
+        )
+        .unwrap();
+        let result = GitWorkspaceCommitter::default()
+            .commit_local(&local_commit_request(&runtime_repo_path, "main"))
+            .await
+            .unwrap();
+        assert!(result.is_none(), "runtime-only result: {result:?}");
+        assert_eq!(
+            runtime_repo
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .message(),
+            Some("initial")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_committer_reconciles_an_unrecorded_matching_commit() {
+        let temp = tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        let repo = init_repo(&repo_path);
+        std::fs::write(repo_path.join("README.md"), "changed\n").unwrap();
+        let request = local_commit_request(&repo_path, "main");
+        let committer = GitWorkspaceCommitter::default();
+        let initial = committer.commit_local(&request).await.unwrap().unwrap();
+        let recovered = committer.commit_local(&request).await.unwrap().unwrap();
+
+        assert!(!initial.reconciled);
+        assert!(recovered.reconciled);
+        assert_eq!(recovered.head_sha, initial.head_sha);
+        let mut walk = repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.count(), 2);
     }
 
     #[tokio::test]

@@ -38,6 +38,7 @@ The current workspace configuration covers:
 - `codex`: optional single-agent shorthand for one Codex app-server profile
 - `agents`: named agent profiles and routing rules
 - `automation`: optional post-run git and PR handoff settings
+- `local_commit`: optional sandbox-safe, local-only commit gate before QA
 - `feedback`: outbound notification sink configuration
 - `pipeline`: multi-stage pipeline orchestration settings
 - `server`: optional server settings
@@ -186,6 +187,26 @@ relevant.
 Use
 [`templates/examples/WORKFLOW.automation-feedback.md`](../../templates/examples/WORKFLOW.automation-feedback.md)
 as a full-file example that wires automation and feedback together.
+
+### Sandbox-safe local commits
+
+`local_commit.enabled = true` enables a system-owned local Git commit after each
+implementation or repair task exits and before any later task starts. It is
+separate from `automation.enabled`: it never pushes, opens a pull request,
+merges, deploys, releases, or marks a run delivered. Polyphony records the
+local-only commit SHA and changed-file list as a distinct run step before it
+can dispatch independent QA. An empty eligible diff, a wrong branch, a commit
+failure, or a failure to record the outcome stops the run.
+
+The committer uses the fixed `Polyphony Local Commit
+<local-commit@polyphony.invalid>` identity and an issue/run/task-identifying
+message. It excludes `.polyphony/` runtime artifacts and reconciles an exact
+matching local commit after a restart rather than creating a duplicate.
+
+With this gate enabled, implementation and repair profiles must set both
+`thread_sandbox` and `turn_sandbox_policy` to `workspace-write`; QA profiles
+must set both to `read-only`. The workflow is rejected for any other value,
+including `danger-full-access`.
 
 ## Pipeline Orchestration
 

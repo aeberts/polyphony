@@ -227,6 +227,12 @@ agents:
 #       name: Polyphony Bot
 #       email: bot@polyphony.dev
 
+# ─── Sandbox-safe local commits ─────────────────────────────────────
+# This is independent of automation. It creates a system-owned local commit
+# after implementation and repair, before QA. It never pushes or opens a PR.
+# local_commit:
+#   enabled: false
+
 # ─── Review Events ──────────────────────────────────────────────────
 # Automatic PR review when new pull requests are opened or updated.
 # review_events:
