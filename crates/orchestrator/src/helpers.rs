@@ -1,3 +1,5 @@
+use std::{collections::HashSet, time::Duration};
+
 use serde::Serialize;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
@@ -11,6 +13,40 @@ pub(crate) const MAX_RUN_HISTORY: usize = 256;
 pub(crate) const MAX_SAVED_CONTEXT_TRANSCRIPT_ENTRIES: usize = 24;
 pub(crate) const MAX_PERSISTED_RUN_CONTEXT_TRANSCRIPT_ENTRIES: usize = 12;
 pub(crate) const MAX_SAVED_CONTEXT_MESSAGE_CHARS: usize = 2_048;
+/// A provider shutdown must not hold a pipeline handoff indefinitely.
+#[cfg(not(test))]
+pub(crate) const LIVE_SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const LIVE_SESSION_STOP_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// A durable task-evidence comment is the worker's explicit completion signal.
+/// It does not reuse tracker workflow state: a task can hand off while its
+/// issue remains active for the next pipeline stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageCompletionSignal {
+    Implementation,
+    Repair,
+    Qa,
+}
+
+impl StageCompletionSignal {
+    pub(crate) fn for_role(role: polyphony_core::PipelineTaskRole) -> Self {
+        match role {
+            polyphony_core::PipelineTaskRole::Implementation => Self::Implementation,
+            polyphony_core::PipelineTaskRole::Repair => Self::Repair,
+            polyphony_core::PipelineTaskRole::Qa => Self::Qa,
+        }
+    }
+
+    fn matches(self, body: &str) -> bool {
+        let body = body.trim_start();
+        match self {
+            Self::Implementation => body.starts_with("IMPLEMENTATION NOTE:"),
+            Self::Repair => body.starts_with("REPAIR NOTE:"),
+            Self::Qa => body.starts_with("QA PASS:") || body.starts_with("QA FAIL:"),
+        }
+    }
+}
 
 /// Messages that are too noisy to show in the agent log lines.
 pub(crate) fn is_noise_agent_event(message: &str) -> bool {
@@ -79,6 +115,7 @@ pub(crate) async fn run_worker_attempt(
     active_states: Vec<String>,
     max_turns: u32,
     continuation_prompt_template: Option<String>,
+    completion_signal: Option<StageCompletionSignal>,
     selected_agent: polyphony_core::AgentDefinition,
     saved_context: Option<AgentContextSnapshot>,
     mut stop_rx: watch::Receiver<Option<String>>,
@@ -128,6 +165,11 @@ pub(crate) async fn run_worker_attempt(
         }
         result = agent.start_session(run_spec.clone(), event_tx.clone()) => result?,
     };
+    let initial_comment_ids = issue
+        .comments
+        .iter()
+        .map(|comment| comment.id.clone())
+        .collect::<HashSet<_>>();
     let result = if let Some(mut session) = session {
         info!(
             issue_identifier = %run_spec.issue.identifier,
@@ -187,6 +229,36 @@ pub(crate) async fn run_worker_attempt(
                 Ok(None) => {},
             }
 
+            if let Some(signal) = completion_signal {
+                let refreshed_issue = tracker
+                    .fetch_issues_by_ids(&[current_issue.id.clone()])
+                    .await?
+                    .into_iter()
+                    .find(|updated_issue| updated_issue.id == current_issue.id)
+                    .ok_or_else(|| {
+                        CoreError::Adapter(
+                            "worker completion signal refresh omitted the active issue".into(),
+                        )
+                    })?;
+                if let Some(comment) = refreshed_issue.comments.iter().rev().find(|comment| {
+                    !initial_comment_ids.contains(&comment.id) && signal.matches(&comment.body)
+                }) {
+                    info!(
+                        issue_identifier = %current_issue.identifier,
+                        turn_number,
+                        signal = ?signal,
+                        "received durable worker stage-completion signal"
+                    );
+                    break Ok(AgentRunResult {
+                        status: AttemptStatus::Succeeded,
+                        turns_completed: total_turns,
+                        error: None,
+                        final_issue_state: Some(comment.body.clone()),
+                    });
+                }
+                current_issue = refreshed_issue;
+            }
+
             let state_updates = tracker
                 .fetch_issue_states_by_ids(&[current_issue.id.clone()])
                 .await?;
@@ -236,7 +308,10 @@ pub(crate) async fn run_worker_attempt(
             )
             .map_err(|error| CoreError::Adapter(error.to_string()))?;
         };
-        let stop_result = session.stop().await;
+        let stop_result = tokio::time::timeout(LIVE_SESSION_STOP_TIMEOUT, session.stop())
+            .await
+            .map_err(|_| CoreError::Adapter("agent_session_stop_timeout".into()))
+            .and_then(|result| result);
         match (run_result, stop_result) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
@@ -682,7 +757,10 @@ pub(crate) fn agent_run_result_from_error(error: &Error) -> AgentRunResult {
 pub(crate) fn attempt_status_from_error(error: &Error) -> AttemptStatus {
     match error {
         Error::Core(CoreError::Adapter(message))
-            if matches!(message.as_str(), "response_timeout" | "turn_timeout") =>
+            if matches!(
+                message.as_str(),
+                "response_timeout" | "turn_timeout" | "agent_session_stop_timeout"
+            ) =>
         {
             AttemptStatus::TimedOut
         },

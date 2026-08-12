@@ -128,6 +128,23 @@ impl TestTracker {
         *self.fetch_by_ids_calls.lock().unwrap()
     }
 
+    fn record_external_comment(&self, issue_id: &str, body: impl Into<String>) {
+        let body = body.into();
+        let mut issues = self.issues.lock().unwrap();
+        let issue = issues
+            .get_mut(issue_id)
+            .expect("test issue must exist before recording worker evidence");
+        let ordinal = issue.comments.len() + 1;
+        issue.comments.push(IssueComment {
+            id: format!("worker-comment-{ordinal}"),
+            body,
+            author: None,
+            url: None,
+            created_at: Some(Utc::now()),
+            updated_at: None,
+        });
+    }
+
     fn recorded_issue_updates(&self) -> Vec<UpdateIssueRequest> {
         self.issue_updates.lock().unwrap().clone()
     }
@@ -623,6 +640,7 @@ struct RecordingSessionAgent {
     session_starts: Arc<Mutex<u32>>,
     stops: Arc<Mutex<u32>>,
     final_issue_state: Option<String>,
+    completion_evidence: Option<(TestTracker, String, String)>,
 }
 
 impl RecordingSessionAgent {
@@ -644,12 +662,24 @@ impl RecordingSessionAgent {
             ..Self::default()
         }
     }
+
+    fn with_stage_completion_signal(
+        tracker: TestTracker,
+        issue_id: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            completion_evidence: Some((tracker, issue_id.into(), evidence.into())),
+            ..Self::default()
+        }
+    }
 }
 
 struct RecordingSession {
     prompts: Arc<Mutex<Vec<String>>>,
     stops: Arc<Mutex<u32>>,
     final_issue_state: Option<String>,
+    completion_evidence: Option<(TestTracker, String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -677,6 +707,11 @@ struct FailingStopSessionAgent {
 struct FailingStopSession {
     started: Arc<Notify>,
 }
+
+#[derive(Clone, Default)]
+struct HangingStopSessionAgent;
+
+struct HangingStopSession;
 
 #[derive(Clone, Default)]
 struct FailingCancellationCleanupAgent {
@@ -830,9 +865,46 @@ impl AgentRuntime for FailingStopSessionAgent {
 }
 
 #[async_trait]
+impl AgentSession for HangingStopSession {
+    async fn run_turn(&mut self, _prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
+        Ok(AgentRunResult::succeeded(1))
+    }
+
+    async fn stop(&mut self) -> Result<(), polyphony_core::Error> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for HangingStopSessionAgent {
+    fn component_key(&self) -> String {
+        "provider:hanging-stop-session-test".into()
+    }
+
+    async fn start_session(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<Box<dyn AgentSession>>, polyphony_core::Error> {
+        Ok(Some(Box::new(HangingStopSession)))
+    }
+
+    async fn run(
+        &self,
+        _spec: AgentRunSpec,
+        _event_tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<AgentRunResult, polyphony_core::Error> {
+        unreachable!("run_worker_attempt starts a session first")
+    }
+}
+
+#[async_trait]
 impl AgentSession for RecordingSession {
     async fn run_turn(&mut self, prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
         self.prompts.lock().unwrap().push(prompt);
+        if let Some((tracker, issue_id, evidence)) = self.completion_evidence.take() {
+            tracker.record_external_comment(&issue_id, evidence);
+        }
         Ok(AgentRunResult {
             status: AttemptStatus::Succeeded,
             turns_completed: 1,
@@ -863,6 +935,7 @@ impl AgentRuntime for RecordingSessionAgent {
             prompts: self.prompts.clone(),
             stops: self.stops.clone(),
             final_issue_state: self.final_issue_state.clone(),
+            completion_evidence: self.completion_evidence.clone(),
         })))
     }
 
@@ -3885,6 +3958,7 @@ async fn run_worker_attempt_reuses_live_session_and_continues_while_issue_active
 Turn {{ turn_number }} of {{ max_turns }}. Continuation={{ is_continuation }}."
                 .into(),
         ),
+        None,
         polyphony_core::AgentDefinition {
             name: "codex".into(),
             kind: "codex".into(),
@@ -3912,6 +3986,120 @@ Turn {{ turn_number }} of {{ max_turns }}. Continuation={{ is_continuation }}."
         prompts[1],
         "Continue FAC-TURNS in state Todo.\nTurn 2 of 4. Continuation=true."
     );
+}
+
+#[tokio::test]
+async fn run_worker_attempt_hands_off_after_first_durable_stage_completion_signal() {
+    let workspace_root = unique_workspace_root("stage-completion-handoff");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue("issue-stage-complete", "FAC-HANDOFF", "Todo", "Handoff");
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let evidence = "IMPLEMENTATION NOTE:\nwhat changed: added handoff marker\ncommit: abc123\ntests run: focused test\nchecks: 1";
+    let agent = Arc::new(RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        evidence,
+    ));
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+
+    let result = run_worker_attempt(
+        &workspace_manager,
+        &HooksConfig {
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            after_outcome: None,
+            before_remove: None,
+            timeout_ms: 1_000,
+        },
+        agent.clone(),
+        Arc::new(tracker.clone()),
+        issue,
+        None,
+        workspace_root.join("FAC-HANDOFF"),
+        "Initial prompt".into(),
+        vec!["Todo".into()],
+        4,
+        None,
+        Some(StageCompletionSignal::Implementation),
+        polyphony_core::AgentDefinition::default(),
+        None,
+        watch::channel(None).1,
+        command_tx,
+    )
+    .await
+    .expect("durable completion evidence should hand off the live session");
+
+    assert_eq!(result.turns_completed, 1);
+    assert_eq!(result.final_issue_state.as_deref(), Some(evidence));
+    assert_eq!(agent.prompts(), vec!["Initial prompt"]);
+    assert_eq!(agent.stops(), 1);
+    assert_eq!(tracker.fetch_by_ids_calls(), 1);
+}
+
+#[tokio::test]
+async fn run_worker_attempt_times_out_when_live_session_shutdown_hangs() {
+    let workspace_root = unique_workspace_root("stage-completion-stop-timeout");
+    let workspace_manager = WorkspaceManager::new(
+        workspace_root.clone(),
+        Arc::new(RecordingProvisioner::default()),
+        polyphony_core::CheckoutKind::Directory,
+        true,
+        Vec::new(),
+        None,
+        None,
+        None,
+    );
+    let issue = sample_issue(
+        "issue-stop-timeout",
+        "FAC-STOP-TIMEOUT",
+        "Todo",
+        "Stop timeout",
+    );
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+
+    let error = run_worker_attempt(
+        &workspace_manager,
+        &HooksConfig {
+            after_create: None,
+            before_run: None,
+            after_run: None,
+            after_outcome: None,
+            before_remove: None,
+            timeout_ms: 1_000,
+        },
+        Arc::new(HangingStopSessionAgent),
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        issue,
+        None,
+        workspace_root.join("FAC-STOP-TIMEOUT"),
+        "Initial prompt".into(),
+        vec!["Todo".into()],
+        1,
+        None,
+        None,
+        polyphony_core::AgentDefinition::default(),
+        None,
+        watch::channel(None).1,
+        command_tx,
+    )
+    .await
+    .expect_err("a hanging session shutdown must fail with a typed timeout");
+
+    assert_eq!(
+        agent_run_result_from_error(&error).status,
+        AttemptStatus::TimedOut
+    );
+    assert!(error.to_string().contains("agent_session_stop_timeout"));
 }
 
 #[tokio::test]
@@ -3952,6 +4140,7 @@ async fn run_worker_attempt_does_not_continue_after_a_blocked_report() {
         "Initial prompt".into(),
         vec!["Todo".into()],
         4,
+        None,
         None,
         polyphony_core::AgentDefinition::default(),
         None,
@@ -4005,6 +4194,7 @@ async fn run_worker_attempt_stops_live_session_when_eligibility_is_revoked() {
             "Initial prompt".into(),
             vec!["Todo".into()],
             1,
+            None,
             None,
             polyphony_core::AgentDefinition::default(),
             None,
@@ -4074,6 +4264,7 @@ async fn run_worker_attempt_stops_before_provider_startup_when_already_revoked()
         vec!["Todo".into()],
         1,
         None,
+        None,
         polyphony_core::AgentDefinition::default(),
         None,
         stop_rx,
@@ -4128,6 +4319,7 @@ async fn run_worker_attempt_reports_live_session_termination_failure() {
             "Initial prompt".into(),
             vec!["Todo".into()],
             1,
+            None,
             None,
             polyphony_core::AgentDefinition::default(),
             None,
@@ -4198,6 +4390,7 @@ async fn run_worker_attempt_does_not_report_clean_cancellation_when_owned_cleanu
             vec!["Todo".into()],
             1,
             None,
+            None,
             polyphony_core::AgentDefinition::default(),
             None,
             stop_rx,
@@ -4266,6 +4459,7 @@ async fn run_worker_attempt_cancellation_during_startup_terminates_process() {
             "Initial prompt".into(),
             vec!["Todo".into()],
             1,
+            None,
             None,
             polyphony_core::AgentDefinition::default(),
             None,

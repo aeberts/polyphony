@@ -379,6 +379,7 @@ impl RuntimeService {
                     active_states,
                     max_turns,
                     workflow.config.agent.continuation_prompt.clone(),
+                    None,
                     selected_agent_for_task,
                     saved_context,
                     stop_rx,

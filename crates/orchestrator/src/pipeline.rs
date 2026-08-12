@@ -1510,19 +1510,24 @@ impl RuntimeService {
                  also use exactly one line each for `realistic: yes|no`, `material: yes|no`, \
                  `risks: none|false pass, lost evidence, duplicate work, human-control bypass`, \
                  `small fix: yes|no`, and `recommendation: remediate|defer|needs human decision`. \
-                 A deferred recommendation also requires `follow-up: <issue or tracker reference>`.\n",
+                 A deferred recommendation also requires `follow-up: <issue or tracker reference>`. Your durable \
+                 verdict is your explicit stage-completion signal: after it succeeds, stop working and let Polyphony \
+                 perform the handoff. Do not request a tracker-state change.\n",
             );
         } else if task.role == polyphony_core::PipelineTaskRole::Implementation {
             prompt.push_str(
                 "\nBefore completing, publish `IMPLEMENTATION NOTE:` with exactly one nonempty checklist line for each: \
                  `what changed:`, `commit:` (use `none — <reason>` if no commit exists), `tests run:`, \
-                 and `checks:`.\n",
+                 and `checks:`. That durable note is your explicit stage-completion signal: after it succeeds, \
+                 stop working and let Polyphony perform the handoff. Do not wait for or request a tracker-state change.\n",
             );
         } else if task.role == polyphony_core::PipelineTaskRole::Repair {
             prompt.push_str(
                 "\nBefore completing, publish `REPAIR NOTE:` with exactly one nonempty checklist line for each: \
                  `what fixed:`, `commit:` (use `none — <reason>` if no commit exists), `tests run:`, \
-                 `recheck:`, and `checks:`.\n",
+                 `recheck:`, and `checks:`. That durable note is your explicit stage-completion signal: after it \
+                 succeeds, stop working and let Polyphony perform the handoff. Do not wait for or request a \
+                 tracker-state change.\n",
             );
         }
         if let Some(desc) = &task.description {
@@ -1573,6 +1578,15 @@ impl RuntimeService {
         let hooks = workflow.config.hooks.clone();
         let active_states = workflow.config.tracker.active_states.clone();
         let max_turns = workflow.config.agent.max_turns;
+        let completion_signal = active_task_id.as_ref().and_then(|task_id| {
+            run_id.as_ref().and_then(|run_id| {
+                self.state
+                    .tasks
+                    .get(run_id)
+                    .and_then(|tasks| tasks.iter().find(|task| task.id == *task_id))
+                    .map(|task| StageCompletionSignal::for_role(task.role))
+            })
+        });
         let started_at = Utc::now();
         let (stop_tx, stop_rx) = watch::channel(None);
         let selected_agent_for_task = selected_agent.clone();
@@ -1615,6 +1629,7 @@ impl RuntimeService {
                     active_states,
                     max_turns,
                     workflow.config.agent.continuation_prompt.clone(),
+                    completion_signal,
                     selected_agent_for_task,
                     prior_context,
                     stop_rx,
