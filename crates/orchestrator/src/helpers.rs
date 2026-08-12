@@ -230,16 +230,27 @@ pub(crate) async fn run_worker_attempt(
             }
 
             if let Some(signal) = completion_signal {
-                let refreshed_issue = tracker
+                // Do not return directly on a refresh failure: the live
+                // provider session must still receive its bounded shutdown.
+                // The failed result is handled after `session.stop()` below,
+                // where it prevents a local-commit or QA handoff.
+                let refreshed_issue = match tracker
                     .fetch_issues_by_ids(&[current_issue.id.clone()])
-                    .await?
-                    .into_iter()
-                    .find(|updated_issue| updated_issue.id == current_issue.id)
-                    .ok_or_else(|| {
-                        CoreError::Adapter(
-                            "worker completion signal refresh omitted the active issue".into(),
-                        )
-                    })?;
+                    .await
+                {
+                    Ok(issues) => match issues
+                        .into_iter()
+                        .find(|updated_issue| updated_issue.id == current_issue.id)
+                    {
+                        Some(issue) => issue,
+                        None => {
+                            break Err(CoreError::Adapter(
+                                "worker completion signal refresh omitted the active issue".into(),
+                            ));
+                        },
+                    },
+                    Err(error) => break Err(error),
+                };
                 if let Some(comment) = refreshed_issue.comments.iter().rev().find(|comment| {
                     !initial_comment_ids.contains(&comment.id) && signal.matches(&comment.body)
                 }) {

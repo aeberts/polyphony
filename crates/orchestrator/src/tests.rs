@@ -30,6 +30,7 @@ struct TestTracker {
     workflow_updates: Arc<Mutex<Vec<String>>>,
     workflow_status_error: Arc<Mutex<Option<String>>>,
     fetch_by_ids_calls: Arc<Mutex<u32>>,
+    fetch_by_ids_error: Arc<Mutex<Option<String>>>,
     issue_updates: Arc<Mutex<Vec<UpdateIssueRequest>>>,
     acknowledged_issues: Arc<Mutex<Vec<String>>>,
     created_issues: Arc<Mutex<Vec<CreateIssueRequest>>>,
@@ -107,6 +108,7 @@ impl TestTracker {
             workflow_updates: Arc::new(Mutex::new(Vec::new())),
             workflow_status_error: Arc::new(Mutex::new(None)),
             fetch_by_ids_calls: Arc::new(Mutex::new(0)),
+            fetch_by_ids_error: Arc::new(Mutex::new(None)),
             issue_updates: Arc::new(Mutex::new(Vec::new())),
             acknowledged_issues: Arc::new(Mutex::new(Vec::new())),
             created_issues: Arc::new(Mutex::new(Vec::new())),
@@ -126,6 +128,11 @@ impl TestTracker {
 
     fn fetch_by_ids_calls(&self) -> u32 {
         *self.fetch_by_ids_calls.lock().unwrap()
+    }
+
+    fn fail_fetch_by_ids(self, error: impl Into<String>) -> Self {
+        *self.fetch_by_ids_error.lock().unwrap() = Some(error.into());
+        self
     }
 
     fn record_external_comment(&self, issue_id: &str, body: impl Into<String>) {
@@ -279,6 +286,9 @@ impl IssueTracker for TestTracker {
         issue_ids: &[String],
     ) -> Result<Vec<Issue>, polyphony_core::Error> {
         *self.fetch_by_ids_calls.lock().unwrap() += 1;
+        if let Some(error) = self.fetch_by_ids_error.lock().unwrap().clone() {
+            return Err(polyphony_core::Error::Adapter(error));
+        }
         let issues = self.issues.lock().unwrap();
         Ok(issue_ids
             .iter()
@@ -641,6 +651,8 @@ struct RecordingSessionAgent {
     stops: Arc<Mutex<u32>>,
     final_issue_state: Option<String>,
     completion_evidence: Option<(TestTracker, String, String)>,
+    completion_evidence_consumed: Arc<Mutex<bool>>,
+    lifecycle_trace: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl RecordingSessionAgent {
@@ -673,6 +685,11 @@ impl RecordingSessionAgent {
             ..Self::default()
         }
     }
+
+    fn with_lifecycle_trace(mut self, lifecycle_trace: Arc<Mutex<Vec<String>>>) -> Self {
+        self.lifecycle_trace = Some(lifecycle_trace);
+        self
+    }
 }
 
 struct RecordingSession {
@@ -680,6 +697,9 @@ struct RecordingSession {
     stops: Arc<Mutex<u32>>,
     final_issue_state: Option<String>,
     completion_evidence: Option<(TestTracker, String, String)>,
+    completion_evidence_consumed: Arc<Mutex<bool>>,
+    lifecycle_trace: Option<Arc<Mutex<Vec<String>>>>,
+    agent_name: String,
 }
 
 #[derive(Clone, Default)]
@@ -902,7 +922,16 @@ impl AgentRuntime for HangingStopSessionAgent {
 impl AgentSession for RecordingSession {
     async fn run_turn(&mut self, prompt: String) -> Result<AgentRunResult, polyphony_core::Error> {
         self.prompts.lock().unwrap().push(prompt);
-        if let Some((tracker, issue_id, evidence)) = self.completion_evidence.take() {
+        if let Some(trace) = &self.lifecycle_trace {
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("turn:{}", self.agent_name));
+        }
+        if !*self.completion_evidence_consumed.lock().unwrap()
+            && let Some((tracker, issue_id, evidence)) = self.completion_evidence.take()
+        {
+            *self.completion_evidence_consumed.lock().unwrap() = true;
             tracker.record_external_comment(&issue_id, evidence);
         }
         Ok(AgentRunResult {
@@ -915,6 +944,12 @@ impl AgentSession for RecordingSession {
 
     async fn stop(&mut self) -> Result<(), polyphony_core::Error> {
         *self.stops.lock().unwrap() += 1;
+        if let Some(trace) = &self.lifecycle_trace {
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("stop:{}", self.agent_name));
+        }
         Ok(())
     }
 }
@@ -927,15 +962,24 @@ impl AgentRuntime for RecordingSessionAgent {
 
     async fn start_session(
         &self,
-        _spec: AgentRunSpec,
+        spec: AgentRunSpec,
         _event_tx: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<Option<Box<dyn AgentSession>>, polyphony_core::Error> {
         *self.session_starts.lock().unwrap() += 1;
+        if let Some(trace) = &self.lifecycle_trace {
+            trace
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", spec.agent.name));
+        }
         Ok(Some(Box::new(RecordingSession {
             prompts: self.prompts.clone(),
             stops: self.stops.clone(),
             final_issue_state: self.final_issue_state.clone(),
             completion_evidence: self.completion_evidence.clone(),
+            completion_evidence_consumed: self.completion_evidence_consumed.clone(),
+            lifecycle_trace: self.lifecycle_trace.clone(),
+            agent_name: spec.agent.name,
         })))
     }
 
@@ -1313,6 +1357,7 @@ struct RecordingCommitter {
     local_requests: Arc<Mutex<Vec<LocalWorkspaceCommitRequest>>>,
     result: Option<WorkspaceCommitResult>,
     local_result: Result<Option<LocalWorkspaceCommitResult>, String>,
+    lifecycle_trace: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl RecordingCommitter {
@@ -1322,6 +1367,7 @@ impl RecordingCommitter {
             local_requests: Arc::new(Mutex::new(Vec::new())),
             result,
             local_result: Err("local commit was not configured for this fixture".into()),
+            lifecycle_trace: None,
         }
     }
 
@@ -1335,11 +1381,17 @@ impl RecordingCommitter {
             local_requests: Arc::new(Mutex::new(Vec::new())),
             result: None,
             local_result: result,
+            lifecycle_trace: None,
         }
     }
 
     fn local_requests(&self) -> Vec<LocalWorkspaceCommitRequest> {
         self.local_requests.lock().unwrap().clone()
+    }
+
+    fn with_lifecycle_trace(mut self, lifecycle_trace: Arc<Mutex<Vec<String>>>) -> Self {
+        self.lifecycle_trace = Some(lifecycle_trace);
+        self
     }
 }
 
@@ -1379,6 +1431,9 @@ impl WorkspaceCommitter for RecordingCommitter {
         request: &LocalWorkspaceCommitRequest,
     ) -> Result<Option<LocalWorkspaceCommitResult>, polyphony_core::Error> {
         self.local_requests.lock().unwrap().push(request.clone());
+        if let Some(trace) = &self.lifecycle_trace {
+            trace.lock().unwrap().push("local_commit".into());
+        }
         self.local_result
             .clone()
             .map_err(polyphony_core::Error::Adapter)
@@ -6615,6 +6670,217 @@ async fn manual_dispatch_directives_reach_pipeline_router_and_worker_prompts() {
         .find(|run| run.issue_id.as_deref() == Some(issue.id.as_str()))
         .expect("run should be created for pipeline dispatch");
     assert_eq!(run.manual_dispatch_directives.as_deref(), Some(directives));
+}
+
+#[tokio::test]
+async fn live_stage_completion_hands_off_through_local_commit_before_qa() {
+    let workspace_root = unique_workspace_root("live-stage-completion-local-commit");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagent:\n  max_turns: 1\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nLive stage-completion fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-live-stage-completion",
+        "SAFE-31",
+        "Todo",
+        "Live stage completion",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let lifecycle_trace = Arc::new(Mutex::new(Vec::new()));
+    let agent = RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        "IMPLEMENTATION NOTE:\nwhat changed: added the live handoff fixture\ncommit: abc123\ntests run: live pipeline fixture\nchecks: 1",
+    )
+    .with_lifecycle_trace(lifecycle_trace.clone());
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: "task/safe-31".into(),
+        head_sha: "a1b2c3d4".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })))
+    .with_lifecycle_trace(lifecycle_trace.clone());
+    let committer_handle = committer.clone();
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow, issue, None, false, false, None)
+        .await
+        .expect("the implementation live session should dispatch");
+    handle_next_worker_message(&mut service).await;
+    handle_next_worker_message(&mut service).await;
+
+    let run = service.state.runs.values().next().unwrap();
+    let implementation = &service.state.tasks[&run.id][0];
+    let qa = &service.state.tasks[&run.id][1];
+    let local_step = run
+        .steps
+        .iter()
+        .find(|step| step.kind == polyphony_core::StepKind::LocalCommit)
+        .expect("local commit outcome must be durable before QA dispatch");
+    assert_eq!(implementation.turns_completed, 1);
+    assert_eq!(
+        agent_handle.prompts().len(),
+        2,
+        "one implementation and one QA turn"
+    );
+    assert_eq!(agent_handle.stops(), 2, "both live sessions shut down");
+    assert_eq!(committer_handle.local_requests().len(), 1);
+    assert_eq!(local_step.status, StepStatus::Succeeded);
+    assert_eq!(
+        qa.status,
+        TaskStatus::Failed,
+        "the fixture supplies no QA verdict"
+    );
+    assert_eq!(lifecycle_trace.lock().unwrap().as_slice(), [
+        "start:implementer",
+        "turn:implementer",
+        "stop:implementer",
+        "local_commit",
+        "start:qa",
+        "turn:qa",
+        "stop:qa",
+    ]);
+}
+
+#[tokio::test]
+async fn malformed_live_completion_signal_fails_closed_without_commit_or_qa() {
+    let workspace_root = unique_workspace_root("malformed-live-stage-completion");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagent:\n  max_turns: 1\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nMalformed live stage-completion fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-malformed-live-stage-completion",
+        "SAFE-31-M",
+        "Todo",
+        "Malformed live stage completion",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let agent = RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        "IMPLEMENTATION NOTE:\nwhat changed: incomplete durable evidence",
+    );
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: "task/safe-31-m".into(),
+        head_sha: "a1b2c3d4".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })));
+    let committer_handle = committer.clone();
+    let mut service = RuntimeService::new(
+        Arc::new(tracker),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow, issue, None, false, false, None)
+        .await
+        .expect("the malformed live session should dispatch");
+    handle_next_worker_message(&mut service).await;
+
+    let run = service.state.runs.values().next().unwrap();
+    assert_eq!(agent_handle.prompts().len(), 1);
+    assert_eq!(agent_handle.stops(), 1);
+    assert!(committer_handle.local_requests().is_empty());
+    assert_eq!(service.state.tasks[&run.id][0].status, TaskStatus::Failed);
+    assert_eq!(service.state.tasks[&run.id][1].status, TaskStatus::Pending);
+}
+
+#[tokio::test]
+async fn live_completion_refresh_failure_is_visible_and_blocks_handoff() {
+    let workspace_root = unique_workspace_root("live-stage-completion-refresh-failure");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagent:\n  max_turns: 1\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nLive stage-completion refresh failure fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-live-stage-completion-refresh-failure",
+        "SAFE-31-R",
+        "Todo",
+        "Live stage completion refresh failure",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()])
+        .fail_fetch_by_ids("injected completion refresh failure");
+    let agent = RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        "IMPLEMENTATION NOTE:\nwhat changed: added the refresh failure fixture\ncommit: abc123\ntests run: live pipeline fixture\nchecks: 1",
+    );
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: "task/safe-31-r".into(),
+        head_sha: "a1b2c3d4".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })));
+    let committer_handle = committer.clone();
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow, issue, None, false, false, None)
+        .await
+        .expect("the refresh-failure live session should dispatch");
+    handle_next_worker_message(&mut service).await;
+
+    let run = service.state.runs.values().next().unwrap();
+    assert_eq!(tracker.fetch_by_ids_calls(), 1);
+    assert_eq!(agent_handle.prompts().len(), 1);
+    assert_eq!(agent_handle.stops(), 1);
+    assert!(committer_handle.local_requests().is_empty());
+    assert_eq!(service.state.tasks[&run.id][0].status, TaskStatus::Failed);
+    assert!(
+        service.state.tasks[&run.id][0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("injected completion refresh failure"))
+    );
+    assert_eq!(service.state.tasks[&run.id][1].status, TaskStatus::Pending);
 }
 
 #[tokio::test]
