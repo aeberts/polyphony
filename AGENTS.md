@@ -1,37 +1,42 @@
 # Repository guidance
 
-This repository is the independently maintained Polyphony Safety Fork. Read
-[`docs/PROJECT-OPERATIONS.md`](docs/PROJECT-OPERATIONS.md) before starting work.
-It defines the current work tracker, issue workflow, validation expectations,
-and handoff format.
+This repository is an archived historical record of the independently
+maintained Polyphony Safety Fork. Do not start new implementation, live tests,
+coordinators, or app-server workers. Preserve its code, issues, databases,
+workspaces, logs, and documentation for reference.
 
-## Start work from an issue
+Read [`docs/PROJECT-OPERATIONS.md`](docs/PROJECT-OPERATIONS.md) for the final
+decision and historical operating model.
 
-When asked to work on issue `#<number>`, treat it as
+## Historical issue records
+
+Historical issue `#<number>` references mean
 [`aeberts/polyphony` Issues](https://github.com/aeberts/polyphony/issues). Read
 the issue, its comments, and its item in the
 [Polyphony safety fork GitHub Project (#6)](https://github.com/users/aeberts/projects/6)
-before changing code. Use that issue and Project #6 for delivery status and
-durable evidence.
+as preserved evidence. Do not reopen or resume work without a new explicit
+human decision to reactivate the experiment.
 
 [`aeberts/symphony-trial`](https://github.com/aeberts/symphony-trial) and its
 [GitHub Project (#5)](https://github.com/users/aeberts/projects/5/views/3) are
 test-only. They are not this repository's delivery tracker.
 
-## Working policy
+## Historical live testing
 
-- This fork is independently maintained. Changes are selectively upstreamable:
-  assess upstream compatibility when a change has shared value; do not make it
-  a default constraint.
-- Beads remains part of the Polyphony product and inherited repository context,
-  but it is not the operational issue tracker for this fork.
-- Keep work scoped to the selected issue. Record implementation, QA, and any
-  integration evidence on that GitHub issue.
-- Use conventional commits:
-  `feat|fix|docs|style|refactor|test|chore(scope): description`.
-- Before committing code, run `just format` and `just lint`. For documentation
-  changes, run focused checks that prove links, file state, and stale guidance
-  are correct.
+[`LIVE-TESTING.md`](LIVE-TESTING.md) is retained as the procedure used for the
+trial. Do not use it to launch a new test unless the experiment is explicitly
+reactivated. Never open a preserved runtime database with a coordinator or
+observer RuntimeService.
+
+## Preservation policy
+
+- Do not delete or rewrite historical issue comments, runtime databases,
+  workspaces, logs, or live-test artifacts.
+- Do not use Polyphony or Symphony for production or development work.
+- The active delivery method is the judgment-led closed-loop issue-delivery
+  skill with durable tracker evidence and explicit human integration gates.
+- Any future evaluation must start with a new decision record, new issue, and
+  new isolated runtime. Historical runtimes are read-only evidence.
 
 ## Engineering conventions
 

@@ -1,3 +1,11 @@
+> [!IMPORTANT]
+> This repository is archived as a historical experiment. The independently
+> maintained safety fork is no longer used for real work. Live trials showed
+> that deterministic orchestration without a first-class judgment layer was
+> too brittle at natural-language handoff boundaries. The code, issues,
+> runtime evidence, and documentation remain available for research and
+> reference. Do not deploy or start Polyphony from this fork.
+
 <div align="center">
 
 <a href="https://polyphony.to"><img src="https://polyphony.to/assets/logo.svg" alt="Polyphony" width="64"></a>

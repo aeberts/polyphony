@@ -1,26 +1,52 @@
 # Project operations
 
-## Purpose and authority
+## Archive decision
+
+This project concluded on 2026-08-13. The Polyphony Safety Fork and the earlier
+Symphony trial are retained for historical reference and are not active work
+systems.
+
+Live testing showed that Polyphony's deterministic gates, isolated workspaces,
+durable state, and fail-closed behavior were useful, but the system did not
+provide the judgment needed at natural-language handoffs. Small representation
+differences could stop a valid implementation, require operator diagnosis, or
+make an automatic retry unsafe. A coordinating agent was still required to
+interpret intent, reconcile evidence, and choose a safe recovery.
+
+The adoption decision is **reject as a primary delivery coordinator**. Use the
+judgment-led closed-loop issue-delivery skill instead. Preserve this repository,
+GitHub Issues, Project #6, and trial artifacts as evidence. Do not start new
+Polyphony work or live tests unless a later explicit decision reactivates the
+experiment.
+
+## Historical purpose and authority
 
 This repository, [`aeberts/polyphony`](https://github.com/aeberts/polyphony),
 is the independently maintained Polyphony Safety Fork. It is not maintained as
 a branch intended for routine merging into the original upstream project.
 
-The authoritative delivery tracker is:
+The historical delivery tracker was:
 
 - [GitHub Issues for `aeberts/polyphony`](https://github.com/aeberts/polyphony/issues)
 - [Polyphony safety fork GitHub Project (#6)](https://github.com/users/aeberts/projects/6)
 
-The issue is the durable record of scope, decisions, implementation evidence,
-QA findings, and integration status. Project #6 shows planning and delivery
-state. Do not use a local tracker for this work.
+The issues remain the durable record of scope, decisions, implementation
+evidence, QA findings, and integration status. Project #6 shows the terminal
+state of the experiment.
 
 [`aeberts/symphony-trial`](https://github.com/aeberts/symphony-trial) and its
 [GitHub Project (#5)](https://github.com/users/aeberts/projects/5/views/3) are
 used only to test this fork with the earlier orchestration system. They do not
 track delivery work for this repository.
 
-## Start a fresh session
+[`LIVE-TESTING.md`](../LIVE-TESTING.md) preserves the procedure used for
+preparation, isolation, launch, observation, recovery, and evidence. It is not
+authorization to start another coordinator or live attempt.
+
+## Historical session procedure
+
+The following procedure documents how work was started before archival. It is
+retained for context and is not authorization to resume an issue.
 
 For a request such as "work on issue #26":
 
@@ -35,7 +61,7 @@ For a request such as "work on issue #26":
 If the issue, Project #6, and repository state disagree, do not silently pick
 one. Record the conflict on the issue and request direction.
 
-## Delivery workflow
+## Historical delivery workflow
 
 1. Refine acceptance criteria when they cannot distinguish a real fix from a
    happy-path result.
@@ -57,7 +83,7 @@ Handoffs are deltas, not a second operating manual. Include only the issue and
 branch, completed work, checks run, open risk or blocker, and the exact next
 action. Put recurring process information in this document instead.
 
-## Upstream relationship
+## Historical upstream relationship
 
 The fork is **selectively upstreamable**. Build what the safety fork needs.
 Evaluate upstream compatibility only when a change has likely shared value.
@@ -75,9 +101,9 @@ The root `.beads` directory is deliberately absent so Polyphony cannot activate
 it as a supplemental runtime tracker. Do not remove Beads product support as
 part of normal issue work.
 
-## Repository configuration
+## Historical repository configuration
 
-`polyphony.toml` configures this repository's Polyphony runtime for GitHub
+`polyphony.toml` configured this repository's Polyphony runtime for GitHub
 Issues in `aeberts/polyphony` and Project #6. It must not be treated as a
 replacement for the issue record. Keep credentials outside the repository and
 use environment variables or personal configuration for them.
