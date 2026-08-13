@@ -117,7 +117,31 @@ fn normalize_to_camel(value: Option<&str>) -> Option<String> {
     })
 }
 
-/// Normalize to kebab-case for `thread/start` `sandbox` and `approvalPolicy` fields.
+/// Translate Polyphony's legacy approval names to app-server protocol values.
+///
+/// The app-server rejects unknown variants during `thread/start`, so approval
+/// policy conversion is deliberately closed instead of passing configuration
+/// through unchanged.
+fn normalize_approval_policy(value: Option<&str>) -> Result<Option<String>, CoreError> {
+    value
+        .map(|value| {
+            let normalized = match value {
+                "auto" | "never" => "never",
+                "manual" | "always" | "on-request" | "onRequest" => "on-request",
+                "untrusted" => "untrusted",
+                "granular" => "granular",
+                other => {
+                    return Err(CoreError::Adapter(format!(
+                        "unsupported_codex_approval_policy: {other}"
+                    )));
+                },
+            };
+            Ok(normalized.to_string())
+        })
+        .transpose()
+}
+
+/// Normalize to kebab-case for `thread/start` sandbox fields.
 fn normalize_to_kebab(value: Option<&str>) -> Option<String> {
     value.map(|v| match v {
         "workspaceWrite" | "workspace-write" => "workspace-write".into(),
@@ -161,7 +185,8 @@ impl AgentSession for CodexAppServerSession {
         let thread_id = self.thread_id.clone();
         let title = format!("{}: {}", self.spec.issue.identifier, self.spec.issue.title);
         let workspace_path = self.spec.workspace_path.clone();
-        let approval_policy = normalize_to_camel(self.spec.agent.approval_policy.as_deref());
+        let approval_policy =
+            normalize_approval_policy(self.spec.agent.approval_policy.as_deref())?;
         let sandbox_policy = self
             .spec
             .agent
@@ -256,7 +281,7 @@ impl AgentSession for CodexAppServerSession {
         if let Some(transcript) = self.transcript.take() {
             let _ = transcript.finish();
         }
-        best_effort_stop_child(&mut self.child).await;
+        stop_child(&mut self.child).await?;
         if let Some(stderr_forward) = self.stderr_forward.take() {
             let _ = stderr_forward.await;
         }
@@ -542,11 +567,12 @@ async fn launch_codex_session(
         }
         write_json_line(&mut stdin, &initialized_msg).await?;
 
+        let approval_policy = normalize_approval_policy(spec.agent.approval_policy.as_deref())?;
         let thread_start_msg = json!({
             "id": 2u64,
             "method": "thread/start",
             "params": {
-                "approvalPolicy": normalize_to_kebab(spec.agent.approval_policy.as_deref()),
+                "approvalPolicy": approval_policy,
                 "sandbox": normalize_to_kebab(spec.agent.thread_sandbox.as_deref()),
                 "cwd": spec.workspace_path,
                 "dynamicTools": dynamic_tools,
@@ -1038,13 +1064,24 @@ async fn write_json_line(
 }
 
 async fn best_effort_stop_child(child: &mut Child) {
+    let _ = stop_child(child).await;
+}
+
+async fn stop_child(child: &mut Child) -> Result<(), CoreError> {
     match child.try_wait() {
-        Ok(Some(_)) => {},
+        Ok(Some(_)) => Ok(()),
         Ok(None) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            child.kill().await.map_err(|error| {
+                CoreError::Adapter(format!("agent_session_stop_failed: kill: {error}"))
+            })?;
+            child.wait().await.map_err(|error| {
+                CoreError::Adapter(format!("agent_session_stop_failed: wait: {error}"))
+            })?;
+            Ok(())
         },
-        Err(_) => {},
+        Err(error) => Err(CoreError::Adapter(format!(
+            "agent_session_stop_failed: status: {error}"
+        ))),
     }
 }
 
@@ -1200,7 +1237,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
-    use super::{CodexRuntime, extract_usage};
+    use super::{CodexRuntime, extract_usage, normalize_approval_policy};
 
     struct MockToolExecutor;
 
@@ -1234,6 +1271,127 @@ mod tests {
             title: "Test".into(),
             state: "Todo".into(),
             ..Issue::default()
+        }
+    }
+
+    #[test]
+    fn closed_loop_role_approval_policies_use_supported_app_server_values() {
+        let role_policies = [
+            ("implementation", "auto", "never"),
+            ("qa", "always", "on-request"),
+            ("repair", "auto", "never"),
+        ];
+        for (role, configured, expected) in role_policies {
+            assert_eq!(
+                normalize_approval_policy(Some(configured))
+                    .unwrap_or_else(|error| panic!("{role} policy should translate: {error}"))
+                    .as_deref(),
+                Some(expected),
+                "{role} approval policy"
+            );
+        }
+        for supported in ["untrusted", "on-request", "granular", "never"] {
+            assert_eq!(
+                normalize_approval_policy(Some(supported))
+                    .expect("supported protocol policy should remain valid")
+                    .as_deref(),
+                Some(supported)
+            );
+        }
+        let error = normalize_approval_policy(Some("auto,always"))
+            .expect_err("contradictory policy input must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported_codex_approval_policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_loop_role_policies_reach_thread_and_turn_protocol_requests() {
+        let runtime = CodexRuntime::default();
+        let dir = tempdir().unwrap();
+        for (ordinal, (role, configured, expected)) in [
+            ("implementation", "auto", "never"),
+            ("qa", "always", "on-request"),
+            ("repair", "auto", "never"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let script = dir.path().join(format!("mock-{role}-app-server.sh"));
+            let thread_request = dir.path().join(format!("{role}-thread.json"));
+            let turn_request = dir.path().join(format!("{role}-turn.json"));
+            std::fs::write(
+                &script,
+                format!(
+                    r#"#!/usr/bin/env bash
+set -euo pipefail
+while IFS= read -r line; do
+  if [[ "$line" == *'"id":1'* ]]; then
+    echo '{{"id":1,"result":{{"ok":true}}}}'
+  elif [[ "$line" == *'"method":"thread/start"'* ]]; then
+    printf '%s' "$line" > '{}'
+    echo '{{"id":2,"result":{{"thread":{{"id":"thread-{ordinal}"}}}}}}'
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    printf '%s' "$line" > '{}'
+    echo '{{"id":3,"result":{{"turn":{{"id":"turn-{ordinal}"}}}}}}'
+    echo '{{"method":"turn/completed","params":{{"message":"done"}}}}'
+  fi
+done
+"#,
+                    thread_request.display(),
+                    turn_request.display(),
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&script).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&script, perms).unwrap();
+            }
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let result = runtime
+                .run(
+                    AgentRunSpec {
+                        issue: test_issue(),
+                        attempt: None,
+                        workspace_path: dir.path().to_path_buf(),
+                        prompt: format!("run {role}"),
+                        max_turns: 1,
+                        prior_context: None,
+                        agent: AgentDefinition {
+                            name: role.into(),
+                            kind: "codex".into(),
+                            transport: AgentTransport::AppServer,
+                            command: Some(script.display().to_string()),
+                            approval_policy: Some(configured.into()),
+                            turn_timeout_ms: 2_000,
+                            read_timeout_ms: 1_000,
+                            stall_timeout_ms: 60_000,
+                            idle_timeout_ms: 1_000,
+                            ..AgentDefinition::default()
+                        },
+                    },
+                    tx,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{role} app-server fixture failed: {error}"));
+            assert_eq!(result.status, polyphony_core::AttemptStatus::Succeeded);
+
+            for request_path in [&thread_request, &turn_request] {
+                let request: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(request_path).unwrap()).unwrap();
+                assert_eq!(
+                    request["params"]["approvalPolicy"].as_str(),
+                    Some(expected),
+                    "{role} request {}",
+                    request_path.display()
+                );
+            }
         }
     }
 

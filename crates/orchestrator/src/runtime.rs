@@ -1477,6 +1477,41 @@ impl RuntimeService {
             );
             return Ok(());
         };
+        let run_has_running_worker = self
+            .state
+            .running
+            .values()
+            .any(|running| running.run_id.as_deref() == Some(run_id));
+        let blocked_handoff_task = self.state.tasks.get(run_id).and_then(|tasks| {
+            tasks
+                .iter()
+                .filter(|task| {
+                    task.status == TaskStatus::Completed
+                        && task
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.starts_with(LIVE_STAGE_HANDOFF_BLOCK_PREFIX))
+                })
+                .max_by_key(|task| task.ordinal)
+                .cloned()
+        });
+        if run.status == RunStatus::Review
+            && requested_task_id.is_none()
+            && let Some(blocked_task) = blocked_handoff_task
+        {
+            if run_has_running_worker {
+                self.push_event(
+                    EventScope::Dispatch,
+                    format!(
+                        "run retry ignored: run {run_id} still owns a worker session during lifecycle recovery"
+                    ),
+                );
+                return Ok(());
+            }
+            return self
+                .resume_completed_worker_handoff(&run, &blocked_task)
+                .await;
+        }
         if matches!(run.status, RunStatus::Cancelled | RunStatus::Blocked) {
             self.push_event(
                 EventScope::Dispatch,
@@ -1521,11 +1556,6 @@ impl RuntimeService {
             }
         }
 
-        let run_has_running_worker = self
-            .state
-            .running
-            .values()
-            .any(|running| running.run_id.as_deref() == Some(run_id));
         let can_retry_stalled_run = requested_task_id.is_none()
             && run.status == RunStatus::InProgress
             && !run_has_running_worker;
@@ -1632,6 +1662,141 @@ impl RuntimeService {
         Ok(())
     }
 
+    async fn resume_completed_worker_handoff(
+        &mut self,
+        run: &Run,
+        completed_task: &Task,
+    ) -> Result<(), Error> {
+        let issue_id = run.issue_id.as_deref().ok_or_else(|| {
+            CoreError::Adapter(format!(
+                "run {} has no issue id for lifecycle recovery",
+                run.id
+            ))
+        })?;
+        let issue = self
+            .tracker_for_issue(issue_id)
+            .fetch_issues_by_ids(&[issue_id.to_string()])
+            .await?
+            .into_iter()
+            .find(|issue| issue.id == issue_id)
+            .ok_or_else(|| {
+                CoreError::Adapter(format!(
+                    "lifecycle recovery could not refresh issue {issue_id}"
+                ))
+            })?;
+        if completed_task
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("delivery_evidence_publication_failed:"))
+        {
+            let evidence_prefix = match completed_task.role {
+                polyphony_core::PipelineTaskRole::Implementation => "IMPLEMENTATION NOTE:",
+                polyphony_core::PipelineTaskRole::Repair => "REPAIR NOTE:",
+                polyphony_core::PipelineTaskRole::Qa => "QA ",
+            };
+            let evidence = issue
+                .comments
+                .iter()
+                .rev()
+                .find(|comment| comment.body.trim_start().starts_with(evidence_prefix))
+                .map(|comment| comment.body.clone())
+                .ok_or_else(|| {
+                    CoreError::Adapter(format!(
+                        "lifecycle recovery could not find durable {} evidence for task {}",
+                        completed_task.role, completed_task.id
+                    ))
+                })?;
+            let recovery_outcome = AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: completed_task.turns_completed,
+                error: None,
+                final_issue_state: Some(evidence),
+            };
+            let note = Self::delivery_note(completed_task, &issue, &recovery_outcome)
+                .map_err(CoreError::Adapter)?;
+            self.publish_delivery_note(&issue, &run.id, completed_task, &note)
+                .await?;
+        }
+        let workspace_path = run.workspace_path.as_deref().ok_or_else(|| {
+            CoreError::Adapter(format!(
+                "run {} has no workspace path for lifecycle recovery",
+                run.id
+            ))
+        })?;
+        if let Some(tasks) = self.state.tasks.get_mut(&run.id)
+            && let Some(task) = tasks.iter_mut().find(|task| task.id == completed_task.id)
+        {
+            task.error = None;
+            task.activity_log
+                .push("worker lifecycle recovery confirmed: no owned live session remains".into());
+            task.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                store.save_task(task).await?;
+            }
+        }
+        if let Some(run_row) = self.state.runs.get_mut(&run.id) {
+            run_row.status = RunStatus::InProgress;
+            run_row.push_log(
+                polyphony_core::RunLogScope::Pipeline,
+                format!(
+                    "worker lifecycle recovery confirmed for completed {} task {}; resuming at the system handoff gate",
+                    completed_task.role, completed_task.id
+                ),
+            );
+            run_row.updated_at = Utc::now();
+            if let Some(store) = &self.store {
+                store.save_run(run_row).await?;
+            }
+        }
+
+        let workflow = self.workflow_for_issue(issue_id);
+        if completed_task.role == polyphony_core::PipelineTaskRole::Qa {
+            let qa_report = completed_task
+                .activity_log
+                .iter()
+                .rev()
+                .find_map(|entry| {
+                    [
+                        ("durable QA PASS evidence: ", "QA PASS: "),
+                        ("durable QA FAIL evidence: ", "QA FAIL: "),
+                    ]
+                    .into_iter()
+                    .find_map(|(stored_prefix, report_prefix)| {
+                        entry
+                            .strip_prefix(stored_prefix)
+                            .map(|evidence| format!("{report_prefix}{evidence}"))
+                    })
+                })
+                .ok_or_else(|| {
+                    CoreError::Adapter(format!(
+                        "lifecycle recovery lost durable QA evidence for task {}",
+                        completed_task.id
+                    ))
+                })?;
+            let recovery_outcome = AgentRunResult {
+                status: AttemptStatus::Succeeded,
+                turns_completed: completed_task.turns_completed,
+                error: None,
+                final_issue_state: Some(qa_report),
+            };
+            return self
+                .handle_task_finished(
+                    &workflow,
+                    &issue,
+                    &run.id,
+                    &completed_task.id,
+                    workspace_path,
+                    &recovery_outcome,
+                    None,
+                )
+                .await;
+        }
+        self.commit_local_stage(&workflow, &issue, &run.id, completed_task, workspace_path)
+            .await?;
+        self.dispatch_next_task(workflow, issue, None, false, &run.id, workspace_path)
+            .await
+    }
+
     pub(crate) async fn normalize_restored_in_progress_runs(&mut self) -> Result<(), Error> {
         let now = Utc::now();
         let stale_error = "restored without an active agent session; retry the run to continue";
@@ -1692,6 +1857,41 @@ impl RuntimeService {
             let Some(tasks) = self.state.tasks.get_mut(&run_id) else {
                 continue;
             };
+            // A completed worker with a persisted stop diagnostic is waiting
+            // at the lifecycle handoff gate. The stage evidence is already
+            // durable, so restart must preserve the completed task and the
+            // pending downstream task instead of manufacturing a failed task
+            // that could re-dispatch implementation or repair.
+            if let Some(blocked_task) = tasks.iter().find(|task| {
+                task.status == TaskStatus::Completed
+                    && task
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.starts_with(LIVE_STAGE_HANDOFF_BLOCK_PREFIX))
+            }) {
+                let blocked_role = blocked_task.role;
+                let blocked_task_id = blocked_task.id.clone();
+                if let Some(run) = self.state.runs.get_mut(&run_id) {
+                    run.status = RunStatus::Review;
+                    run.push_log(
+                        polyphony_core::RunLogScope::Reconciliation,
+                        format!(
+                            "restart preserved completed {blocked_role} task {blocked_task_id} at the worker lifecycle recovery gate"
+                        ),
+                    );
+                    run.updated_at = now;
+                    if let Some(store) = &self.store {
+                        store.save_run(run).await?;
+                    }
+                }
+                self.push_event(
+                    EventScope::Startup,
+                    format!(
+                        "restored worker lifecycle handoff block for run {run_id}; retry resumes after the completed worker"
+                    ),
+                );
+                continue;
+            }
             // A QA FAIL is a durable gate, not an agent crash.  If the
             // process stopped after dispatching its distinct repair role,
             // restore that repair as pending.  This preserves the QA evidence

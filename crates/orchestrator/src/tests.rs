@@ -35,6 +35,7 @@ struct TestTracker {
     acknowledged_issues: Arc<Mutex<Vec<String>>>,
     created_issues: Arc<Mutex<Vec<CreateIssueRequest>>>,
     comments: Arc<Mutex<Vec<AddIssueCommentRequest>>>,
+    comment_error: Arc<Mutex<Option<String>>>,
     write_order: Arc<Mutex<Vec<String>>>,
 }
 
@@ -113,6 +114,7 @@ impl TestTracker {
             acknowledged_issues: Arc::new(Mutex::new(Vec::new())),
             created_issues: Arc::new(Mutex::new(Vec::new())),
             comments: Arc::new(Mutex::new(Vec::new())),
+            comment_error: Arc::new(Mutex::new(None)),
             write_order: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -166,6 +168,10 @@ impl TestTracker {
 
     fn recorded_comments(&self) -> Vec<AddIssueCommentRequest> {
         self.comments.lock().unwrap().clone()
+    }
+
+    fn set_comment_error(&self, error: Option<&str>) {
+        *self.comment_error.lock().unwrap() = error.map(str::to_string);
     }
 
     fn write_order(&self) -> Vec<String> {
@@ -362,6 +368,9 @@ impl IssueTracker for TestTracker {
         &self,
         request: &AddIssueCommentRequest,
     ) -> Result<IssueComment, polyphony_core::Error> {
+        if let Some(error) = self.comment_error.lock().unwrap().clone() {
+            return Err(polyphony_core::Error::Adapter(error));
+        }
         self.comments.lock().unwrap().push(request.clone());
         self.write_order.lock().unwrap().push("comment".into());
         Ok(IssueComment {
@@ -653,6 +662,15 @@ struct RecordingSessionAgent {
     completion_evidence: Option<(TestTracker, String, String)>,
     completion_evidence_consumed: Arc<Mutex<bool>>,
     lifecycle_trace: Option<Arc<Mutex<Vec<String>>>>,
+    stop_behavior: RecordingStopBehavior,
+}
+
+#[derive(Clone, Copy, Default)]
+enum RecordingStopBehavior {
+    #[default]
+    Succeeds,
+    FirstStopTimesOut,
+    FirstStopFails,
 }
 
 impl RecordingSessionAgent {
@@ -690,6 +708,16 @@ impl RecordingSessionAgent {
         self.lifecycle_trace = Some(lifecycle_trace);
         self
     }
+
+    fn with_first_stop_timeout(mut self) -> Self {
+        self.stop_behavior = RecordingStopBehavior::FirstStopTimesOut;
+        self
+    }
+
+    fn with_first_stop_failure(mut self) -> Self {
+        self.stop_behavior = RecordingStopBehavior::FirstStopFails;
+        self
+    }
 }
 
 struct RecordingSession {
@@ -700,6 +728,7 @@ struct RecordingSession {
     completion_evidence_consumed: Arc<Mutex<bool>>,
     lifecycle_trace: Option<Arc<Mutex<Vec<String>>>>,
     agent_name: String,
+    stop_behavior: RecordingStopBehavior,
 }
 
 #[derive(Clone, Default)]
@@ -943,14 +972,24 @@ impl AgentSession for RecordingSession {
     }
 
     async fn stop(&mut self) -> Result<(), polyphony_core::Error> {
-        *self.stops.lock().unwrap() += 1;
+        let stop_number = {
+            let mut stops = self.stops.lock().unwrap();
+            *stops += 1;
+            *stops
+        };
         if let Some(trace) = &self.lifecycle_trace {
             trace
                 .lock()
                 .unwrap()
                 .push(format!("stop:{}", self.agent_name));
         }
-        Ok(())
+        match (self.stop_behavior, stop_number) {
+            (RecordingStopBehavior::FirstStopTimesOut, 1) => std::future::pending().await,
+            (RecordingStopBehavior::FirstStopFails, 1) => Err(polyphony_core::Error::Adapter(
+                "injected app-server stop failure".into(),
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -980,6 +1019,7 @@ impl AgentRuntime for RecordingSessionAgent {
             completion_evidence_consumed: self.completion_evidence_consumed.clone(),
             lifecycle_trace: self.lifecycle_trace.clone(),
             agent_name: spec.agent.name,
+            stop_behavior: self.stop_behavior,
         })))
     }
 
@@ -6749,6 +6789,339 @@ async fn live_stage_completion_hands_off_through_local_commit_before_qa() {
         qa.status,
         TaskStatus::Failed,
         "the fixture supplies no QA verdict"
+    );
+    assert_eq!(lifecycle_trace.lock().unwrap().as_slice(), [
+        "start:implementer",
+        "turn:implementer",
+        "stop:implementer",
+        "local_commit",
+        "start:qa",
+        "turn:qa",
+        "stop:qa",
+    ]);
+}
+
+#[tokio::test]
+async fn live_completion_stop_timeout_blocks_then_recovers_after_completed_worker() {
+    let workspace_root = unique_workspace_root("live-completion-stop-timeout-recovery");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagent:\n  max_turns: 1\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\n    repair: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\nlocal_commit:\n  enabled: true\n---\nLive stop-timeout recovery fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-live-stop-timeout",
+        "SAFE-32-T",
+        "Todo",
+        "Stop timeout recovery",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let lifecycle_trace = Arc::new(Mutex::new(Vec::new()));
+    let evidence = "IMPLEMENTATION NOTE:\nwhat changed: completed before shutdown timed out\ncommit: abc123\ntests run: live pipeline fixture\nchecks: 1";
+    let agent = RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        evidence,
+    )
+    .with_lifecycle_trace(lifecycle_trace.clone())
+    .with_first_stop_timeout();
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: "task/safe-32-t".into(),
+        head_sha: "32abc123".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })))
+    .with_lifecycle_trace(lifecycle_trace.clone());
+    let committer_handle = committer.clone();
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(store.clone()),
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .expect("implementation should dispatch");
+    handle_next_worker_message(&mut service).await;
+
+    let persisted_run = service.state.runs.values().next().unwrap().clone();
+    let persisted_tasks = service.state.tasks[&persisted_run.id].clone();
+    assert_eq!(
+        persisted_run.status,
+        RunStatus::Review,
+        "run={persisted_run:?} tasks={persisted_tasks:?}"
+    );
+    assert_eq!(persisted_tasks[0].status, TaskStatus::Completed);
+    assert!(
+        persisted_tasks[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("agent_session_stop_timeout"))
+    );
+    assert_eq!(persisted_tasks[1].status, TaskStatus::Pending);
+    assert_eq!(persisted_tasks[2].status, TaskStatus::Pending);
+    assert!(committer_handle.local_requests().is_empty());
+    assert_eq!(agent_handle.prompts().len(), 1);
+    assert_eq!(agent_handle.session_starts(), 1);
+    assert!(
+        !tracker
+            .recorded_workflow_updates()
+            .iter()
+            .any(|status| { status == "Repair Needed" })
+    );
+    assert!(service.state.running.is_empty());
+
+    let (_restart_tx, restart_rx) = watch::channel(workflow);
+    let mut restarted = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent_handle.clone()),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer_handle.clone())),
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        restart_rx,
+    )
+    .0;
+    restarted
+        .state
+        .runs
+        .insert(persisted_run.id.clone(), persisted_run.clone());
+    restarted
+        .state
+        .tasks
+        .insert(persisted_run.id.clone(), persisted_tasks);
+    restarted
+        .normalize_restored_in_progress_runs()
+        .await
+        .expect("restart should preserve the handoff block");
+    assert_eq!(
+        restarted.state.runs[&persisted_run.id].status,
+        RunStatus::Review
+    );
+    assert_eq!(
+        restarted.state.tasks[&persisted_run.id][0].status,
+        TaskStatus::Completed
+    );
+
+    restarted.pending_run_retries.push(persisted_run.id.clone());
+    restarted.process_pending_run_retries().await;
+    handle_next_worker_message(&mut restarted).await;
+
+    assert_eq!(committer_handle.local_requests().len(), 1);
+    assert_eq!(agent_handle.session_starts(), 2, "QA starts after recovery");
+    assert_eq!(
+        agent_handle.prompts().len(),
+        2,
+        "one implementation turn and one independent QA turn"
+    );
+    assert_eq!(
+        restarted.state.tasks[&persisted_run.id][0].status,
+        TaskStatus::Completed
+    );
+    assert_eq!(restarted.state.tasks[&persisted_run.id][0].error, None);
+    assert_eq!(lifecycle_trace.lock().unwrap().as_slice(), [
+        "start:implementer",
+        "turn:implementer",
+        "stop:implementer",
+        "local_commit",
+        "start:qa",
+        "turn:qa",
+        "stop:qa",
+    ]);
+    assert_eq!(
+        lifecycle_trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "start:implementer")
+            .count(),
+        1,
+        "recovery must not dispatch implementation a second time"
+    );
+}
+
+#[tokio::test]
+async fn live_completion_typed_stop_failure_is_a_handoff_block_not_repair() {
+    let workspace_root = unique_workspace_root("live-completion-stop-failure");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagent:\n  max_turns: 1\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\n    repair: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\nlocal_commit:\n  enabled: true\n---\nLive stop-failure fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-live-stop-failure",
+        "SAFE-32-F",
+        "Todo",
+        "Stop failure",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let agent = RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        "IMPLEMENTATION NOTE:\nwhat changed: completed before typed stop failure\ncommit: abc123\ntests run: live pipeline fixture\nchecks: 1",
+    )
+    .with_first_stop_failure();
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: "task/safe-32-f".into(),
+        head_sha: "32def456".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })));
+    let committer_handle = committer.clone();
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow, issue, None, false, false, None)
+        .await
+        .expect("implementation should dispatch");
+    handle_next_worker_message(&mut service).await;
+
+    let run = service.state.runs.values().next().unwrap();
+    assert_eq!(run.status, RunStatus::Review);
+    assert_eq!(
+        service.state.tasks[&run.id][0].status,
+        TaskStatus::Completed
+    );
+    assert!(
+        service.state.tasks[&run.id][0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("agent_session_stop_failed"))
+    );
+    assert_eq!(service.state.tasks[&run.id][1].status, TaskStatus::Pending);
+    assert_eq!(service.state.tasks[&run.id][2].status, TaskStatus::Pending);
+    assert!(committer_handle.local_requests().is_empty());
+    assert_eq!(agent_handle.session_starts(), 1);
+    assert!(
+        !tracker
+            .recorded_workflow_updates()
+            .contains(&"Repair Needed".into())
+    );
+}
+
+#[tokio::test]
+async fn completion_evidence_publication_failure_blocks_and_retry_does_not_reimplement() {
+    let workspace_root = unique_workspace_root("completion-evidence-publication-retry");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagent:\n  max_turns: 1\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\n    repair: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\n    - { category: coding, role: repair, agent: repair }\nlocal_commit:\n  enabled: true\n---\nEvidence publication recovery fixture\n",
+    );
+    let (_tx, rx) = watch::channel(workflow.clone());
+    let issue = sample_issue(
+        "issue-evidence-publication-failure",
+        "SAFE-32-E",
+        "Todo",
+        "Evidence publication recovery",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    tracker.set_comment_error(Some("injected tracker publication failure"));
+    let lifecycle_trace = Arc::new(Mutex::new(Vec::new()));
+    let agent = RecordingSessionAgent::with_stage_completion_signal(
+        tracker.clone(),
+        issue.id.clone(),
+        "IMPLEMENTATION NOTE:\nwhat changed: completed before tracker publication failed\ncommit: abc123\ntests run: live pipeline fixture\nchecks: 1",
+    )
+    .with_lifecycle_trace(lifecycle_trace.clone());
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: "task/safe-32-e".into(),
+        head_sha: "32eeeeee".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })))
+    .with_lifecycle_trace(lifecycle_trace.clone());
+    let committer_handle = committer.clone();
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
+    let mut service = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        rx,
+    )
+    .0;
+
+    service
+        .dispatch_pipeline(workflow, issue, None, false, false, None)
+        .await
+        .expect("implementation should dispatch");
+    handle_next_worker_message(&mut service).await;
+
+    let run_id = service.state.runs.keys().next().unwrap().clone();
+    assert_eq!(service.state.runs[&run_id].status, RunStatus::Review);
+    assert_eq!(
+        service.state.tasks[&run_id][0].status,
+        TaskStatus::Completed
+    );
+    assert!(
+        service.state.tasks[&run_id][0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("delivery_evidence_publication_failed"))
+    );
+    assert!(committer_handle.local_requests().is_empty());
+    assert_eq!(service.state.tasks[&run_id][1].status, TaskStatus::Pending);
+    assert_eq!(service.state.tasks[&run_id][2].status, TaskStatus::Pending);
+
+    tracker.set_comment_error(None);
+    service.pending_run_retries.push(run_id.clone());
+    service.process_pending_run_retries().await;
+    handle_next_worker_message(&mut service).await;
+
+    assert_eq!(tracker.recorded_comments().len(), 1);
+    assert_eq!(committer_handle.local_requests().len(), 1);
+    assert_eq!(agent_handle.session_starts(), 2);
+    assert_eq!(
+        lifecycle_trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "start:implementer")
+            .count(),
+        1
     );
     assert_eq!(lifecycle_trace.lock().unwrap().as_slice(), [
         "start:implementer",

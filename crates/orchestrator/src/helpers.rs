@@ -18,6 +18,7 @@ pub(crate) const MAX_SAVED_CONTEXT_MESSAGE_CHARS: usize = 2_048;
 pub(crate) const LIVE_SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(crate) const LIVE_SESSION_STOP_TIMEOUT: Duration = Duration::from_millis(50);
+pub(crate) const LIVE_STAGE_HANDOFF_BLOCK_PREFIX: &str = "lifecycle_handoff_block: ";
 
 /// A durable task-evidence comment is the worker's explicit completion signal.
 /// It does not reuse tracker workflow state: a task can hand off while its
@@ -319,12 +320,42 @@ pub(crate) async fn run_worker_attempt(
             )
             .map_err(|error| CoreError::Adapter(error.to_string()))?;
         };
+        let completed_stage = run_result.as_ref().ok().is_some_and(|result| {
+            completion_signal.is_some_and(|signal| {
+                result
+                    .final_issue_state
+                    .as_deref()
+                    .is_some_and(|evidence| signal.matches(evidence))
+            })
+        });
         let stop_result = tokio::time::timeout(LIVE_SESSION_STOP_TIMEOUT, session.stop())
             .await
             .map_err(|_| CoreError::Adapter("agent_session_stop_timeout".into()))
             .and_then(|result| result);
         match (run_result, stop_result) {
             (Err(error), _) => Err(error),
+            (Ok(mut result), Err(error)) if completed_stage => {
+                let (status, diagnostic) = match &error {
+                    CoreError::Adapter(message) if message == "agent_session_stop_timeout" => (
+                        AttemptStatus::TimedOut,
+                        "agent_session_stop_timeout".to_string(),
+                    ),
+                    CoreError::Adapter(message) => (AttemptStatus::Failed, {
+                        if message.starts_with("agent_session_stop_failed:") {
+                            message.clone()
+                        } else {
+                            format!("agent_session_stop_failed: {message}")
+                        }
+                    }),
+                    _ => (
+                        AttemptStatus::Failed,
+                        format!("agent_session_stop_failed: {error}"),
+                    ),
+                };
+                result.status = status;
+                result.error = Some(format!("{LIVE_STAGE_HANDOFF_BLOCK_PREFIX}{diagnostic}"));
+                Ok(result)
+            },
             (Ok(_), Err(error)) => Err(error),
             (Ok(result), Ok(())) => Ok(result),
         }
@@ -361,6 +392,17 @@ pub(crate) async fn run_worker_attempt(
             Err(Error::Core(error))
         },
     }
+}
+
+pub(crate) fn live_stage_handoff_block(outcome: &AgentRunResult) -> Option<&str> {
+    outcome
+        .final_issue_state
+        .as_ref()
+        .filter(|evidence| !evidence.trim().is_empty())?;
+    outcome
+        .error
+        .as_deref()
+        .and_then(|error| error.strip_prefix(LIVE_STAGE_HANDOFF_BLOCK_PREFIX))
 }
 
 async fn wait_for_stop(stop_rx: &mut watch::Receiver<Option<String>>) -> String {

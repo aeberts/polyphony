@@ -1156,6 +1156,7 @@ impl RuntimeService {
                     || (run.status == RunStatus::Review
                         && !run.activity_log.iter().any(|entry| {
                             entry.message.contains("closed-loop repair limit reached")
+                                || entry.message.contains("worker lifecycle handoff blocked")
                         }))
             });
             if pipeline_done {

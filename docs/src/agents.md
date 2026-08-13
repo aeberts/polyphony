@@ -120,7 +120,7 @@ Known providers get a default `base_url` when none is set:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `approval_policy` | string | — | `"auto"` or `"manual"`. Controls whether tool calls need human approval. |
+| `approval_policy` | string | — | App-server values: `"untrusted"`, `"on-request"`, `"granular"`, or `"never"`. Legacy `"auto"` maps to `"never"`; `"manual"` and `"always"` map to `"on-request"`. Other values fail closed. |
 | `thread_sandbox` | string | — | Sandbox policy for the thread (e.g. `"workspace-write"`). |
 | `turn_sandbox_policy` | string | — | Per-turn sandbox policy. |
 

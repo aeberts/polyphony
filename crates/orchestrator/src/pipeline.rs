@@ -757,7 +757,12 @@ impl RuntimeService {
                 id: issue.id.clone(),
                 body,
             })
-            .await?;
+            .await
+            .map_err(|error| {
+                Error::Core(CoreError::Adapter(format!(
+                    "delivery evidence publication failed: {error}"
+                )))
+            })?;
         if let Some(run) = self.state.runs.get_mut(run_id) {
             run.push_log(
                 polyphony_core::RunLogScope::Pipeline,
@@ -1918,7 +1923,10 @@ impl RuntimeService {
         let is_qa = task_snapshot
             .as_ref()
             .is_some_and(|task| task.role == polyphony_core::PipelineTaskRole::Qa);
-        let qa_result = if is_qa && matches!(outcome.status, AttemptStatus::Succeeded) {
+        let mut handoff_block = live_stage_handoff_block(outcome).map(str::to_string);
+        let stage_completed =
+            matches!(outcome.status, AttemptStatus::Succeeded) || handoff_block.is_some();
+        let qa_result = if is_qa && stage_completed {
             Some(Self::qa_verdict(outcome))
         } else {
             None
@@ -1931,7 +1939,7 @@ impl RuntimeService {
                 .iter()
                 .any(|stage| stage.role == polyphony_core::PipelineTaskRole::Qa);
         let delivery_note = task_snapshot.as_ref().and_then(|task| {
-            (evidence_required && matches!(outcome.status, AttemptStatus::Succeeded))
+            (evidence_required && stage_completed)
                 .then(|| Self::delivery_note(task, issue, outcome))
         });
         let mut evidence_error = delivery_note
@@ -1951,7 +1959,8 @@ impl RuntimeService {
                 Err(error) => evidence_error = Some(error),
             }
         }
-        let qa_failed = is_qa
+        let qa_failed = handoff_block.is_none()
+            && is_qa
             && (!matches!(outcome.status, AttemptStatus::Succeeded)
                 || qa_result
                     .as_ref()
@@ -1959,9 +1968,21 @@ impl RuntimeService {
                 || qa_result.as_ref().is_some_and(Result::is_err)
                 || evidence_error.is_some());
 
-        if let (Some(task), Some(Ok(note))) = (task_snapshot.as_ref(), delivery_note.as_ref()) {
-            self.publish_delivery_note(issue, run_id, task, note)
-                .await?;
+        if let (Some(task), Some(Ok(note))) = (task_snapshot.as_ref(), delivery_note.as_ref())
+            && let Err(error) = self.publish_delivery_note(issue, run_id, task, note).await
+        {
+            if live_stage_handoff_block(outcome).is_none()
+                && !error
+                    .to_string()
+                    .contains("delivery evidence publication failed:")
+            {
+                return Err(error);
+            }
+            let diagnostic = format!("delivery_evidence_publication_failed: {error}");
+            handoff_block = Some(match handoff_block {
+                Some(existing) => format!("{existing}; {diagnostic}"),
+                None => diagnostic,
+            });
         }
 
         if let Some(tasks) = self.state.tasks.get_mut(run_id)
@@ -1969,6 +1990,8 @@ impl RuntimeService {
         {
             task.status = if evidence_error.is_some() {
                 TaskStatus::Failed
+            } else if handoff_block.is_some() {
+                TaskStatus::Completed
             } else if is_qa {
                 if qa_failed {
                     TaskStatus::Failed
@@ -1987,6 +2010,8 @@ impl RuntimeService {
             task.turns_completed = outcome.turns_completed;
             task.error = if let Some(error) = evidence_error.as_ref() {
                 Some(error.clone())
+            } else if let Some(diagnostic) = handoff_block.as_ref() {
+                Some(format!("{LIVE_STAGE_HANDOFF_BLOCK_PREFIX}{diagnostic}"))
             } else if is_qa {
                 match qa_result.as_ref() {
                     Some(Ok((false, evidence))) => Some(format!("QA FAIL: {evidence}")),
@@ -2007,6 +2032,11 @@ impl RuntimeService {
                     evidence
                 ));
             }
+            if let Some(diagnostic) = handoff_block.as_ref() {
+                task.activity_log.push(format!(
+                    "worker lifecycle handoff blocked after durable stage completion: {diagnostic}"
+                ));
+            }
             task.finished_at = Some(now);
             task.updated_at = now;
             if let Some(store) = &self.store {
@@ -2020,10 +2050,7 @@ impl RuntimeService {
                 s.kind == polyphony_core::StepKind::AgentRun
                     && s.task_id.as_deref() == Some(task_id)
             }) {
-                if matches!(outcome.status, AttemptStatus::Succeeded)
-                    && !qa_failed
-                    && evidence_error.is_none()
-                {
+                if stage_completed && !qa_failed && evidence_error.is_none() {
                     step.mark_succeeded();
                 } else if matches!(
                     outcome.status,
@@ -2040,6 +2067,38 @@ impl RuntimeService {
             run.updated_at = Utc::now();
             if let Some(store) = &self.store {
                 store.save_run(run).await?;
+            }
+        }
+
+        if let Some(diagnostic) = handoff_block {
+            if evidence_error.is_some() {
+                // A completion-looking note that does not satisfy the durable
+                // evidence contract is not a completed stage. Continue through
+                // the ordinary task-failure path below.
+            } else if let Some(run) = self.state.runs.get_mut(run_id) {
+                run.status = RunStatus::Review;
+                run.push_log(
+                    polyphony_core::RunLogScope::Pipeline,
+                    format!(
+                        "worker lifecycle handoff blocked after durable {} completion: {diagnostic}; retry the run after confirming no worker session remains",
+                        task_snapshot
+                            .as_ref()
+                            .map(|task| task.role.to_string())
+                            .unwrap_or_else(|| "stage".into())
+                    ),
+                );
+                run.updated_at = Utc::now();
+                if let Some(store) = &self.store {
+                    store.save_run(run).await?;
+                }
+                self.push_event(
+                    EventScope::Dispatch,
+                    format!(
+                        "{} needs worker lifecycle recovery before local commit or the next stage",
+                        issue.identifier
+                    ),
+                );
+                return Ok(());
             }
         }
 
