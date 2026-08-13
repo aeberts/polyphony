@@ -6959,6 +6959,406 @@ async fn live_completion_stop_timeout_blocks_then_recovers_after_completed_worke
 }
 
 #[tokio::test]
+async fn fresh_service_recovers_precheckpoint_delivery_evidence_without_duplicate_worker() {
+    let workspace_root = unique_workspace_root("precheckpoint-delivery-recovery");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nPrecheckpoint recovery fixture\n",
+    );
+    let issue = sample_issue(
+        "issue-precheckpoint-recovery",
+        "SAFE-32-CRASH",
+        "Todo",
+        "Recover published evidence after a lost local checkpoint",
+    );
+    let tracker = TestTracker::new(vec![issue.clone()]);
+    let store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        workspace_root.join("state.json"),
+    ));
+    let (_initial_tx, initial_rx) = watch::channel(workflow.clone());
+    let mut initial = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        Some(store.clone()),
+        None,
+        initial_rx,
+    )
+    .0;
+    initial
+        .dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run_id = initial.state.runs.keys().next().unwrap().clone();
+    let stale_task = initial.state.tasks[&run_id][0].clone();
+    assert_eq!(stale_task.status, TaskStatus::InProgress);
+    let completed = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(
+            "IMPLEMENTATION NOTE:\n\
+             what changed: completed the implementation before the local checkpoint\n\
+             commit: abc123\n\
+             tests run: focused crash-window fixture\n\
+             checks: 1"
+                .into(),
+        ),
+    };
+    let note = RuntimeService::delivery_note(&stale_task, &issue, &completed).unwrap();
+    tracker.record_external_comment(
+        &issue.id,
+        RuntimeService::delivery_comment_body(&run_id, &stale_task, &note),
+    );
+    let bootstrap = polyphony_core::StateStore::bootstrap(store.as_ref())
+        .await
+        .unwrap();
+    drop(initial);
+
+    let lifecycle_trace = Arc::new(Mutex::new(Vec::new()));
+    let agent = ClosedLoopQaFixtureAgent::with_qa_pass_after(1);
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(Some(LocalWorkspaceCommitResult {
+        branch_name: issue.branch_name.clone().unwrap(),
+        head_sha: "32cafe01".into(),
+        changed_files: vec!["fixture.rs".into()],
+        reconciled: false,
+    })))
+    .with_lifecycle_trace(lifecycle_trace.clone());
+    let committer_handle = committer.clone();
+    let (_restart_tx, restart_rx) = watch::channel(workflow);
+    let mut restarted = RuntimeService::new(
+        Arc::new(tracker.clone()),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        restart_rx,
+    )
+    .0;
+    restarted.restore_bootstrap(bootstrap);
+    restarted
+        .normalize_restored_in_progress_runs()
+        .await
+        .expect("fresh-service normalization should recover tracker evidence");
+
+    assert_eq!(restarted.state.runs[&run_id].status, RunStatus::Review);
+    assert_eq!(
+        restarted.state.tasks[&run_id][0].status,
+        TaskStatus::Completed
+    );
+    assert!(
+        restarted.state.tasks[&run_id][0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(LIVE_STAGE_HANDOFF_BLOCK_PREFIX))
+    );
+    assert!(committer_handle.local_requests().is_empty());
+    assert!(agent_handle.calls().is_empty());
+    assert_eq!(tracker.recorded_comments().len(), 0);
+
+    restarted.pending_run_retries.push(run_id.clone());
+    restarted.process_pending_run_retries().await;
+    assert_eq!(committer_handle.local_requests().len(), 1);
+    assert!(
+        agent_handle.calls().is_empty(),
+        "the local commit must finish before the queued independent QA runs"
+    );
+    assert_eq!(
+        restarted.state.tasks[&run_id][1].status,
+        TaskStatus::InProgress
+    );
+    handle_next_worker_message(&mut restarted).await;
+
+    assert_eq!(agent_handle.calls(), vec!["qa"]);
+    assert_eq!(lifecycle_trace.lock().unwrap().as_slice(), ["local_commit"]);
+    assert_eq!(
+        restarted.state.tasks[&run_id]
+            .iter()
+            .filter(|task| task.role == polyphony_core::PipelineTaskRole::Implementation)
+            .count(),
+        1,
+        "recovery must preserve the original implementation task"
+    );
+    assert_eq!(
+        tracker.recorded_comments().len(),
+        1,
+        "only QA publishes anew"
+    );
+}
+
+#[tokio::test]
+async fn stale_worker_reconciliation_rejects_missing_conflicting_and_duplicate_evidence() {
+    let workspace_root = unique_workspace_root("stale-worker-evidence-negative");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nNegative reconciliation fixture\n",
+    );
+    let issue = sample_issue(
+        "issue-stale-evidence-negative",
+        "SAFE-32-NEG",
+        "Todo",
+        "Reject ambiguous recovered evidence",
+    );
+    let (_base_tx, base_rx) = watch::channel(workflow.clone());
+    let mut base = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        base_rx,
+    )
+    .0;
+    base.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run = base.state.runs.values().next().unwrap().clone();
+    let tasks = base.state.tasks[&run.id].clone();
+    let task = tasks[0].clone();
+    let completed = AgentRunResult {
+        status: AttemptStatus::Succeeded,
+        turns_completed: 1,
+        error: None,
+        final_issue_state: Some(
+            "IMPLEMENTATION NOTE:\n\
+             what changed: completed before restart\n\
+             commit: abc123\n\
+             tests run: negative fixture\n\
+             checks: 1"
+                .into(),
+        ),
+    };
+    let note = RuntimeService::delivery_note(&task, &issue, &completed).unwrap();
+    let canonical = RuntimeService::delivery_comment_body(&run.id, &task, &note);
+    let conflicting = canonical.replacen("role=implementation", "role=qa", 1);
+
+    for (case, comments, normalization_fails) in [
+        ("missing", Vec::new(), false),
+        ("conflicting", vec![conflicting], true),
+        (
+            "duplicate",
+            vec![canonical.clone(), canonical.clone()],
+            true,
+        ),
+    ] {
+        let mut case_issue = issue.clone();
+        case_issue.comments = comments
+            .into_iter()
+            .enumerate()
+            .map(|(index, body)| IssueComment {
+                id: format!("{case}-{index}"),
+                body,
+                author: None,
+                url: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .collect();
+        let tracker = TestTracker::new(vec![case_issue]);
+        let agent = ClosedLoopQaFixtureAgent::with_qa_pass_after(1);
+        let agent_handle = agent.clone();
+        let committer = RecordingCommitter::with_local_result(Ok(None));
+        let committer_handle = committer.clone();
+        let (_tx, rx) = watch::channel(workflow.clone());
+        let mut restarted = RuntimeService::new(
+            Arc::new(tracker),
+            None,
+            Arc::new(agent),
+            Arc::new(RecordingProvisioner::default()),
+            Some(Arc::new(committer)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            rx,
+        )
+        .0;
+        restarted.state.runs.insert(run.id.clone(), run.clone());
+        restarted.state.tasks.insert(run.id.clone(), tasks.clone());
+        let result = restarted.normalize_restored_in_progress_runs().await;
+        assert_eq!(result.is_err(), normalization_fails, "case={case}");
+        if !normalization_fails {
+            restarted.pending_run_retries.push(run.id.clone());
+            restarted.process_pending_run_retries().await;
+        }
+        assert!(restarted.state.running.is_empty(), "case={case}");
+        assert!(agent_handle.calls().is_empty(), "case={case}");
+        assert!(committer_handle.local_requests().is_empty(), "case={case}");
+    }
+}
+
+#[tokio::test]
+async fn stale_worker_reconciliation_store_failure_never_releases_downstream_work() {
+    let workspace_root = unique_workspace_root("stale-worker-store-failure");
+    let workflow = test_workflow_with_front_matter(
+        &workspace_root,
+        "---\ntracker:\n  kind: mock\npolling:\n  interval_ms: 1000\nworkspace:\n  root: __ROOT__\norchestration:\n  dispatch_mode: manual\nagents:\n  default: implementer\n  profiles:\n    implementer: { kind: mock, transport: mock, command: mock, thread_sandbox: workspace-write, turn_sandbox_policy: workspace-write }\n    qa: { kind: mock, transport: mock, command: mock, thread_sandbox: read-only, turn_sandbox_policy: read-only }\npipeline:\n  stages:\n    - { category: coding, role: implementation, agent: implementer }\n    - { category: review, role: qa, agent: qa }\nlocal_commit:\n  enabled: true\n---\nStore-failure reconciliation fixture\n",
+    );
+    let issue = sample_issue(
+        "issue-stale-store-failure",
+        "SAFE-32-STORE",
+        "Todo",
+        "Keep recovered evidence blocked when its checkpoint fails",
+    );
+    let (_base_tx, base_rx) = watch::channel(workflow.clone());
+    let mut base = RuntimeService::new(
+        Arc::new(TestTracker::new(vec![issue.clone()])),
+        None,
+        Arc::new(NoopAgent),
+        Arc::new(RecordingProvisioner::default()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        base_rx,
+    )
+    .0;
+    base.dispatch_pipeline(workflow.clone(), issue.clone(), None, false, false, None)
+        .await
+        .unwrap();
+    let run = base.state.runs.values().next().unwrap().clone();
+    let tasks = base.state.tasks[&run.id].clone();
+    let task = tasks[0].clone();
+    let note = "IMPLEMENTATION NOTE:\nwhat changed: completed before restart\ncommit: abc123\ntests run: store-failure fixture\nchecks: 1";
+    let mut tracker_issue = issue.clone();
+    tracker_issue.comments.push(IssueComment {
+        id: "persisted-evidence".into(),
+        body: RuntimeService::delivery_comment_body(&run.id, &task, note),
+        author: None,
+        url: None,
+        created_at: None,
+        updated_at: None,
+    });
+    let tracker = TestTracker::new(vec![tracker_issue]);
+    let invalid_parent = workspace_root.join("not-a-directory");
+    fs::create_dir_all(&workspace_root).unwrap();
+    fs::write(&invalid_parent, "blocks state-store directory creation").unwrap();
+    let failing_store = Arc::new(polyphony_core::file_store::JsonStateStore::new(
+        invalid_parent.join("state.json"),
+    ));
+    let agent = ClosedLoopQaFixtureAgent::with_qa_pass_after(1);
+    let agent_handle = agent.clone();
+    let committer = RecordingCommitter::with_local_result(Ok(None));
+    let committer_handle = committer.clone();
+    let (_tx, rx) = watch::channel(workflow);
+    let mut restarted = RuntimeService::new(
+        Arc::new(tracker),
+        None,
+        Arc::new(agent),
+        Arc::new(RecordingProvisioner::default()),
+        Some(Arc::new(committer)),
+        None,
+        None,
+        None,
+        Some(failing_store),
+        None,
+        rx,
+    )
+    .0;
+    restarted.state.runs.insert(run.id.clone(), run.clone());
+    restarted.state.tasks.insert(run.id.clone(), tasks);
+
+    assert!(
+        restarted
+            .normalize_restored_in_progress_runs()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        restarted.state.tasks[&run.id][0].status,
+        TaskStatus::InProgress
+    );
+    restarted.pending_run_retries.push(run.id.clone());
+    restarted.process_pending_run_retries().await;
+    assert!(restarted.state.running.is_empty());
+    assert!(agent_handle.calls().is_empty());
+    assert!(committer_handle.local_requests().is_empty());
+}
+
+#[test]
+fn restart_delivery_reconciliation_accepts_exact_implementation_repair_and_qa_roles() {
+    let issue = sample_issue(
+        "issue-role-reconciliation",
+        "SAFE-32-ROLES",
+        "Todo",
+        "Reconcile each worker role",
+    );
+    let now = Utc::now();
+    for (index, (role, note)) in [
+        (
+            polyphony_core::PipelineTaskRole::Implementation,
+            "IMPLEMENTATION NOTE:\nwhat changed: implementation done\ncommit: abc123\ntests run: role fixture\nchecks: 1",
+        ),
+        (
+            polyphony_core::PipelineTaskRole::Repair,
+            "REPAIR NOTE:\nwhat fixed: repair done\ncommit: def456\ntests run: role fixture\nrecheck: QA requested the repair\nchecks: 1",
+        ),
+        (
+            polyphony_core::PipelineTaskRole::Qa,
+            "QA PASS: role-specific evidence\ntests run: role fixture\nchecks: 1",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let task = Task {
+            id: format!("role-task-{index}"),
+            run_id: "role-run".into(),
+            title: format!("{role} role"),
+            description: None,
+            activity_log: Vec::new(),
+            category: TaskCategory::Coding,
+            role,
+            status: TaskStatus::InProgress,
+            ordinal: index as u32,
+            parent_id: None,
+            agent_name: None,
+            session_id: None,
+            thread_id: None,
+            turns_completed: 0,
+            tokens: TokenUsage::default(),
+            started_at: Some(now),
+            finished_at: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut role_issue = issue.clone();
+        role_issue.comments.push(IssueComment {
+            id: format!("role-comment-{index}"),
+            body: RuntimeService::delivery_comment_body("role-run", &task, note),
+            author: None,
+            url: None,
+            created_at: None,
+            updated_at: None,
+        });
+        assert_eq!(
+            RuntimeService::reconciled_delivery_note(&role_issue, "role-run", &task).unwrap(),
+            Some(note.into())
+        );
+    }
+}
+
+#[tokio::test]
 async fn live_completion_typed_stop_failure_is_a_handoff_block_not_repair() {
     let workspace_root = unique_workspace_root("live-completion-stop-failure");
     let workflow = test_workflow_with_front_matter(

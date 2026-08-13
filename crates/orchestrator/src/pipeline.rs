@@ -803,6 +803,104 @@ impl RuntimeService {
         )
     }
 
+    /// Recover a worker note from the tracker after the tracker write won a
+    /// race with the local task checkpoint. Only the exact v2 marker and the
+    /// complete canonical wrapper are accepted. This keeps restart recovery
+    /// from trusting a role-mismatched, partial, or duplicated comment.
+    pub(crate) fn reconciled_delivery_note(
+        issue: &Issue,
+        run_id: &str,
+        task: &Task,
+    ) -> Result<Option<String>, String> {
+        let marker_identity = format!(
+            "<!-- polyphony:delivery-evidence-v2 run={run_id} task={} ",
+            task.id
+        );
+        let matching_comments = issue
+            .comments
+            .iter()
+            .filter(|comment| {
+                comment
+                    .body
+                    .lines()
+                    .any(|line| line.starts_with(&marker_identity))
+            })
+            .collect::<Vec<_>>();
+        if matching_comments.len() > 1 {
+            return Err(format!(
+                "delivery evidence marker for {} task {} is duplicated; refusing ambiguous restart reconciliation",
+                task.role, task.id
+            ));
+        }
+        let Some(comment) = matching_comments.first() else {
+            return Ok(None);
+        };
+
+        let expected_heading = match task.role {
+            polyphony_core::PipelineTaskRole::Implementation => "implementation note",
+            polyphony_core::PipelineTaskRole::Qa => "QA note",
+            polyphony_core::PipelineTaskRole::Repair => "repair note",
+        };
+        let expected_prefix = format!(
+            "<!-- polyphony:delivery-evidence-v2 run={run_id} task={} role={} sha256=",
+            task.id, task.role
+        );
+        let marker = comment.body.lines().next().ok_or_else(|| {
+            format!(
+                "delivery evidence for {} task {} has no canonical marker",
+                task.role, task.id
+            )
+        })?;
+        let Some(digest) = marker
+            .strip_prefix(&expected_prefix)
+            .and_then(|value| value.strip_suffix(" -->"))
+        else {
+            return Err(format!(
+                "delivery evidence marker for {} task {} has a conflicting role or noncanonical identity",
+                task.role, task.id
+            ));
+        };
+        if digest.len() != 64
+            || !digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "delivery evidence marker for {} task {} has a noncanonical digest",
+                task.role, task.id
+            ));
+        }
+
+        let note_prefix = format!("{marker}\n## Polyphony {expected_heading}\n\n");
+        let note_suffix = format!("\n\nRole: `{}`\nTask: `{}`", task.role, task.id);
+        let note = comment
+            .body
+            .strip_prefix(&note_prefix)
+            .and_then(|body| body.strip_suffix(&note_suffix))
+            .ok_or_else(|| {
+                format!(
+                    "delivery evidence marker for {} task {} does not identify a complete role-matched note",
+                    task.role, task.id
+                )
+            })?;
+        let recovery_outcome = AgentRunResult {
+            status: AttemptStatus::Succeeded,
+            turns_completed: task.turns_completed,
+            error: None,
+            final_issue_state: Some(note.to_string()),
+        };
+        let validated_note = Self::delivery_note(task, issue, &recovery_outcome)?;
+        let expected_marker = Self::delivery_marker(run_id, task, &validated_note);
+        let expected_body = Self::delivery_comment_body(run_id, task, &validated_note);
+        if marker != expected_marker || comment.body != expected_body {
+            return Err(format!(
+                "delivery evidence marker for {} task {} conflicts with its validated note",
+                task.role, task.id
+            ));
+        }
+        Ok(Some(validated_note))
+    }
+
     /// QA is not allowed to silently succeed.  Its terminal state must carry a
     /// machine-readable verdict and non-empty evidence so restart/retry logic
     /// can make a durable, role-safe decision without trusting a prompt.

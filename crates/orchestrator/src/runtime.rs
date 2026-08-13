@@ -8,6 +8,8 @@ use polyphony_core::{
 use crate::{prelude::*, *};
 
 const SLOW_TRACKER_FETCH_WARN_THRESHOLD: Duration = Duration::from_millis(750);
+const RESTORED_STALE_TASK_ERROR: &str =
+    "restored without an active agent session; retry the run to continue";
 
 struct RuntimeInteractionReporter {
     snapshot_tx: watch::Sender<RuntimeSnapshot>,
@@ -1625,6 +1627,33 @@ impl RuntimeService {
             return Ok(());
         }
 
+        if run.kind == RunKind::IssueDelivery
+            && (failed_task.status == TaskStatus::InProgress
+                || failed_task.error.as_deref() == Some(RESTORED_STALE_TASK_ERROR))
+        {
+            if self
+                .reconcile_stale_worker_evidence(&run, &failed_task)
+                .await?
+            {
+                self.push_event(
+                    EventScope::Dispatch,
+                    format!(
+                        "run {run_id} recovered completed {} evidence; confirm the worker lifecycle outcome and retry again to resume the system handoff",
+                        failed_task.role
+                    ),
+                );
+                return Ok(());
+            }
+            self.push_event(
+                EventScope::Dispatch,
+                format!(
+                    "run retry blocked: stale {} task {} has no exact canonical delivery evidence",
+                    failed_task.role, failed_task.id
+                ),
+            );
+            return Ok(());
+        }
+
         // Reset failed steps so the handoff can re-run from the failure point.
         if let Some(run) = self.state.runs.get_mut(run_id) {
             run.reset_failed_steps();
@@ -1797,9 +1826,99 @@ impl RuntimeService {
             .await
     }
 
+    async fn reconcile_stale_worker_evidence(
+        &mut self,
+        run: &Run,
+        stale_task: &Task,
+    ) -> Result<bool, Error> {
+        let issue_id = run.issue_id.as_deref().ok_or_else(|| {
+            CoreError::Adapter(format!(
+                "run {} has no issue id for stale worker evidence reconciliation",
+                run.id
+            ))
+        })?;
+        let issue = self
+            .tracker_for_issue(issue_id)
+            .fetch_issues_by_ids(&[issue_id.to_string()])
+            .await?
+            .into_iter()
+            .find(|issue| issue.id == issue_id)
+            .ok_or_else(|| {
+                CoreError::Adapter(format!(
+                    "stale worker evidence reconciliation could not refresh issue {issue_id}"
+                ))
+            })?;
+        let Some(note) =
+            Self::reconciled_delivery_note(&issue, &run.id, stale_task).map_err(|error| {
+                CoreError::Adapter(format!(
+                    "stale {} task {} evidence reconciliation failed: {error}",
+                    stale_task.role, stale_task.id
+                ))
+            })?
+        else {
+            return Ok(false);
+        };
+
+        let now = Utc::now();
+        let mut recovered_task = stale_task.clone();
+        recovered_task.status = TaskStatus::Completed;
+        recovered_task.error = Some(format!(
+            "{LIVE_STAGE_HANDOFF_BLOCK_PREFIX}restart_reconciled_delivery_evidence: canonical {} evidence was published before the local checkpoint; confirm that no owned live worker session remains",
+            stale_task.role
+        ));
+        recovered_task.finished_at = Some(now);
+        recovered_task.updated_at = now;
+        recovered_task.activity_log.push(format!(
+            "restart recovered exact canonical {} evidence after the local checkpoint was lost",
+            stale_task.role
+        ));
+        if stale_task.role == polyphony_core::PipelineTaskRole::Qa {
+            for (prefix, verdict) in [("QA PASS:", "PASS"), ("QA FAIL:", "FAIL")] {
+                if let Some(evidence) = note.strip_prefix(prefix).map(str::trim) {
+                    recovered_task
+                        .activity_log
+                        .push(format!("durable QA {verdict} evidence: {evidence}"));
+                    break;
+                }
+            }
+        }
+        // The completed task is the fail-closed checkpoint. Save it before
+        // making the run resumable at the human lifecycle-recovery gate.
+        if let Some(store) = &self.store {
+            store.save_task(&recovered_task).await?;
+        }
+
+        let mut recovered_run = run.clone();
+        recovered_run.status = RunStatus::Review;
+        if let Some(step) = recovered_run.steps.iter_mut().find(|step| {
+            step.kind == polyphony_core::StepKind::AgentRun
+                && step.task_id.as_deref() == Some(stale_task.id.as_str())
+        }) {
+            step.mark_succeeded();
+        }
+        recovered_run.push_log(
+            polyphony_core::RunLogScope::Reconciliation,
+            format!(
+                "restart recovered exact canonical {} evidence for stale task {}; worker lifecycle outcome remains unknown, so local commit and downstream dispatch stay blocked until explicit recovery",
+                stale_task.role, stale_task.id
+            ),
+        );
+        recovered_run.updated_at = now;
+        if let Some(store) = &self.store {
+            store.save_run(&recovered_run).await?;
+        }
+
+        if let Some(tasks) = self.state.tasks.get_mut(&run.id)
+            && let Some(task) = tasks.iter_mut().find(|task| task.id == stale_task.id)
+        {
+            *task = recovered_task;
+        }
+        self.state.runs.insert(run.id.clone(), recovered_run);
+        Ok(true)
+    }
+
     pub(crate) async fn normalize_restored_in_progress_runs(&mut self) -> Result<(), Error> {
         let now = Utc::now();
-        let stale_error = "restored without an active agent session; retry the run to continue";
         let run_ids = self.state.runs.keys().cloned().collect::<Vec<_>>();
 
         for run_id in run_ids {
@@ -1851,6 +1970,27 @@ impl RuntimeService {
                         )
                 });
             if has_active_running {
+                continue;
+            }
+
+            if run_snapshot.kind == RunKind::IssueDelivery
+                && let Some(stale_task) = self.state.tasks.get(&run_id).and_then(|tasks| {
+                    tasks
+                        .iter()
+                        .filter(|task| task.status == TaskStatus::InProgress)
+                        .min_by_key(|task| task.ordinal)
+                        .cloned()
+                })
+                && self
+                    .reconcile_stale_worker_evidence(&run_snapshot, &stale_task)
+                    .await?
+            {
+                self.push_event(
+                    EventScope::Startup,
+                    format!(
+                        "restored exact canonical evidence for run {run_id}; explicit worker lifecycle recovery is required"
+                    ),
+                );
                 continue;
             }
 
@@ -1957,7 +2097,7 @@ impl RuntimeService {
                 .filter(|task| task.status == TaskStatus::InProgress)
             {
                 task.status = TaskStatus::Failed;
-                task.error = Some(stale_error.into());
+                task.error = Some(RESTORED_STALE_TASK_ERROR.into());
                 task.finished_at = Some(now);
                 task.updated_at = now;
                 normalized_task_ids.push(task.id.clone());
@@ -1968,7 +2108,7 @@ impl RuntimeService {
                     .find(|task| matches!(task.status, TaskStatus::Pending | TaskStatus::Cancelled))
             {
                 task.status = TaskStatus::Failed;
-                task.error = Some(stale_error.into());
+                task.error = Some(RESTORED_STALE_TASK_ERROR.into());
                 task.finished_at = Some(now);
                 task.updated_at = now;
                 normalized_task_ids.push(task.id.clone());
